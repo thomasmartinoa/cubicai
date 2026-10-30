@@ -35,6 +35,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -197,7 +198,7 @@ fun ChatScreen(vm: ChatViewModel, onOpenSettings: () -> Unit) {
                 Modifier.fillMaxSize().padding(padding).consumeWindowInsets(padding).imePadding(),
             ) {
                 Box(Modifier.weight(1f).fillMaxWidth()) {
-                    if (state.current.messages.isEmpty()) EmptyState(state, onSuggestion = vm::send, onOpenSettings = onOpenSettings, onBehaviour = { showBehaviour = true })
+                    if (state.current.messages.isEmpty()) EmptyState(state, onSuggestion = vm::sendSuggestion, onOpenSettings = onOpenSettings, onBehaviour = { showBehaviour = true })
                     else MessageList(state, vm)
                 }
                 Composer(state, vm)
@@ -341,13 +342,13 @@ private fun Composer(state: UiState, vm: ChatViewModel) {
         val dir = File(context.cacheDir, "camera").apply { mkdirs() }
         val uri = FileProvider.getUriForFile(context, "${context.packageName}.files", File(dir, "${System.currentTimeMillis()}.jpg"))
         cameraUri = uri
-        try { camera.launch(uri) } catch (_: ActivityNotFoundException) { }
+        try { camera.launch(uri) } catch (_: ActivityNotFoundException) { vm.showNotice("No camera app found") }
     }
 
     fun launchSpeech() {
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
             .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-        try { speech.launch(intent) } catch (_: ActivityNotFoundException) { }
+        try { speech.launch(intent) } catch (_: ActivityNotFoundException) { vm.showNotice("Voice input isn't available on this phone") }
     }
 
     val canSend = (state.draft.isNotBlank() || state.pending.isNotEmpty()) && !state.attaching
@@ -461,10 +462,11 @@ private fun PendingAttachments(state: UiState, vm: ChatViewModel) {
                 Surface(
                     shape = CutCornerShape(4.dp),
                     color = MaterialTheme.colorScheme.inverseSurface,
-                    modifier = Modifier.align(Alignment.TopEnd).size(22.dp).clickable { vm.removePending(a) },
+                    modifier = Modifier.align(Alignment.TopEnd).size(24.dp),
                 ) {
-                    Icon(Icons.Rounded.Close, "Remove", Modifier.padding(3.dp), tint = MaterialTheme.colorScheme.inverseOnSurface)
+                    Icon(Icons.Rounded.Close, "Remove", Modifier.padding(4.dp), tint = MaterialTheme.colorScheme.inverseOnSurface)
                 }
+                Box(Modifier.align(Alignment.TopEnd).size(48.dp).offset(x = 12.dp, y = (-12).dp).clickable { vm.removePending(a) })
             }
         }
         if (state.attaching) CircularProgressIndicator(Modifier.size(24.dp), strokeWidth = 2.dp)
@@ -508,7 +510,7 @@ private fun ChatDrawer(
                     onClick = { onOpen(chat.id) },
                     badge = {
                         Box {
-                            IconButton(onClick = { menu = true }, modifier = Modifier.size(32.dp)) {
+                            IconButton(onClick = { menu = true }, modifier = Modifier.size(48.dp)) {
                                 Icon(Icons.Rounded.MoreVert, "Options", Modifier.size(18.dp))
                             }
                             DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {

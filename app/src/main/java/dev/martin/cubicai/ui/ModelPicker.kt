@@ -129,7 +129,7 @@ fun ModelPickerSheet(vm: ChatViewModel, onOpenSettings: () -> Unit, onDismiss: (
                             "recommended".takeIf { m.recommended },
                             "free".takeIf { m.free },
                             "sees images".takeIf { m.vision },
-                            m.contextTokens.takeIf { it > 0 }?.let { "${it / 1000}K context" },
+                            m.contextTokens.takeIf { it > 0 }?.let { "${contextLabel(it)} context" },
                             m.sizeBytes.takeIf { it > 0 }?.let { "%.1f GB".format(it / 1e9) },
                         ).joinToString(", ")
                         ListItem(
@@ -144,4 +144,9 @@ fun ModelPickerSheet(vm: ChatViewModel, onOpenSettings: () -> Unit, onDismiss: (
             }
         }
     }
+}
+
+private fun contextLabel(tokens: Int): String = when {
+    tokens >= 1_000_000 -> "%dM".format((tokens + 524_287) / 1_048_576)
+    else -> "${tokens / 1024}K"
 }

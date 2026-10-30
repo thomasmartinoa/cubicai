@@ -251,6 +251,15 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     fun setDraft(text: String) = _state.update { it.copy(draft = text) }
 
+    fun showNotice(text: String) = _state.update { it.copy(notice = text) }
+
+    /** Suggestion cards send straight away, unless the user has already typed or attached something. */
+    fun sendSuggestion(prompt: String) {
+        val s = _state.value
+        if (s.draft.isBlank() && s.pending.isEmpty()) send(prompt)
+        else setDraft((s.draft + " " + prompt).trim())
+    }
+
     fun clearNotice() = _state.update { it.copy(notice = null) }
 
     fun addAttachments(uris: List<Uri>) {

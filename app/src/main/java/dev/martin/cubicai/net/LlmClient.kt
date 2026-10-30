@@ -252,7 +252,7 @@ class LlmClient {
                         free = free,
                         sizeBytes = o.optLong("size"),
                         recommended = o.optBoolean("cubic_recommended"),
-                        contextTokens = o.optInt("context_length"),
+                        contextTokens = o.optInt("context_length").takeIf { it > 0 } ?: if (google) 1_048_576 else 0,
                     ).let { if (google && id == "gemini-3.5-flash") it.copy(recommended = true) else it }
                 }.distinctBy { it.id } // the picker keys its list by id; a duplicate would crash it
                     .sortedWith(compareByDescending<ModelInfo> { it.recommended }.thenBy { it.id })

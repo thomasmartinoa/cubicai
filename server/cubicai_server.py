@@ -21,6 +21,7 @@ import datetime
 import hashlib
 import hmac
 import ipaddress
+import http.client
 import json
 import os
 import re
@@ -466,7 +467,37 @@ class _PublicRedirects(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-_page_opener = urllib.request.build_opener(_PublicRedirects)
+def _check_peer(conn):
+    """Re-check the address we actually connected to, so a DNS answer that changed after public_url() can't reach the LAN."""
+    ip = conn.sock.getpeername()[0].split("%")[0]
+    if not ipaddress.ip_address(ip).is_global:
+        conn.close()
+        raise OSError("connected to a non-public address")
+
+
+class _PublicHTTPConnection(http.client.HTTPConnection):
+    def connect(self):
+        super().connect()
+        _check_peer(self)
+
+
+class _PublicHTTPSConnection(http.client.HTTPSConnection):
+    def connect(self):
+        super().connect()
+        _check_peer(self)
+
+
+class _PublicHTTP(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_PublicHTTPConnection, req)
+
+
+class _PublicHTTPS(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_PublicHTTPSConnection, req, context=self._context)
+
+
+_page_opener = urllib.request.build_opener(_PublicRedirects, _PublicHTTP, _PublicHTTPS)
 
 
 def read_page(url):
@@ -560,7 +591,11 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.split("?")[0].rstrip("/") != "/v1/chat/completions":
             self._json(404, {"error": {"message": "Not found"}})
             return
-        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self._json(400, {"error": {"message": "Bad Content-Length"}})
+            return
         if length <= 0 or length > MAX_BODY:
             self._json(413, {"error": {"message": "Request too large"}})
             return

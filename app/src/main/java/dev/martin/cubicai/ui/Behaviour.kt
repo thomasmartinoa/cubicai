@@ -23,7 +23,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
@@ -34,7 +33,13 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.foundation.layout.size
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.foundation.shape.CutCornerShape
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.border
+import androidx.compose.foundation.background
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.martin.cubicai.ChatViewModel
@@ -69,7 +74,14 @@ fun BehaviourSheet(vm: ChatViewModel, onDismiss: () -> Unit) {
                     Modifier.fillMaxWidth().clip(MaterialTheme.shapes.small).clickable { vm.selectPersona(p.id) }.padding(vertical = 4.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    RadioButton(selected = p.id == selected, onClick = { vm.selectPersona(p.id) })
+                    val on = p.id == selected
+                    val tone = if (on) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
+                    Box(
+                        Modifier.padding(15.dp).size(18.dp)
+                            .border(2.dp, tone, CutCornerShape(5.dp))
+                            .padding(3.dp)
+                            .background(if (on) tone else Color.Transparent, CutCornerShape(2.dp)),
+                    )
                     Column(Modifier.weight(1f)) {
                         Text(p.name, style = MaterialTheme.typography.titleSmall)
                         val summary = p.summary.ifBlank { p.instructions.lineSequence().firstOrNull().orEmpty() }

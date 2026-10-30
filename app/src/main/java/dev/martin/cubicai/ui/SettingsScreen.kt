@@ -198,6 +198,7 @@ private fun LocalPcSection(s: Settings, vm: ChatViewModel) {
         val options = GmsBarcodeScannerOptions.Builder().setBarcodeFormats(Barcode.FORMAT_QR_CODE).build()
         GmsBarcodeScanning.getClient(context, options).startScan()
             .addOnSuccessListener { code -> code.rawValue?.let { vm.pair(it) } }
+            .addOnFailureListener { vm.showNotice("Couldn't open the scanner. Paste the pairing link instead.") }
     }
 
     SectionTitle("Local PC (Ollama)")
