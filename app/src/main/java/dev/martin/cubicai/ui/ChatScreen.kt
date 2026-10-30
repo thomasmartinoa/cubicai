@@ -88,6 +88,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -111,6 +113,16 @@ fun ChatScreen(vm: ChatViewModel, onOpenSettings: () -> Unit) {
     val snackbar = remember { SnackbarHostState() }
     var showModels by remember { mutableStateOf(false) }
     var showBehaviour by remember { mutableStateOf(false) }
+
+    // An open keyboard would cover the drawer's Settings entry.
+    val keyboard = LocalSoftwareKeyboardController.current
+    val focus = LocalFocusManager.current
+    LaunchedEffect(drawerState.targetValue) {
+        if (drawerState.targetValue == DrawerValue.Open) {
+            focus.clearFocus()
+            keyboard?.hide()
+        }
+    }
 
     LaunchedEffect(state.notice) {
         state.notice?.let {

@@ -27,6 +27,9 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -64,8 +67,18 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
     val s = state.settings
     var confirmDelete by remember { mutableStateOf(false) }
     var showBehaviour by remember { mutableStateOf(false) }
+    val snackbar = remember { SnackbarHostState() }
+
+    // Pairing and connection-test results arrive as notices; show them here too.
+    LaunchedEffect(state.notice) {
+        state.notice?.let {
+            snackbar.showSnackbar(it)
+            vm.clearNotice()
+        }
+    }
 
     Scaffold(
+        snackbarHost = { SnackbarHost(snackbar) },
         topBar = {
             TopAppBar(
                 title = { Text("Settings") },
