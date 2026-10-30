@@ -9,6 +9,13 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -35,11 +42,18 @@ class MainActivity : ComponentActivity() {
                     else window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
                 }
                 var showSettings by rememberSaveable { mutableStateOf(false) }
-                if (showSettings) {
-                    BackHandler { showSettings = false }
-                    SettingsScreen(vm, onBack = { showSettings = false })
-                } else {
-                    ChatScreen(vm, onOpenSettings = { showSettings = true })
+                BackHandler(enabled = showSettings) { showSettings = false }
+                AnimatedContent(
+                    targetState = showSettings,
+                    transitionSpec = {
+                        val dir = if (targetState) 1 else -1
+                        (fadeIn(tween(200)) + slideInHorizontally(tween(220)) { it / 10 * dir }) togetherWith
+                            (fadeOut(tween(120)) + slideOutHorizontally(tween(220)) { -it / 10 * dir })
+                    },
+                    label = "screen",
+                ) { settings ->
+                    if (settings) SettingsScreen(vm, onBack = { showSettings = false })
+                    else ChatScreen(vm, onOpenSettings = { showSettings = true })
                 }
             }
         }

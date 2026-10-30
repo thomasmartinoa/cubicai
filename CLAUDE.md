@@ -8,7 +8,7 @@ Native Kotlin + Jetpack Compose, single `:app` module, package `dev.martin.cubic
 - Toolchain: AGP 9.4.1 (built-in Kotlin), Kotlin compose plugin 2.4.21, Gradle 9.8.2, compileSdk 37, minSdk 29, JDK 27. SDK at ~/Android/Sdk.
 
 ## Layout
-- `data/Settings.kt`: provider presets (Local PC, xAI, OpenRouter, Custom), SharedPreferences store. Local PC has a home URL and an optional Tailscale URL (`baseUrls`, tried in order).
+- `data/Settings.kt`: provider presets (Local PC, Gemini, xAI, OpenRouter, Custom), SharedPreferences store. Local PC has a home URL and an optional Tailscale URL (`baseUrls`, tried in order).
 - `data/Personas.kt`: built-in behaviours ("None" sends no system prompt). Custom ones live in settings; "About you" is appended to every behaviour except None.
 - `data/SecretBox.kt`: API keys and the PC token are AES-GCM encrypted with an Android Keystore key.
 - `data/Models.kt`: Chat/Message/Attachment + org.json (de)serialisation. No kotlinx.serialization on purpose. Each chat stores its own persona and model.
@@ -18,10 +18,16 @@ Native Kotlin + Jetpack Compose, single `:app` module, package `dev.martin.cubic
 - `ChatViewModel.kt`: all state (`UiState`), streaming, edit/regenerate, personas, TTS. The whole history is resent each turn; photos only from the last 6 photo messages.
 - `ui/`: Theme (cobalt + amber, Chakra Petch headings, cut-corner shapes), Cube (brand mark + thinking animation), ChatScreen, Messages, Behaviour sheet, Markdown (Markwon), ModelPicker, SettingsScreen.
 
+## Gemini
+- Chat goes through Google's OpenAI-compatible endpoint (`/v1beta/openai`); default model `gemini-3.5-flash` (3.8 is often overloaded; 2.x models are closed to new keys and hidden from the picker).
+- Image creation ("Image" chip, `LlmClient.generateImage`) uses the native `generateContent` API with `responseModalities: IMAGE`. Google's free tier has zero image quota, so it only works with billing enabled; the 429 is turned into a plain-language message.
+- No web search for Gemini yet (the compat endpoint lacks grounding).
+
 ## Design rules
 - Shapes come from `MaterialTheme.shapes` (all `CutCornerShape`); buttons pass `shape = MaterialTheme.shapes.small`. No rounded/circle shapes.
 - Headings use Chakra Petch via the typography; body stays Roboto.
-- The cube is the only animated element (it rolls its light while a reply is generated).
+- Motion is short (120-260 ms) and tied to state: the cube rolls its light, the phase label shimmers (Thinking, Searching, Writing), a block cursor blinks while text streams, reasoning opens itself while the model thinks, list items fade in, the send/mic/stop button cross-fades.
+- Never put a secret (API key, token) in the repo; keys are entered in Settings and stored encrypted by `SecretBox`.
 
 ## Local PC mode (server/)
 - `server/cubicai_server.py`: stdlib-only HTTPS gateway: phone → (TLS 1.3, pinned self-signed cert, bearer token) → Ollama on 127.0.0.1:11434. Converts OpenAI chat format ↔ Ollama `/api/chat` (thinking → `delta.reasoning`, `cubic_status` progress events, `citations`).

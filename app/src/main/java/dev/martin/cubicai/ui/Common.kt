@@ -6,7 +6,11 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.content.ContentValues
 import android.net.Uri
+import android.os.Environment
+import android.provider.MediaStore
+import java.io.File
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -34,6 +38,18 @@ fun shareText(context: Context, text: String) {
     val send = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text)
     context.startActivity(Intent.createChooser(send, null))
 }
+
+/** Copies an image into Pictures/CubicAI. Only ever called from a tap on "Save", never automatically. */
+fun saveToGallery(context: Context, path: String): Boolean = runCatching {
+    val source = File(path)
+    val values = ContentValues().apply {
+        put(MediaStore.Images.Media.DISPLAY_NAME, "CubicAI-${System.currentTimeMillis()}.${source.extension.ifBlank { "png" }}")
+        put(MediaStore.Images.Media.MIME_TYPE, if (source.extension == "jpg") "image/jpeg" else "image/png")
+        put(MediaStore.Images.Media.RELATIVE_PATH, "${Environment.DIRECTORY_PICTURES}/CubicAI")
+    }
+    val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)!!
+    context.contentResolver.openOutputStream(uri)!!.use { out -> source.inputStream().use { it.copyTo(out) } }
+}.isSuccess
 
 fun shortModelName(model: String) = model.substringAfterLast('/').removeSuffix(":free")
 

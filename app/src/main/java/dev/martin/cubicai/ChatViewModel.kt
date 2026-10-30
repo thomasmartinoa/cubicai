@@ -47,6 +47,8 @@ data class UiState(
     val streaming: Boolean = false,
     val status: String? = null,
     val notice: String? = null,
+    /** Next message creates an image instead of a text reply (providers that support it). */
+    val imageMode: Boolean = false,
 )
 
 /** How many recent messages keep their photos in the request; older ones are summarised as a note. */
@@ -89,6 +91,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     /** Picks the model for the open chat (it remembers it) and for new chats. */
     fun selectModel(provider: Provider, model: String) {
         updateSettings { it.copy(providerId = provider.id, models = it.models + (provider.id to model)) }
+        if (!provider.images) _state.update { it.copy(imageMode = false) }
         val chatId = _state.value.current.id
         mutateChat(chatId) { it.copy(providerId = provider.id, model = model) }
         _state.update { s -> if (s.current.id == chatId) s.copy(current = s.current.copy(providerId = provider.id, model = model)) else s }
@@ -96,6 +99,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun toggleWebSearch() = updateSettings { it.copy(webSearch = !it.webSearch) }
+
+    fun toggleImageMode() = _state.update { it.copy(imageMode = !it.imageMode) }
 
     suspend fun listModels(provider: Provider): List<ModelInfo> {
         modelCache[provider.id]?.let { return it }
@@ -275,7 +280,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             )
         }
         _state.update { it.copy(current = chat, pending = emptyList(), draft = "") }
-        complete()
+        if (s.imageMode && s.settings.provider.images) createImage() else complete()
     }
 
     fun editMessage(id: String, text: String) {
@@ -290,10 +295,13 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun regenerate() {
         val c = _state.value.current
         if (_state.value.streaming) return
+        val provider = _state.value.settings.provider
+        // A failed or unwanted picture is redone as a picture, not as text.
+        val wasImage = provider.images && c.messages.lastOrNull { it.role == Role.ASSISTANT }?.model == provider.imageModel
         val trimmed = c.messages.dropLastWhile { it.role == Role.ASSISTANT }
         if (trimmed.isEmpty()) return
         _state.update { it.copy(current = c.copy(messages = trimmed)) }
-        complete()
+        if (wasImage) createImage() else complete()
     }
 
     fun stop() {
@@ -355,6 +363,49 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                         else -> m
                     }
                 }
+                if (runId == run) _state.update { it.copy(streaming = false, status = null) }
+                persist(chat.id)
+            }
+        }
+    }
+
+    /** Creates an image from the last message (and any photos attached to it) and adds it as the reply. */
+    private fun createImage() {
+        val snapshot = _state.value
+        val settings = snapshot.settings
+        val provider = settings.provider
+        val history = snapshot.current.messages
+        val last = history.last()
+        val reply = Message(role = Role.ASSISTANT, model = provider.imageModel)
+        val chat = snapshot.current.copy(
+            messages = history + reply,
+            updatedAt = System.currentTimeMillis(),
+            providerId = provider.id,
+            model = settings.model(provider),
+        )
+        _state.update { s ->
+            s.copy(current = chat, chats = listOf(chat) + s.chats.filter { it.id != chat.id }, streaming = true, status = "Creating your image…")
+        }
+        persist(chat.id)
+
+        val run = ++runId
+        job = viewModelScope.launch {
+            var cancelled = false
+            try {
+                val key = settings.key(provider)
+                if (key.isBlank()) throw ApiException("Add your ${provider.name} API key in Settings to create images.")
+                val refs = withContext(Dispatchers.IO) { last.attachments.filter { it.isImage }.mapNotNull(AttachmentProcessor::dataUrl) }
+                val (bytes, mime) = client.generateImage(key, provider.imageModel, last.content.ifBlank { "Create an image" }, refs)
+                val file = File(store.attachmentDir, "${newId()}.${if ("jpeg" in mime) "jpg" else "png"}")
+                withContext(Dispatchers.IO) { file.writeBytes(bytes) }
+                updateMessage(chat.id, reply.id) { it.copy(attachments = listOf(Attachment(Attachment.KIND_IMAGE, "Created image", file.path))) }
+            } catch (e: CancellationException) {
+                cancelled = true
+                throw e
+            } catch (e: Exception) {
+                updateMessage(chat.id, reply.id) { it.copy(error = e.message ?: "Couldn't create the image") }
+            } finally {
+                if (cancelled) updateMessage(chat.id, reply.id) { it.copy(stopped = true) }
                 if (runId == run) _state.update { it.copy(streaming = false, status = null) }
                 persist(chat.id)
             }

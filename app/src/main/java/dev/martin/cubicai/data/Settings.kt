@@ -19,6 +19,9 @@ data class Provider(
     val search: SearchMode,
     /** Shown in the model picker when the live model list can't be fetched. */
     val suggestedModels: List<String>,
+    /** Can create images from a prompt (Gemini's native image models). */
+    val images: Boolean = false,
+    val imageModel: String = "",
 )
 
 object Providers {
@@ -32,6 +35,18 @@ object Providers {
         keyUrl = "",
         search = SearchMode.LOCAL_PC,
         suggestedModels = emptyList(),
+    )
+    val GEMINI = Provider(
+        id = "gemini",
+        name = "Google Gemini",
+        shortName = "Gemini",
+        baseUrl = "https://generativelanguage.googleapis.com/v1beta/openai",
+        defaultModel = "gemini-3.5-flash",
+        keyUrl = "https://aistudio.google.com/apikey",
+        search = SearchMode.NONE,
+        suggestedModels = listOf("gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3.1-pro-preview"),
+        images = true,
+        imageModel = "gemini-3.1-flash-image",
     )
     val XAI = Provider(
         id = "xai",
@@ -71,7 +86,7 @@ object Providers {
         suggestedModels = emptyList(),
     )
 
-    val all = listOf(LOCAL, XAI, OPENROUTER, CUSTOM)
+    val all = listOf(LOCAL, GEMINI, XAI, OPENROUTER, CUSTOM)
 
     fun get(id: String) = all.firstOrNull { it.id == id } ?: LOCAL
 }

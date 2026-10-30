@@ -2,6 +2,9 @@ package dev.martin.cubicai.ui
 
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.material3.FilterChipDefaults
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -24,9 +27,6 @@ import androidx.compose.material3.ListItemDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.SegmentedButton
-import androidx.compose.material3.SegmentedButtonDefaults
-import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
@@ -82,13 +82,17 @@ fun ModelPickerSheet(vm: ChatViewModel, onOpenSettings: () -> Unit, onDismiss: (
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
         Column(Modifier.padding(horizontal = 16.dp).padding(bottom = 16.dp)) {
             Text("Choose a model", style = MaterialTheme.typography.titleLarge, modifier = Modifier.padding(bottom = 12.dp))
-            SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
-                Providers.all.forEachIndexed { i, p ->
-                    SegmentedButton(
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Providers.all.forEach { p ->
+                    FilterChip(
                         selected = p.id == providerId,
                         onClick = { providerId = p.id; query = "" },
-                        shape = SegmentedButtonDefaults.itemShape(i, Providers.all.size),
-                    ) { Text(p.shortName, maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis) }
+                        label = { Text(p.shortName, maxLines = 1) },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = MaterialTheme.colorScheme.primary,
+                            selectedLabelColor = MaterialTheme.colorScheme.onPrimary,
+                        ),
+                    )
                 }
             }
             OutlinedTextField(

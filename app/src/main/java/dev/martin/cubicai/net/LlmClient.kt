@@ -7,6 +7,7 @@ import dev.martin.cubicai.data.strings
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.ensureActive
+import android.util.Base64
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -33,6 +34,8 @@ sealed interface StreamEvent {
 }
 
 class ApiException(message: String) : Exception(message)
+
+private val NOT_CHAT = listOf("tts", "live", "image", "audio", "transcribe", "robotics", "computer-use", "customtools", "omni", "nano-banana", "argon")
 
 /** A message ready to send; images are already data URLs. */
 data class ApiMessage(val role: String, val text: String, val images: List<String> = emptyList())
@@ -162,6 +165,57 @@ class LlmClient {
         }
     }
 
+    /**
+     * Creates an image with Gemini's native generateContent API (the OpenAI-style images endpoint
+     * doesn't cover these models). Optional [reference] images let the prompt edit or build on a photo.
+     * Returns the image bytes and their mime type.
+     */
+    suspend fun generateImage(
+        apiKey: String,
+        model: String,
+        prompt: String,
+        reference: List<String> = emptyList(),
+    ): Pair<ByteArray, String> = withContext(Dispatchers.IO) {
+        val parts = JSONArray().put(JSONObject().put("text", prompt))
+        reference.forEach { url ->
+            val data = url.substringAfter("base64,")
+            parts.put(JSONObject().put("inlineData", JSONObject().put("mimeType", url.substringAfter("data:").substringBefore(";")).put("data", data)))
+        }
+        val body = JSONObject()
+            .put("contents", JSONArray().put(JSONObject().put("parts", parts)))
+            .put("generationConfig", JSONObject().put("responseModalities", JSONArray().put("IMAGE")))
+        val request = Request.Builder()
+            .url("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent")
+            .header("x-goog-api-key", apiKey)
+            .post(body.toString().toRequestBody(jsonType))
+            .build()
+        val call = http.newCall(request)
+        val handle = coroutineContext[Job]?.invokeOnCompletion { call.cancel() }
+        try {
+            call.execute().use { response ->
+                val text = response.body.string()
+                if (!response.isSuccessful) {
+                    throw ApiException(
+                        if (response.code == 429) "Image generation isn't included in the free Google plan. Turn on billing for this key at aistudio.google.com, or try again tomorrow."
+                        else errorMessage(response.code, text)
+                    )
+                }
+                val partsOut = JSONObject(text).optJSONArray("candidates")?.optJSONObject(0)
+                    ?.optJSONObject("content")?.optJSONArray("parts").objects()
+                val inline = partsOut.firstNotNullOfOrNull { it.optJSONObject("inlineData") ?: it.optJSONObject("inline_data") }
+                    ?: throw ApiException(
+                        partsOut.firstNotNullOfOrNull { it.str("text") }?.take(300) ?: "The model didn't return an image. Try rephrasing."
+                    )
+                Base64.decode(inline.getString("data"), Base64.DEFAULT) to (inline.str("mimeType") ?: inline.str("mime_type") ?: "image/png")
+            }
+        } catch (e: IOException) {
+            ensureActive()
+            throw networkError(e, null)
+        } finally {
+            handle?.dispose()
+        }
+    }
+
     suspend fun listModels(baseUrls: List<String>, apiKey: String, pin: String? = null): List<ModelInfo> = withContext(Dispatchers.IO) {
         try {
             executeFirst(baseUrls, pin, {}) { baseUrl ->
@@ -172,8 +226,11 @@ class LlmClient {
             }.use { response ->
                 val text = response.body.string()
                 if (!response.isSuccessful) throw ApiException(errorMessage(response.code, text))
-                JSONObject(text).optJSONArray("data").objects().map { o ->
-                    val id = o.getString("id")
+                val google = baseUrls.any { "generativelanguage.googleapis.com" in it }
+                JSONObject(text).optJSONArray("data").objects().mapNotNull { o ->
+                    val id = o.getString("id").removePrefix("models/")
+                    // Google lists speech, live, image and robotics models too; only offer ones that can chat.
+                    if (google && (!id.startsWith("gemini") || NOT_CHAT.any { it in id } || id.startsWith("gemini-2"))) return@mapNotNull null
                     val modalities = o.optJSONObject("architecture")?.optJSONArray("input_modalities").strings() +
                         o.optJSONArray("input_modalities").strings()
                     val pricing = o.optJSONObject("pricing")
@@ -181,13 +238,13 @@ class LlmClient {
                         (pricing?.optString("prompt") == "0" && pricing.optString("completion") == "0")
                     ModelInfo(
                         id,
-                        vision = "image" in modalities,
+                        vision = "image" in modalities || (google && id.startsWith("gemini")),
                         free = free,
                         sizeBytes = o.optLong("size"),
                         recommended = o.optBoolean("cubic_recommended"),
                         contextTokens = o.optInt("context_length"),
-                    )
-                }.sortedBy { it.id }
+                    ).let { if (google && id == "gemini-3.5-flash") it.copy(recommended = true) else it }
+                }.sortedWith(compareByDescending<ModelInfo> { it.recommended }.thenBy { it.id })
             }
         } catch (e: IOException) {
             throw networkError(e, pin)
@@ -297,14 +354,16 @@ class LlmClient {
 
     private fun errorMessage(code: Int, body: String): String {
         val detail = runCatching {
-            val o = JSONObject(body)
+            // Google wraps some errors in a one-element array.
+            val o = if (body.trimStart().startsWith("[")) JSONArray(body).getJSONObject(0) else JSONObject(body)
             o.optJSONObject("error")?.str("message") ?: o.str("error") ?: o.str("message")
-        }.getOrNull() ?: body.take(300)
+        }.getOrNull()?.lineSequence()?.firstOrNull() ?: body.take(300)
         val hint = when (code) {
             401, 403 -> "Check your API key in Settings."
             402 -> "Your account is out of credits."
             404 -> "Model not found. Pick another model."
-            429 -> "Rate limited. Free models are often busy; wait a moment or pick another model."
+            429 -> "Rate limited or out of free quota. Wait a moment, pick another model, or check your plan."
+            503 -> "The model is overloaded right now. Try again or pick another model."
             else -> null
         }
         return listOfNotNull("Error $code: $detail".trim(), hint).joinToString("\n")

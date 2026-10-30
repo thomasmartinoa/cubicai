@@ -7,7 +7,22 @@ import android.speech.RecognizerIntent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.clickable
+import androidx.compose.material3.SmallFloatingActionButton
+import androidx.compose.runtime.derivedStateOf
+import kotlinx.coroutines.delay
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -198,30 +213,49 @@ fun ChatScreen(vm: ChatViewModel, onOpenSettings: () -> Unit) {
 private fun MessageList(state: UiState, vm: ChatViewModel) {
     val messages = state.current.messages
     val listState = rememberLazyListState()
+    val scope = rememberCoroutineScope()
     // reverseLayout keeps the view pinned to the newest message while it streams in.
-    LaunchedEffect(state.current.id, messages.size) { listState.scrollToItem(0) }
-    LazyColumn(
-        state = listState,
-        reverseLayout = true,
-        modifier = Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(18.dp),
-    ) {
-        items(messages.asReversed(), key = { it.id }) { message ->
-            val isLast = message.id == messages.last().id
-            if (message.role == Role.USER) {
-                UserMessage(message, canEdit = !state.streaming) { vm.editMessage(message.id, it) }
-            } else {
-                AssistantMessage(
-                    message = message,
-                    streaming = state.streaming && isLast,
-                    status = state.status,
-                    fallbackName = shortModelName(message.model.orEmpty()),
-                    isLast = isLast,
-                    onRegenerate = vm::regenerate,
-                    onSpeak = vm::speak,
-                )
+    LaunchedEffect(state.current.id, messages.size) { listState.animateScrollToItem(0) }
+    val atBottom by remember { derivedStateOf { listState.firstVisibleItemIndex == 0 && listState.firstVisibleItemScrollOffset < 80 } }
+    Box(Modifier.fillMaxSize()) {
+        LazyColumn(
+            state = listState,
+            reverseLayout = true,
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(18.dp),
+        ) {
+            items(messages.asReversed(), key = { it.id }) { message ->
+                val isLast = message.id == messages.last().id
+                Box(Modifier.animateItem(fadeInSpec = tween(220), placementSpec = tween(220), fadeOutSpec = tween(120))) {
+                    if (message.role == Role.USER) {
+                        UserMessage(message, canEdit = !state.streaming) { vm.editMessage(message.id, it) }
+                    } else {
+                        AssistantMessage(
+                            message = message,
+                            streaming = state.streaming && isLast,
+                            status = state.status,
+                            fallbackName = shortModelName(message.model.orEmpty()),
+                            isLast = isLast,
+                            onRegenerate = vm::regenerate,
+                            onSpeak = vm::speak,
+                        )
+                    }
+                }
             }
+        }
+        AnimatedVisibility(
+            visible = !atBottom,
+            enter = fadeIn(tween(150)) + scaleIn(tween(150), initialScale = 0.7f),
+            exit = fadeOut(tween(100)) + scaleOut(tween(100), targetScale = 0.7f),
+            modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 8.dp),
+        ) {
+            SmallFloatingActionButton(
+                onClick = { scope.launch { listState.animateScrollToItem(0) } },
+                shape = MaterialTheme.shapes.small,
+                containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+            ) { Icon(Icons.Rounded.KeyboardArrowDown, "Jump to latest") }
         }
     }
 }
@@ -266,16 +300,20 @@ private fun EmptyState(state: UiState, onSuggestion: (String) -> Unit, onOpenSet
                 "Explain how vaccines train the immune system",
                 "Help me write a polite complaint email",
                 "Plan a 3-day trip to Munnar",
-            ).forEach { prompt ->
-                Text(
-                    prompt,
-                    Modifier.fillMaxWidth().padding(vertical = 4.dp)
-                        .border(1.dp, MaterialTheme.colorScheme.outlineVariant, MaterialTheme.shapes.medium)
-                        .clip(MaterialTheme.shapes.medium)
-                        .clickable { onSuggestion(prompt) }
-                        .padding(horizontal = 16.dp, vertical = 14.dp),
-                    style = MaterialTheme.typography.bodyLarge,
-                )
+            ).forEachIndexed { i, prompt ->
+                var shown by remember { mutableStateOf(false) }
+                LaunchedEffect(Unit) { delay(70L * i); shown = true }
+                AnimatedVisibility(shown, enter = fadeIn(tween(260)) + slideInVertically(tween(260)) { it / 5 }) {
+                    Text(
+                        prompt,
+                        Modifier.fillMaxWidth().padding(vertical = 4.dp)
+                            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, MaterialTheme.shapes.medium)
+                            .clip(MaterialTheme.shapes.medium)
+                            .clickable { onSuggestion(prompt) }
+                            .padding(horizontal = 16.dp, vertical = 14.dp),
+                        style = MaterialTheme.typography.bodyLarge,
+                    )
+                }
             }
         }
     }
@@ -319,12 +357,16 @@ private fun Composer(state: UiState, vm: ChatViewModel) {
         border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
         modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp),
     ) {
-        Column {
-            if (state.pending.isNotEmpty() || state.attaching) PendingAttachments(state, vm)
+        Column(Modifier.animateContentSize(tween(180))) {
+            AnimatedVisibility(
+                visible = state.pending.isNotEmpty() || state.attaching,
+                enter = expandVertically(tween(180)) + fadeIn(tween(180)),
+                exit = shrinkVertically(tween(140)) + fadeOut(tween(100)),
+            ) { PendingAttachments(state, vm) }
             TextField(
                 value = state.draft,
                 onValueChange = vm::setDraft,
-                placeholder = { Text("Ask anything") },
+                placeholder = { Text(if (state.imageMode) "Describe the image you want" else "Ask anything") },
                 maxLines = 6,
                 modifier = Modifier.fillMaxWidth(),
                 colors = TextFieldDefaults.colors(
@@ -373,11 +415,31 @@ private fun Composer(state: UiState, vm: ChatViewModel) {
                         ),
                     )
                 }
+                if (state.settings.provider.images) {
+                    Spacer(Modifier.width(6.dp))
+                    FilterChip(
+                        selected = state.imageMode,
+                        onClick = vm::toggleImageMode,
+                        label = { Text("Image") },
+                        leadingIcon = { Icon(Icons.Rounded.Image, null, Modifier.size(18.dp)) },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = MaterialTheme.colorScheme.primary,
+                            selectedLabelColor = MaterialTheme.colorScheme.onPrimary,
+                            selectedLeadingIconColor = MaterialTheme.colorScheme.onPrimary,
+                        ),
+                    )
+                }
                 Spacer(Modifier.weight(1f))
-                when {
-                    state.streaming -> FilledIconButton(onClick = vm::stop, shape = MaterialTheme.shapes.small) { Icon(Icons.Rounded.Stop, "Stop") }
-                    canSend -> FilledIconButton(onClick = { vm.send() }, shape = MaterialTheme.shapes.small) { Icon(Icons.Rounded.ArrowUpward, "Send") }
-                    else -> IconButton(onClick = ::launchSpeech) { Icon(Icons.Rounded.Mic, "Voice input") }
+                AnimatedContent(
+                    targetState = when { state.streaming -> 2; canSend -> 1; else -> 0 },
+                    transitionSpec = { (fadeIn(tween(120)) + scaleIn(tween(120), initialScale = 0.8f)) togetherWith fadeOut(tween(80)) },
+                    label = "action",
+                ) { mode ->
+                    when (mode) {
+                        2 -> FilledIconButton(onClick = vm::stop, shape = MaterialTheme.shapes.small) { Icon(Icons.Rounded.Stop, "Stop") }
+                        1 -> FilledIconButton(onClick = { vm.send() }, shape = MaterialTheme.shapes.small) { Icon(Icons.Rounded.ArrowUpward, "Send") }
+                        else -> IconButton(onClick = ::launchSpeech) { Icon(Icons.Rounded.Mic, "Voice input") }
+                    }
                 }
             }
         }
