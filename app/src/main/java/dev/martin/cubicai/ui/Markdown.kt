@@ -79,12 +79,11 @@ private fun buildMarkwon(context: Context, colors: ColorScheme): Markwon {
             }
 
             override fun configureSpansFactory(builder: MarkwonSpansFactory.Builder) {
-                // Square bullets (the cube motif) instead of circles; numbered items keep Markwon's own span.
-                val numbered = builder.requireFactory(ListItem::class.java)
+                // Square bullets (the cube motif) instead of circles; both markers fade in with their item's first word.
                 builder.setFactory(ListItem::class.java) { config, props ->
                     if (CoreProps.LIST_ITEM_TYPE.require(props) == CoreProps.ListItemType.BULLET) {
                         SquareBulletSpan(config.theme(), CoreProps.BULLET_LIST_ITEM_LEVEL.require(props))
-                    } else numbered.getSpans(config, props)
+                    } else NumberSpan(config.theme(), "${CoreProps.ORDERED_LIST_ITEM_NUMBER.require(props)}.\u00a0")
                 }
             }
         })
@@ -102,7 +101,7 @@ private class SquareBulletSpan(private val theme: MarkwonTheme, private val leve
         if (!first || !LeadingMarginUtils.selfStart(start, text, this)) return
         // While streaming, an item's bullet waits for its first word and fades in with it.
         if (text.subSequence(start, end).isBlank()) return
-        val fade = (text as? Spanned)?.getSpans(start, start + 1, FadeSpan::class.java)?.firstOrNull()?.alpha ?: 1f
+        val fade = markerAlpha(text, start)
         val style = p.style
         val color = p.color
         theme.applyListItemStyle(p)
@@ -115,6 +114,34 @@ private class SquareBulletSpan(private val theme: MarkwonTheme, private val leve
         val half = if (level == 0) side / 2f else side / 2f - p.strokeWidth / 2f
         c.drawRect(cx - half, cy - half, cx + half, cy + half, p)
         p.style = style
+        p.color = color
+    }
+}
+
+/** How much a list marker should show: the fade of the first word of its item (1 once it has settled). */
+private fun markerAlpha(text: CharSequence, start: Int): Float =
+    (text as? Spanned)?.getSpans(start, start + 1, FadeSpan::class.java)?.firstOrNull()?.alpha ?: 1f
+
+/** "1." marker laid out like Markwon's own (right-aligned in the margin, which widens for long numbers), but fading. */
+private class NumberSpan(private val theme: MarkwonTheme, private val number: String) : LeadingMarginSpan {
+    private var margin = 0
+
+    override fun getLeadingMargin(first: Boolean) = maxOf(margin, theme.blockMargin)
+
+    override fun drawLeadingMargin(
+        c: Canvas, p: Paint, x: Int, dir: Int, top: Int, baseline: Int, bottom: Int,
+        text: CharSequence, start: Int, end: Int, first: Boolean, layout: Layout?,
+    ) {
+        if (!first || !LeadingMarginUtils.selfStart(start, text, this)) return
+        if (text.subSequence(start, end).isBlank()) return
+        val color = p.color
+        theme.applyListItemStyle(p)
+        p.alpha = (p.alpha * markerAlpha(text, start)).toInt()
+        val numberWidth = (p.measureText(number) + .5f).toInt()
+        val width = maxOf(theme.blockMargin, numberWidth)
+        margin = if (numberWidth > theme.blockMargin) numberWidth else 0
+        val left = if (dir > 0) x + width - numberWidth else x - width + (width - numberWidth)
+        c.drawText(number, left.toFloat(), baseline.toFloat(), p)
         p.color = color
     }
 }

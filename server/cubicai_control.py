@@ -241,7 +241,8 @@ class Window(Adw.ApplicationWindow):
         remote = Adw.PreferencesGroup(
             title="Away from home",
             description="Off: only devices on your home network can connect. On: your paired phone can also connect "
-                        "through Tailscale (encrypted, private to your Tailscale account). Re-pair after changing this.",
+                        "through Tailscale (encrypted, private to your Tailscale account). The phone picks up the Tailscale "
+                        "address the next time it connects at home; no re-pairing needed.",
         )
         self.remote_row = Adw.SwitchRow(title="Remote access through Tailscale", sensitive=False)
         self.remote_row.connect("notify::active", self.on_remote_toggled)
@@ -458,7 +459,8 @@ class Window(Adw.ApplicationWindow):
         on = row.get_active()
         cubicai_server.save_settings(remote=on)  # the running server picks this up on the next connection
         self.qr.queue_draw()
-        self.toast("Remote access on. Scan the new QR code on your phone" if on else "Remote access off. Tailscale connections are refused")
+        self.toast("Remote access on. The phone learns the address next time it connects at home" if on
+                   else "Remote access off. Tailscale connections are refused, even ones already open")
 
     def on_searx_toggled(self, switch, _pspec):
         if self.updating:

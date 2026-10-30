@@ -8,6 +8,7 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.Crossfade
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
@@ -55,6 +56,7 @@ import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material.icons.rounded.ArrowUpward
 import androidx.compose.material.icons.rounded.AttachFile
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.Image
@@ -162,6 +164,7 @@ fun ChatScreen(vm: ChatViewModel, onOpenSettings: () -> Unit) {
             ChatDrawer(
                 chats = state.chats,
                 currentId = state.current.id,
+                open = drawerState.targetValue == DrawerValue.Open,
                 onNew = { vm.newChat(); scope.launch { drawerState.close() } },
                 onOpen = { vm.openChat(it); scope.launch { drawerState.close() } },
                 onDelete = vm::deleteChat,
@@ -207,8 +210,11 @@ fun ChatScreen(vm: ChatViewModel, onOpenSettings: () -> Unit) {
                 Modifier.fillMaxSize().padding(padding).consumeWindowInsets(padding).imePadding(),
             ) {
                 Box(Modifier.weight(1f).fillMaxWidth()) {
-                    if (state.current.messages.isEmpty()) EmptyState(state, onSuggestion = vm::sendSuggestion, onOpenSettings = onOpenSettings, onBehaviour = { showBehaviour = true })
-                    else MessageList(state, vm)
+                    // The welcome screen hands over to the conversation with a short fade instead of a hard cut.
+                    Crossfade(state.current.messages.isEmpty(), animationSpec = tween(220), label = "emptyState") { empty ->
+                        if (empty) EmptyState(state, onSuggestion = vm::sendSuggestion, onOpenSettings = onOpenSettings, onBehaviour = { showBehaviour = true })
+                        else MessageList(state, vm)
+                    }
                 }
                 Composer(state, vm)
             }
@@ -492,6 +498,7 @@ private fun PendingAttachments(state: UiState, vm: ChatViewModel) {
 private fun ChatDrawer(
     chats: List<Chat>,
     currentId: String,
+    open: Boolean,
     onNew: () -> Unit,
     onOpen: (String) -> Unit,
     onDelete: (String) -> Unit,
@@ -512,8 +519,53 @@ private fun ChatDrawer(
             onClick = onNew,
             modifier = Modifier.padding(horizontal = 12.dp),
         )
+        // Search appears once the list is long enough to need it, and clears when the drawer closes,
+        // so a forgotten filter never hides chats next time.
+        var query by remember { mutableStateOf("") }
+        val focus = LocalFocusManager.current
+        LaunchedEffect(open) {
+            if (!open) {
+                query = ""
+                focus.clearFocus() // otherwise the keyboard stays up over the chat that was just opened
+            }
+        }
+        if (chats.size >= 6 || query.isNotEmpty()) {
+            TextField(
+                value = query,
+                onValueChange = { query = it },
+                placeholder = { Text("Search chats") },
+                leadingIcon = { Icon(Icons.Rounded.Search, null) },
+                trailingIcon = {
+                    if (query.isNotEmpty()) IconButton(onClick = { query = "" }) { Icon(Icons.Rounded.Close, "Clear search") }
+                },
+                singleLine = true,
+                shape = MaterialTheme.shapes.small,
+                colors = TextFieldDefaults.colors(
+                    focusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    unfocusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    focusedIndicatorColor = Color.Transparent,
+                    unfocusedIndicatorColor = Color.Transparent,
+                ),
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+            )
+        }
         val today = remember { LocalDate.now() }
-        val groups = remember(chats) { chats.groupBy { dateGroup(it.updatedAt, today) } }
+        val shown = remember(chats, query) {
+            val q = query.trim()
+            // Matches from the start of a word, so "tea" finds "tea" and "teaspoon" but not "steam".
+            val match = Regex("\\b" + Regex.escape(q), RegexOption.IGNORE_CASE)
+            if (q.isEmpty()) chats
+            else chats.filter { c -> match.containsMatchIn(c.title) || c.messages.any { match.containsMatchIn(it.content) } }
+        }
+        val groups = remember(shown) { shown.groupBy { dateGroup(it.updatedAt, today) } }
+        if (shown.isEmpty() && query.isNotBlank()) {
+            Text(
+                "No chats match \u201c${query.trim()}\u201d",
+                Modifier.padding(horizontal = 28.dp, vertical = 16.dp),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
         LazyColumn(Modifier.weight(1f)) {
             groups.forEach { (label, group) ->
                 item(key = "group:$label") {

@@ -14,7 +14,7 @@ Native Kotlin + Jetpack Compose, single `:app` module, package `dev.martin.cubic
 - `data/Models.kt`: Chat/Message/Attachment + org.json (de)serialisation. No kotlinx.serialization on purpose. Each chat stores its own persona and model.
 - `data/ChatStore.kt`: one JSON file per chat in filesDir/chats, attachments in filesDir/attachments.
 - `data/Attachments.kt`: images → downscaled JPEG; PDFs → page images via PdfRenderer; other files → text.
-- `net/LlmClient.kt`: OkHttp SSE streaming. `/chat/completions` normally; xAI + Search uses `/responses` with `web_search` + `x_search`. OpenRouter search uses `plugins:[{id:"web"}]`. Falls back across base URLs only on connect failure.
+- `net/LlmClient.kt`: OkHttp SSE streaming. `/chat/completions` normally; xAI + Search uses `/responses` with `web_search` + `x_search`. OpenRouter search uses `plugins:[{id:"web"}]`. Falls back across base URLs only on connect failure (a TLS refusal wins over later errors so the "turned away" hint shows). A stream that ends without `[DONE]`/`finish_reason` is an error ("connection dropped"), not a silent cut. Don't shorten the LAN connect timeout: home Wi-Fi with 1 s RTT spikes then fails spuriously.
 - `ChatViewModel.kt`: all state (`UiState`), streaming, edit/regenerate, personas, TTS. The whole history is resent each turn; photos only from the last 6 photo messages.
 - `ui/`: Theme (cobalt + amber, Chakra Petch headings, cut-corner shapes), Cube (brand mark + thinking animation), ChatScreen, Messages, Behaviour sheet, Markdown (Markwon; streaming word fade, square bullets), ModelPicker, ContextMeter, SettingsScreen.
 - Token usage: requests ask for `stream_options.include_usage`; the reply stores `promptTokens`/`outputTokens`. ContextMeter (beside send) shows last prompt+output against the model's `contextTokens`, estimating ~4 chars/token (marked `~`) when a provider doesn't report counts.
@@ -35,7 +35,9 @@ Native Kotlin + Jetpack Compose, single `:app` module, package `dev.martin.cubic
 
 ## Local PC mode (server/)
 - `server/cubicai_server.py`: stdlib-only HTTPS gateway: phone → (TLS 1.3, pinned self-signed cert, bearer token) → Ollama on 127.0.0.1:11434. Converts OpenAI chat format ↔ Ollama `/api/chat` (thinking → `delta.reasoning`, `cubic_status` progress events, `citations`, final `usage` from `prompt_eval_count`/`eval_count`).
-- Only loopback + private (home) addresses may connect; Tailscale (100.64/10) only while `remote` is on (`cubicai_server.py remote on|off`, or the panel). Others are dropped before TLS.
+- Only loopback + private (home) addresses may connect; Tailscale (100.64/10) only while `remote` is on (`cubicai_server.py remote on|off`, or the panel). Others are dropped before TLS, and the check repeats per request (403) so kept-alive Tailscale connections stop when remote goes off.
+- /v1/models includes `cubic_remote` (the Tailscale URL while remote is on); the app adds/updates its stored remote URL from it, never clears it, so no re-pair is needed.
+- Connection slots: 64 total, 12 per address. Error responses drain the unread body and close the connection.
 - Context: a Modelfile `num_ctx` wins; otherwise settings.json `num_ctx` (default 16384), capped at the model's max. Reported as `context_length` in /v1/models. `keep_alive` 15m.
 - Web search runs on the PC via SearXNG in Docker (`cubicai-searxng`, 127.0.0.1:8888, config in ~/.config/cubicai-server/searxng). Request flag `cubic_web_search: true`. Page fetches are limited to public addresses (SSRF guard, incl. redirects).
 - Identity (cert, key, token, settings.json) in ~/.config/cubicai-server (0700). Pairing link `cubicai://pair?u=&r=&t=&f=`; `rotate` revokes phones.
@@ -47,3 +49,5 @@ Native Kotlin + Jetpack Compose, single `:app` module, package `dev.martin.cubic
 ## Notes
 - All providers are treated as OpenAI-compatible; adding one = new entry in `Providers`.
 - Messages list uses `reverseLayout` to stay pinned to the bottom while streaming.
+- Drawer search shows from 6 chats, matches titles and message text from the start of a word; it clears (and drops focus) when the drawer closes.
+- README screenshots live in docs/screenshots (540 px wide, taken with the SystemUI demo-mode status bar, no personal content).

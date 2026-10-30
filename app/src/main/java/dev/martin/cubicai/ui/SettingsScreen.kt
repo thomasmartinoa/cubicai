@@ -18,6 +18,8 @@ import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.ui.semantics.Role
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -109,7 +111,7 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
             Modifier.fillMaxSize().padding(padding).verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            LocalPcSection(s, vm)
+            LocalPcSection(s, state.testingConnection, vm)
 
             SectionTitle("Cloud API keys")
             SettingsCard {
@@ -164,9 +166,14 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
 
             SectionTitle("Privacy")
             SettingsCard {
-                SettingRow("Privacy screen", "Blank in the recent-apps view and blocks screenshots and screen recording.") {
-                    CutSwitch(s.privacyScreen, onCheckedChange = { v -> vm.updateSettings { it.copy(privacyScreen = v) } })
-                }
+                // The whole row is the switch: a bigger target, and TalkBack reads the title with the state.
+                SettingRow(
+                    "Privacy screen",
+                    "Blank in the recent-apps view and blocks screenshots and screen recording.",
+                    Modifier.clip(MaterialTheme.shapes.small).toggleable(s.privacyScreen, role = Role.Switch) { v ->
+                        vm.updateSettings { it.copy(privacyScreen = v) }
+                    },
+                ) { CutSwitch(s.privacyScreen) }
             }
 
             SectionTitle("Data")
@@ -211,8 +218,8 @@ private fun SettingsCard(content: @Composable ColumnScope.() -> Unit) {
 
 /** A setting's name and explanation, with its control on the right. */
 @Composable
-private fun SettingRow(title: String, description: String, control: @Composable () -> Unit) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
+private fun SettingRow(title: String, description: String, modifier: Modifier = Modifier, control: @Composable () -> Unit) {
+    Row(modifier, verticalAlignment = Alignment.CenterVertically) {
         Column(Modifier.weight(1f)) {
             Text(title, style = MaterialTheme.typography.bodyLarge)
             Text(description, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -222,25 +229,22 @@ private fun SettingRow(title: String, description: String, control: @Composable 
     }
 }
 
-/** On/off toggle in the app's bevelled style; Material's switch is pill-shaped and can't take another shape. */
+/**
+ * On/off toggle in the app's bevelled style; Material's switch is pill-shaped and can't take another shape.
+ * Only draws the state: the row around it handles taps.
+ */
 @Composable
-private fun CutSwitch(checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
+private fun CutSwitch(checked: Boolean) {
     val colors = MaterialTheme.colorScheme
     val thumbX by animateDpAsState(if (checked) 20.dp else 0.dp, tween(160), label = "thumb")
     val track by animateColorAsState(if (checked) colors.primary else colors.surfaceContainerHighest, tween(160), label = "track")
     val edge by animateColorAsState(if (checked) colors.primary else colors.outline, tween(160), label = "edge")
     val thumb by animateColorAsState(if (checked) colors.onPrimary else colors.onSurfaceVariant, tween(160), label = "thumbColor")
     Box(
-        Modifier.minimumInteractiveComponentSize()
-            .toggleable(checked, role = Role.Switch, onValueChange = onCheckedChange),
-        contentAlignment = Alignment.Center,
+        Modifier.padding(vertical = 8.dp).size(52.dp, 32.dp).clip(CutCornerShape(8.dp)).background(track)
+            .border(2.dp, edge, CutCornerShape(8.dp)).padding(6.dp),
     ) {
-        Box(
-            Modifier.size(52.dp, 32.dp).clip(CutCornerShape(8.dp)).background(track)
-                .border(2.dp, edge, CutCornerShape(8.dp)).padding(6.dp),
-        ) {
-            Box(Modifier.offset(x = thumbX).size(20.dp).background(thumb, CutCornerShape(4.dp)))
-        }
+        Box(Modifier.offset(x = thumbX).size(20.dp).background(thumb, CutCornerShape(4.dp)))
     }
 }
 
@@ -276,8 +280,9 @@ private fun KeyField(provider: Provider, value: String, onChange: (String) -> Un
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun LocalPcSection(s: Settings, vm: ChatViewModel) {
+private fun LocalPcSection(s: Settings, testing: Boolean, vm: ChatViewModel) {
     val context = LocalContext.current
     var link by remember { mutableStateOf("") }
     var confirmUnpair by remember { mutableStateOf(false) }
@@ -302,7 +307,7 @@ private fun LocalPcSection(s: Settings, vm: ChatViewModel) {
             }
             if (s.isPaired) Text(
                 if (s.localRemoteUrl.isNotBlank()) "Away from home: through Tailscale (${s.localRemoteUrl.removePrefix("https://")})"
-                else "Away from home: off. Turn on remote access in CubicAI Server, then re-pair.",
+                else "Away from home: off. Turn on remote access in CubicAI Server, then tap Test connection at home.",
                 style = MaterialTheme.typography.bodyMedium,
             )
             Text(
@@ -312,8 +317,11 @@ private fun LocalPcSection(s: Settings, vm: ChatViewModel) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             if (s.isPaired) {
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(shape = MaterialTheme.shapes.small, onClick = vm::testLocalConnection) { Text("Test connection") }
+                // Wraps onto a second line with large text instead of squeezing a button to one letter per line.
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(shape = MaterialTheme.shapes.small, onClick = vm::testLocalConnection, enabled = !testing) {
+                        Text(if (testing) "Testing…" else "Test connection")
+                    }
                     OutlinedButton(shape = MaterialTheme.shapes.small, onClick = ::scan) { Text("Re-pair") }
                     TextButton(
                         onClick = { confirmUnpair = true },

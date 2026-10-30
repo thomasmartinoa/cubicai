@@ -21,11 +21,14 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 import java.security.MessageDigest
 import java.security.cert.CertificateException
 import java.security.cert.X509Certificate
 import java.util.concurrent.TimeUnit
 import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLException
 import javax.net.ssl.X509TrustManager
 
 sealed interface StreamEvent {
@@ -124,7 +127,8 @@ class LlmClient {
                 return call.execute().also { preferredUrl = url }
             } catch (e: IOException) {
                 if (call.isCanceled()) throw e
-                last = e
+                // Keep the error from an address that answered (a refusal says more than the other one's timeout).
+                if (last !is SSLException || e is SSLException) last = e
             }
         }
         throw last ?: IOException("No address to connect to")
@@ -158,15 +162,26 @@ class LlmClient {
                     .post(payload)
                     .build()
             }.use { response ->
-                if (!response.isSuccessful) throw ApiException(errorMessage(response.code, response.body.string()))
+                if (!response.isSuccessful) throw ApiException(errorMessage(response.code, response.body.string(), pc = pin != null))
                 val source = response.body.source()
+                // A stream that just stops (server restarted, Wi-Fi dropped) must not pass for a finished reply.
+                var finished = false
                 while (true) {
                     val line = source.readUtf8Line() ?: break
                     if (!line.startsWith("data:")) continue
                     val data = line.substring(5).trim()
-                    if (data == "[DONE]") break
+                    if (data == "[DONE]") { finished = true; break }
                     val json = runCatching { JSONObject(data) }.getOrNull() ?: continue
-                    if (useResponses) parseResponsesEvent(json, onEvent) else parseChatChunk(json, onEvent)
+                    if (useResponses) {
+                        if (json.optString("type") == "response.completed") finished = true
+                        parseResponsesEvent(json, onEvent)
+                    } else {
+                        if (json.optJSONArray("choices")?.optJSONObject(0)?.isNull("finish_reason") == false) finished = true
+                        parseChatChunk(json, onEvent)
+                    }
+                }
+                if (!finished) {
+                    throw ApiException((if (pin != null) "The connection to your PC" else "The connection") + " dropped before the reply finished.")
                 }
             }
         } catch (e: IOException) {
@@ -228,7 +243,13 @@ class LlmClient {
         }
     }
 
-    suspend fun listModels(baseUrls: List<String>, apiKey: String, pin: String? = null): List<ModelInfo> = withContext(Dispatchers.IO) {
+    /** [onRemoteUrl] gets the PC's Tailscale address ("" while remote access is off), if the PC reports it. */
+    suspend fun listModels(
+        baseUrls: List<String>,
+        apiKey: String,
+        pin: String? = null,
+        onRemoteUrl: (String) -> Unit = {},
+    ): List<ModelInfo> = withContext(Dispatchers.IO) {
         try {
             executeFirst(baseUrls, pin, {}) { baseUrl ->
                 Request.Builder()
@@ -237,9 +258,11 @@ class LlmClient {
                     .build()
             }.use { response ->
                 val text = response.body.string()
-                if (!response.isSuccessful) throw ApiException(errorMessage(response.code, text))
+                if (!response.isSuccessful) throw ApiException(errorMessage(response.code, text, pc = pin != null))
                 val google = baseUrls.any { "generativelanguage.googleapis.com" in it }
-                JSONObject(text).optJSONArray("data").objects().mapNotNull { o ->
+                val root = JSONObject(text)
+                if (pin != null && root.has("cubic_remote")) onRemoteUrl(root.optString("cubic_remote").takeIf { it.startsWith("https://") }.orEmpty())
+                root.optJSONArray("data").objects().mapNotNull { o ->
                     val id = o.getString("id").removePrefix("models/")
                     // Google lists speech, live, image and robotics models too; only offer ones that can chat.
                     if (google && (!id.startsWith("gemini") || NOT_CHAT.any { it in id } || id.startsWith("gemini-2"))) return@mapNotNull null
@@ -367,20 +390,34 @@ class LlmClient {
     }
 
     private fun networkError(e: IOException, pin: String?): ApiException {
-        val detail = e.message ?: e.javaClass.simpleName
+        if (pin == null) return ApiException(
+            when (e) {
+                is UnknownHostException -> "No internet connection."
+                is SocketTimeoutException -> "The server didn't answer in time. Try again."
+                else -> "Network error: ${e.message ?: e.javaClass.simpleName}"
+            }
+        )
+        val mismatch = generateSequence<Throwable>(e) { it.cause }.filterIsInstance<CertificateException>().firstOrNull()
         return ApiException(
-            if (pin != null) "Can't reach your PC ($detail). Check the server is on, and that you're on home Wi-Fi or Tailscale."
-            else "Network error: $detail"
+            when {
+                mismatch != null -> mismatch.message ?: "This isn't your paired PC. Pair again in Settings."
+                // The PC drops connections it doesn't allow (Tailscale while remote access is off) before TLS.
+                e is SSLException -> "Your PC turned the connection away. If you're away from home, turn on remote access in CubicAI Server."
+                else -> "Can't reach your PC. Check that CubicAI Server is running, and that you're on home Wi-Fi or Tailscale."
+            }
         )
     }
 
-    private fun errorMessage(code: Int, body: String): String {
+    /** [pc]: the paired PC, whose 401 means the pairing was revoked rather than a wrong API key. */
+    private fun errorMessage(code: Int, body: String, pc: Boolean = false): String {
         val detail = runCatching {
             // Google wraps some errors in a one-element array.
             val o = if (body.trimStart().startsWith("[")) JSONArray(body).getJSONObject(0) else JSONObject(body)
             o.optJSONObject("error")?.str("message") ?: o.str("error") ?: o.str("message")
         }.getOrNull()?.lineSequence()?.firstOrNull() ?: body.take(300)
         val hint = when (code) {
+            401 if pc -> "Your PC no longer accepts this phone's pairing. Pair again in Settings."
+            403 if pc -> null // the PC explains itself
             401, 403 -> "Check your API key in Settings."
             402 -> "Your account is out of credits."
             404 -> "Model not found. Pick another model."
@@ -388,6 +425,7 @@ class LlmClient {
             503 -> "The model is overloaded right now. Try again or pick another model."
             else -> null
         }?.takeUnless { detail.contains("try again", ignoreCase = true) } // the provider already said it
+        if (pc && code == 401) return hint!! // the PC's own "invalid token" adds nothing
         return listOfNotNull("Error $code: $detail".trim(), hint).joinToString("\n")
     }
 }

@@ -35,7 +35,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -46,11 +46,14 @@ SEARXNG_URL = os.environ.get("CUBICAI_SEARXNG_URL", "http://127.0.0.1:8888")
 DEFAULT_PORT = 8443
 DEFAULT_CTX = int(os.environ.get("CUBICAI_NUM_CTX", "16384"))  # Ollama's own default is 4096; settings.json "num_ctx" overrides
 MAX_BODY = 64 * 1024 * 1024
-MAX_CONNECTIONS = 32
+DRAIN_LIMIT = 1024 * 1024  # a rejected request's body is read (and dropped) up to this size
+MAX_CONNECTIONS = 64
+MAX_PER_ADDRESS = 12  # so one misbehaving device on the network can't take every slot
 PRE_AUTH_TIMEOUT = 30
 SEARCH_RESULTS = 8
 PAGES_TO_READ = 4
 PAGE_CHARS = 4000
+PAGE_DEADLINE = 6  # seconds for reading all result pages together
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0 Safari/537.36"
 
 
@@ -522,12 +525,18 @@ def read_page(url):
         return ""
 
 
-def research(query):
+def research(query, on_results=lambda urls: None):
+    """Search, then read the top pages; [on_results] gets the result URLs as soon as they're known."""
     results = search(query)
     if not results:
         return [], ""
-    with ThreadPoolExecutor(PAGES_TO_READ) as pool:
-        pages = list(pool.map(read_page, [r["url"] for r in results[:PAGES_TO_READ]]))
+    on_results([r["url"] for r in results])
+    # One slow site mustn't hold up the answer: pages not read by the deadline fall back to their search snippet.
+    pool = ThreadPoolExecutor(PAGES_TO_READ)
+    futures = [pool.submit(read_page, r["url"]) for r in results[:PAGES_TO_READ]]
+    done, _ = wait(futures, timeout=PAGE_DEADLINE)
+    pool.shutdown(wait=False, cancel_futures=True)
+    pages = [f.result() if f in done else "" for f in futures]
     blocks = []
     for i, r in enumerate(results):
         body = pages[i] if i < len(pages) and pages[i] else r["snippet"]
@@ -552,6 +561,10 @@ class Handler(BaseHTTPRequestHandler):
         pass  # never log request lines or bodies
 
     def _authorized(self):
+        if not client_allowed(self.client_address[0]):
+            # A kept-alive connection opened before remote access was switched off: the check holds per request too.
+            self._json(403, {"error": {"message": "Remote access is off on your PC. Turn it on in CubicAI Server to connect over Tailscale."}})
+            return False
         expected = f"Bearer {self.server.token}".encode()
         if hmac.compare_digest(self.headers.get("Authorization", "").encode(), expected):
             return True
@@ -566,8 +579,25 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        if code >= 400:
+            # A rejected request's body may be unread: never parse it as a next request, and read it first so
+            # closing doesn't reset the connection before the client sees this reply.
+            self._drain()
+            self.send_header("Connection", "close")
+            self.close_connection = True
         self.end_headers()
         self.wfile.write(body)
+
+    def _drain(self):
+        if self.command != "POST" or getattr(self, "_body_read", False):
+            return
+        self._body_read = True
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            if 0 < length <= DRAIN_LIMIT:
+                self.rfile.read(length)
+        except (ValueError, OSError):
+            pass
 
     def do_GET(self):
         if not self._authorized():
@@ -579,7 +609,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, ACTIVITY.snapshot())
         elif path == "/v1/models":
             try:
-                self._json(200, list_models())
+                # The phone learns the Tailscale address from here, so remote on/off needs no re-pairing.
+                self._json(200, {**list_models(), "cubic_remote": remote_url(self.server.server_address[1])})
             except Exception as e:
                 self._json(502, {"error": {"message": f"Can't reach Ollama: {e}"}})
         else:
@@ -600,6 +631,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(413, {"error": {"message": "Request too large"}})
             return
         try:
+            self._body_read = True
             body = json.loads(self.rfile.read(length))
         except ValueError:
             self._json(400, {"error": {"message": "Invalid JSON"}})
@@ -643,12 +675,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._emit({"cubic_status": "Searching the web…"})
                 query = make_query(model, caps, messages)
                 self._emit({"cubic_status": f"Searching: {query}"})
-                urls, context = research(query)
-                if urls:
+                def found(urls):
                     self._emit({"citations": urls})
                     self._emit({"cubic_status": f"Reading {len(urls)} results…"})
                     ACTIVITY.phase(rid, f"Reading {len(urls)} results")
-                else:
+
+                urls, context = research(query, found)
+                if not urls:
                     context = "Web search was requested but returned no results. Answer from your own knowledge and say so."
                 if messages and messages[0]["role"] == "system":
                     messages[0]["content"] += "\n\n" + context
@@ -724,6 +757,7 @@ class TLSServer(ThreadingHTTPServer):
         super().__init__(address, Handler)
         self.tls, self.token = tls, token
         self.slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+        self.per_address, self.per_address_lock = {}, threading.Lock()
 
     def verify_request(self, request, client_address):
         # Dropped before TLS: outsiders can't even see a certificate.
@@ -733,21 +767,43 @@ class TLSServer(ThreadingHTTPServer):
         ACTIVITY.reject(client_address[0])
         return False
 
+    def _take_slot(self, ip):
+        with self.per_address_lock:
+            if self.per_address.get(ip, 0) >= MAX_PER_ADDRESS:
+                return False
+            if not self.slots.acquire(blocking=False):
+                return False
+            self.per_address[ip] = self.per_address.get(ip, 0) + 1
+            return True
+
+    def _free_slot(self, ip):
+        with self.per_address_lock:
+            left = self.per_address.get(ip, 1) - 1
+            if left > 0:
+                self.per_address[ip] = left
+            else:
+                self.per_address.pop(ip, None)
+            self.slots.release()
+
     def process_request(self, request, client_address):
-        if not self.slots.acquire(blocking=False):
+        if not self._take_slot(client_address[0]):
             self.shutdown_request(request)
             return
         try:
             super().process_request(request, client_address)
         except Exception:
-            self.slots.release()
+            self._free_slot(client_address[0])
             raise
 
     def process_request_thread(self, request, client_address):
         try:
             super().process_request_thread(request, client_address)
         finally:
-            self.slots.release()
+            self._free_slot(client_address[0])
+
+    def handle_error(self, request, client_address):
+        # One line instead of socketserver's traceback; usually just a client that went away mid-request.
+        log(f"request from {client_address[0]} ended early: {sys.exc_info()[0].__name__}")
 
     def finish_request(self, request, client_address):
         # TLS handshake happens here, on the worker thread, so one slow client can't block accept().
@@ -795,7 +851,7 @@ def main():
         ip = tailscale_ip()
         print(f"Remote access: {'on' if remote_enabled() else 'off'}; Tailscale: {ip or 'not connected'}")
         if a.state == "on":
-            print("Pair the phone again so it learns the Tailscale address.")
+            print("The phone learns the Tailscale address the next time it connects at home (no re-pairing needed).")
     elif a.cmd == "rotate":
         identity()
         rotate_token()

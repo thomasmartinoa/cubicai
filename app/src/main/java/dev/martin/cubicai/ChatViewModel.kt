@@ -40,6 +40,8 @@ import java.time.format.DateTimeFormatter
 
 data class UiState(
     val settings: Settings,
+    /** "Test connection" is running (it can take a few seconds when the PC is unreachable). */
+    val testingConnection: Boolean = false,
     val chats: List<Chat> = emptyList(),
     val current: Chat = Chat(),
     val draft: String = "",
@@ -141,9 +143,22 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         if (baseUrls.isEmpty()) {
             throw ApiException(if (provider == Providers.LOCAL) "Pair with your PC first: Settings → Local PC." else "Set a base URL in Settings first.")
         }
-        return client.listModels(baseUrls, s.key(provider), s.pin(provider)).also {
+        return client.listModels(baseUrls, s.key(provider), s.pin(provider), onRemoteUrl = ::learnRemoteUrl).also {
             modelCache[provider.id] = it
             refreshContextLimit() // the open chat's meter may have been waiting on this list
+        }
+    }
+
+    /**
+     * The PC says where it is on Tailscale, so turning remote access on there needs no re-pairing. An address is
+     * only ever added or updated: forgetting it while remote access is off would leave a phone that's away from
+     * home unable to reconnect once it's switched back on (it then gets a clear "turned away" message instead).
+     */
+    private fun learnRemoteUrl(url: String) {
+        if (url.isEmpty()) return
+        // Called from the network thread; settings are saved on the main thread like every other change.
+        viewModelScope.launch {
+            if (url != _state.value.settings.localRemoteUrl && _state.value.settings.isPaired) updateSettings { it.copy(localRemoteUrl = url) }
         }
     }
 
@@ -179,7 +194,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     fun setAboutMe(text: String) = updateSettings { it.copy(aboutMe = text) }
 
-    /** Pairs with the PC gateway from a scanned/pasted `gk://pair` link and switches to it. */
+    /** Pairs with the PC gateway from a scanned/pasted `cubicai://pair` link and switches to it. */
     fun pair(link: String): Boolean {
         val pairing = Pairing.parse(link) ?: run {
             _state.update { it.copy(notice = "That isn't a CubicAI pairing code. Open CubicAI Server on your PC → Pair.") }
@@ -222,11 +237,16 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun testLocalConnection() {
+        if (_state.value.testingConnection) return
         modelCache.remove(Providers.LOCAL.id)
+        _state.update { it.copy(testingConnection = true) }
         viewModelScope.launch {
             val result = runCatching { listModels(Providers.LOCAL) }
             _state.update {
-                it.copy(notice = result.fold({ list -> "Connected · ${list.size} models" }, { e -> e.message ?: "Connection failed" }))
+                it.copy(
+                    testingConnection = false,
+                    notice = result.fold({ list -> "Connected · ${list.size} models" }, { e -> e.message ?: "Connection failed" }),
+                )
             }
         }
     }

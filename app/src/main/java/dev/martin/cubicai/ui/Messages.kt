@@ -74,9 +74,14 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
@@ -127,12 +132,24 @@ fun UserMessage(message: Message, canEdit: Boolean, onEdit: (String) -> Unit) {
 
 @Composable
 private fun EditDialog(initial: String, onDismiss: () -> Unit, onSave: (String) -> Unit) {
-    var text by remember { mutableStateOf(initial) }
+    // Opens ready to type: field focused, keyboard up, cursor after the last word.
+    var text by remember { mutableStateOf(TextFieldValue(initial, TextRange(initial.length))) }
+    val focus = remember { FocusRequester() }
+    LaunchedEffect(Unit) { focus.requestFocus() }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Edit message") },
-        text = { OutlinedTextField(text, { text = it }, Modifier.fillMaxWidth(), maxLines = 10) },
-        confirmButton = { TextButton(onClick = { onSave(text) }, enabled = text.isNotBlank()) { Text("Send") } },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(
+                    "Sending replaces the replies that came after this message.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                OutlinedTextField(text, { text = it }, Modifier.fillMaxWidth().focusRequester(focus), maxLines = 10)
+            }
+        },
+        confirmButton = { TextButton(onClick = { onSave(text.text) }, enabled = text.text.isNotBlank()) { Text("Send") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
 }
@@ -292,12 +309,15 @@ private fun ReasoningBlock(reasoning: String, active: Boolean) {
             // Same 16dp mark + 8dp gap as the reply header, so both labels start on one line.
             Icon(Icons.Rounded.Psychology, null, Modifier.size(16.dp), tint = muted)
             Spacer(Modifier.width(8.dp))
-            Text(if (active) "Thinking" else "Thought process", style = MaterialTheme.typography.labelLarge, color = muted)
+            Text(if (active) "Thoughts" else "Thought process", style = MaterialTheme.typography.labelLarge, color = muted)
             Icon(Icons.Rounded.ExpandMore, null, Modifier.size(18.dp).graphicsLayer { rotationZ = arrow }, tint = muted)
         }
         AnimatedVisibility(expanded, enter = expandVertically(tween(200)) + fadeIn(tween(200)), exit = shrinkVertically(tween(160)) + fadeOut(tween(120))) {
             val scroll = rememberScrollState()
-            LaunchedEffect(reasoning) { if (active) scroll.scrollTo(scroll.maxValue) }
+            // Follow the newest thoughts: track the scroll range itself, which grows only after the new text is laid out.
+            LaunchedEffect(active) {
+                if (active) snapshotFlow { scroll.maxValue }.collect { scroll.scrollTo(it) }
+            }
             Surface(
                 color = MaterialTheme.colorScheme.surfaceContainer,
                 shape = MaterialTheme.shapes.medium,
