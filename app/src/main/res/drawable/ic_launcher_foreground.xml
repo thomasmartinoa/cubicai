@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- CubicAI mark: isometric cube, lit top face, hairline seams. Same geometry as ui/Cube.kt. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <path android:fillColor="#FFC861" android:pathData="M54,31 L74.78,43 L54,55 L33.22,43 Z" />
+    <path android:fillColor="#F29E38" android:pathData="M33.22,43 L54,55 L54,79 L33.22,67 Z" />
+    <path android:fillColor="#C46F1C" android:pathData="M54,55 L74.78,43 L74.78,67 L54,79 Z" />
+    <path android:strokeColor="#161B33" android:strokeWidth="1.6"
+        android:pathData="M54,55 L33.22,43 M54,55 L74.78,43 M54,55 L54,79" />
+</vector>

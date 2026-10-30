@@ -1,0 +1,19 @@
+[Unit]
+Description=CubicAI private gateway (phone app -> Ollama)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%h/dev_works/Model_test_harness/cubicai/server/.venv/bin/python %h/dev_works/Model_test_harness/cubicai/server/cubicai_server.py serve
+Restart=on-failure
+RestartSec=5
+# The gateway only needs to read its code and write its own config folder.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.config/cubicai-server
+UMask=0077
+
+[Install]
+WantedBy=default.target
