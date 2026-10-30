@@ -152,6 +152,9 @@ data class Pairing(val url: String, val remoteUrl: String, val token: String, va
 
 class SettingsStore(context: Context) {
     private val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
+    /** Keys as written by this store, so a save re-encrypts only a key that changed, not all of them on every keystroke.
+     *  Starts empty, so the first save also seals any key stored before encryption existed. */
+    private var savedKeys = emptyMap<String, String>()
 
     fun load() = Settings(
         providerId = prefs.getString("provider", null) ?: Providers.LOCAL.id,
@@ -170,7 +173,8 @@ class SettingsStore(context: Context) {
 
     fun save(s: Settings) = prefs.edit {
         putString("provider", s.providerId)
-        s.apiKeys.forEach { (id, key) -> putString("key_$id", SecretBox.seal(key)) }
+        s.apiKeys.forEach { (id, key) -> if (savedKeys[id] != key) putString("key_$id", SecretBox.seal(key)) }
+        savedKeys = s.apiKeys
         s.models.forEach { (id, model) -> putString("model_$id", model) }
         putString("custom_base_url", s.customBaseUrl)
         putString("local_url", s.localUrl)

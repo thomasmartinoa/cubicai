@@ -27,6 +27,7 @@ import dev.martin.cubicai.net.StreamEvent
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -54,6 +55,17 @@ data class UiState(
 /** How many recent messages keep their photos in the request; older ones are summarised as a note. */
 private const val MAX_IMAGE_MESSAGES = 6
 
+/** Streamed tokens are applied to the screen at most this often; one update per token re-laid-out the reply too often. */
+private const val STREAM_FRAME_MS = 50L
+
+/** Text that arrived since the last screen update (written by the network thread, flushed on a short timer). */
+private class TokenBuffer {
+    val text = StringBuilder()
+    val reasoning = StringBuilder()
+    var flushedAt = 0L
+    var flushScheduled = false
+}
+
 class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private val store = ChatStore(app)
     private val settingsStore = SettingsStore(app)
@@ -66,6 +78,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     private var job: Job? = null
     private var runId = 0
+    private var lastStreamSave = 0L
     private var tts: TextToSpeech? = null
     private var ttsReady = false
     private var pendingSpeech: List<String>? = null
@@ -76,7 +89,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     init {
         viewModelScope.launch(Dispatchers.IO) { cameraDir.listFiles()?.forEach { it.delete() } } // leftovers from a crash
         viewModelScope.launch {
-            val chats = withContext(io) { store.loadAll() }
+            val chats = withContext(io) { store.loadAll() }.map(::markInterrupted)
             _state.update { it.copy(chats = chats) }
         }
     }
@@ -209,6 +222,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun openChat(id: String) {
         if (_state.value.current.id == id) return
         job?.cancel()
+        if (_state.value.chats.any { it.id == id }) discard(_state.value.pending) // unsent files would be orphaned
         _state.update { s -> s.chats.firstOrNull { it.id == id }?.let { s.copy(current = it, pending = emptyList()) } ?: s }
         // Each chat keeps its own model: switch back to it (the PC loads it on the next message if needed).
         val chat = _state.value.current
@@ -288,6 +302,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val index = c.messages.indexOfFirst { it.id == id }
         if (_state.value.streaming || index < 0) return
         val edited = c.messages[index].copy(content = text.trim())
+        discard(c.messages.drop(index + 1).flatMap { it.attachments }) // later turns are gone; so are their files
         _state.update { it.copy(current = c.copy(messages = c.messages.take(index) + edited)) }
         complete()
     }
@@ -300,6 +315,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val wasImage = provider.images && c.messages.lastOrNull { it.role == Role.ASSISTANT }?.model == provider.imageModel
         val trimmed = c.messages.dropLastWhile { it.role == Role.ASSISTANT }
         if (trimmed.isEmpty()) return
+        discard(c.messages.drop(trimmed.size).flatMap { it.attachments }) // e.g. a created image being redone
         _state.update { it.copy(current = c.copy(messages = trimmed)) }
         if (wasImage) createImage() else complete()
     }
@@ -335,6 +351,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         persist(chat.id)
 
         val run = ++runId
+        val buffer = TokenBuffer()
         job = viewModelScope.launch {
             var cancelled = false
             try {
@@ -348,7 +365,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 val messages = withContext(Dispatchers.IO) { buildApiMessages(settings, persona, history) }
                 client.stream(baseUrls, key, model, messages, provider.search, settings.webSearch, settings.pin(provider)) { event ->
-                    onStreamEvent(chat.id, reply.id, event)
+                    onStreamEvent(chat.id, reply.id, event, buffer)
                 }
             } catch (e: CancellationException) {
                 cancelled = true
@@ -356,6 +373,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             } catch (e: Exception) {
                 updateMessage(chat.id, reply.id) { it.copy(error = e.message ?: "Something went wrong") }
             } finally {
+                flush(chat.id, reply.id, buffer)
                 updateMessage(chat.id, reply.id) { m ->
                     when {
                         cancelled -> m.copy(stopped = true)
@@ -412,20 +430,47 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun onStreamEvent(chatId: String, messageId: String, event: StreamEvent) {
+    private fun onStreamEvent(chatId: String, messageId: String, event: StreamEvent, buffer: TokenBuffer) {
         when (event) {
-            is StreamEvent.Text -> {
-                updateMessage(chatId, messageId) { it.copy(content = it.content + event.text) }
-                if (_state.value.status != null) _state.update { it.copy(status = null) }
+            is StreamEvent.Text -> synchronized(buffer) { buffer.text.append(event.text) }
+            is StreamEvent.Reasoning -> synchronized(buffer) { buffer.reasoning.append(event.text) }
+            is StreamEvent.Citation -> {
+                flush(chatId, messageId, buffer)
+                updateMessage(chatId, messageId) { if (event.url in it.citations) it else it.copy(citations = it.citations + event.url) }
             }
-            is StreamEvent.Reasoning -> {
-                updateMessage(chatId, messageId) { it.copy(reasoning = it.reasoning + event.text) }
-                if (_state.value.status != null) _state.update { it.copy(status = null) }
+            is StreamEvent.Status -> {
+                flush(chatId, messageId, buffer)
+                _state.update { it.copy(status = event.text) }
             }
-            is StreamEvent.Citation -> updateMessage(chatId, messageId) {
-                if (event.url in it.citations) it else it.copy(citations = it.citations + event.url)
+        }
+        val now = System.currentTimeMillis()
+        synchronized(buffer) {
+            val wait = STREAM_FRAME_MS - (now - buffer.flushedAt)
+            if (wait <= 0) flush(chatId, messageId, buffer)
+            else if (!buffer.flushScheduled) {
+                // Tokens that arrive just after an update still show within one frame period, even if the stream pauses.
+                buffer.flushScheduled = true
+                viewModelScope.launch { delay(wait); flush(chatId, messageId, buffer) }
             }
-            is StreamEvent.Status -> _state.update { it.copy(status = event.text) }
+        }
+        // Save the partial reply now and then, so a killed app keeps most of it.
+        if (now - lastStreamSave > 3000) {
+            lastStreamSave = now
+            persist(chatId)
+        }
+    }
+
+    /** Applies the buffered tokens to the reply in one state update (under the lock, so chunks can't swap order). */
+    private fun flush(chatId: String, messageId: String, buffer: TokenBuffer) = synchronized(buffer) {
+        buffer.flushedAt = System.currentTimeMillis()
+        buffer.flushScheduled = false
+        if (buffer.text.isNotEmpty() || buffer.reasoning.isNotEmpty()) {
+            val text = buffer.text.toString()
+            val reasoning = buffer.reasoning.toString()
+            buffer.text.clear()
+            buffer.reasoning.clear()
+            updateMessage(chatId, messageId) { it.copy(content = it.content + text, reasoning = it.reasoning + reasoning) }
+            if (_state.value.status != null) _state.update { it.copy(status = null) }
         }
     }
 
@@ -474,6 +519,13 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val chat = (if (s.current.id == chatId) s.current else s.chats.firstOrNull { it.id == chatId }) ?: return
         if (chat.messages.isEmpty()) return
         viewModelScope.launch(io) { store.save(chat) }
+    }
+
+    /** A reply saved before it got any text (app killed mid-stream) gets an error card, so it can be retried. */
+    private fun markInterrupted(chat: Chat): Chat {
+        val last = chat.messages.lastOrNull() ?: return chat
+        if (last.role != Role.ASSISTANT || last.content.isNotEmpty() || last.error != null || last.stopped || last.attachments.isNotEmpty()) return chat
+        return chat.copy(messages = chat.messages.dropLast(1) + last.copy(error = "The reply was interrupted before it finished."))
     }
 
     private fun titleFor(message: Message): String {

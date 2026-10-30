@@ -4,7 +4,9 @@ import dev.martin.cubicai.data.SearchMode
 import dev.martin.cubicai.data.objects
 import dev.martin.cubicai.data.str
 import dev.martin.cubicai.data.strings
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.InternalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.ensureActive
 import android.util.Base64
@@ -95,6 +97,14 @@ class LlmClient {
             .build()
     }
 
+    /**
+     * Runs [cancel] as soon as the calling coroutine is cancelled (Stop, new chat...). A plain completion handler
+     * would wait for the blocking read to end by itself, so Stop did nothing until the whole reply had arrived.
+     */
+    @OptIn(InternalCoroutinesApi::class)
+    private fun CoroutineScope.cancelOnStop(cancel: () -> Unit) =
+        coroutineContext[Job]?.invokeOnCompletion(onCancelling = true, invokeImmediately = true) { cancel() }
+
     /** The address that answered last, tried first next time (e.g. Tailscale while away from home). */
     @Volatile private var preferredUrl: String? = null
 
@@ -135,7 +145,7 @@ class LlmClient {
 
         val payload = body.toString().toRequestBody(jsonType)
         var call: Call? = null
-        val cancelHandle = coroutineContext[Job]?.invokeOnCompletion { call?.cancel() }
+        val cancelHandle = cancelOnStop { call?.cancel() }
         try {
             executeFirst(baseUrls, pin, { call = it; if (!isActive) it.cancel() }) { baseUrl ->
                 Request.Builder()
@@ -190,7 +200,7 @@ class LlmClient {
             .post(body.toString().toRequestBody(jsonType))
             .build()
         val call = http.newCall(request)
-        val handle = coroutineContext[Job]?.invokeOnCompletion { call.cancel() }
+        val handle = cancelOnStop { call.cancel() }
         try {
             call.execute().use { response ->
                 val text = response.body.string()
@@ -244,7 +254,8 @@ class LlmClient {
                         recommended = o.optBoolean("cubic_recommended"),
                         contextTokens = o.optInt("context_length"),
                     ).let { if (google && id == "gemini-3.5-flash") it.copy(recommended = true) else it }
-                }.sortedWith(compareByDescending<ModelInfo> { it.recommended }.thenBy { it.id })
+                }.distinctBy { it.id } // the picker keys its list by id; a duplicate would crash it
+                    .sortedWith(compareByDescending<ModelInfo> { it.recommended }.thenBy { it.id })
             }
         } catch (e: IOException) {
             throw networkError(e, pin)

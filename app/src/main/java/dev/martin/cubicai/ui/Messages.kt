@@ -24,7 +24,10 @@ import androidx.compose.runtime.produceState
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.BlendMode
+import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.layout.ContentScale
 import kotlinx.coroutines.delay
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -335,14 +338,27 @@ private fun ShimmerText(text: String, modifier: Modifier = Modifier) {
         animationSpec = infiniteRepeatable(tween(1500, easing = LinearEasing)),
         label = "sweep",
     )
-    val brush = Brush.linearGradient(listOf(base, glow, base), start = Offset(sweep - 80f, 0f), end = Offset(sweep + 80f, 0f))
     Row(modifier, verticalAlignment = Alignment.CenterVertically) {
+        // The band is painted over the glyphs at draw time, so the sweep never recomposes or re-lays-out the text.
         Text(
             text,
-            style = MaterialTheme.typography.bodyMedium.copy(brush = brush),
+            style = MaterialTheme.typography.bodyMedium,
+            color = base,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.widthIn(max = 220.dp),
+            modifier = Modifier.widthIn(max = 220.dp)
+                .graphicsLayer(compositingStrategy = CompositingStrategy.Offscreen)
+                .drawWithContent {
+                    drawContent()
+                    drawRect(
+                        Brush.linearGradient(
+                            listOf(Color.Transparent, glow, Color.Transparent),
+                            start = Offset(sweep - 80f, 0f),
+                            end = Offset(sweep + 80f, 0f),
+                        ),
+                        blendMode = BlendMode.SrcAtop,
+                    )
+                },
         )
         Dots(base)
     }

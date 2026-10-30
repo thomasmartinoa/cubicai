@@ -9,6 +9,8 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.size
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.State
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
@@ -27,14 +29,15 @@ import kotlin.math.sqrt
 fun Cube(size: Dp, modifier: Modifier = Modifier, spinning: Boolean = false) {
     val cube = LocalCube.current
     val gap = MaterialTheme.colorScheme.background
-    val phase = if (spinning) {
+    // The animated value is read only while drawing, so the spin redraws the cube without recomposing anything.
+    val phase: State<Float> = if (spinning) {
         rememberInfiniteTransition(label = "cube").animateFloat(
             initialValue = 0f,
             targetValue = 3f,
             animationSpec = infiniteRepeatable(tween(1500, easing = LinearEasing)),
             label = "phase",
-        ).value
-    } else 0f
+        )
+    } else Still
     val shades = listOf(cube.top, cube.left, cube.right)
 
     Canvas(modifier.size(size)) {
@@ -52,8 +55,8 @@ fun Cube(size: Dp, modifier: Modifier = Modifier, spinning: Boolean = false) {
             moveTo(a.x, a.y); lineTo(b.x, b.y); lineTo(c.x, c.y); lineTo(d.x, d.y); close()
         }
 
-        val step = floor(phase).toInt()
-        val t = phase - step
+        val step = floor(phase.value).toInt()
+        val t = phase.value - step
         fun shade(i: Int): Color = lerp(shades[(i + step) % 3], shades[(i + step + 1) % 3], t)
 
         drawPath(face(top, upRight, c, upLeft), shade(0))
@@ -67,6 +70,8 @@ fun Cube(size: Dp, modifier: Modifier = Modifier, spinning: Boolean = false) {
         drawLine(gap, c, bottom, seam)
     }
 }
+
+private val Still: State<Float> = mutableFloatStateOf(0f)
 
 @Composable
 fun CubeMark(modifier: Modifier = Modifier) = Cube(28.dp, modifier)

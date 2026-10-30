@@ -227,14 +227,15 @@ private fun MessageList(state: UiState, vm: ChatViewModel) {
         ) {
             items(messages.asReversed(), key = { it.id }) { message ->
                 val isLast = message.id == messages.last().id
-                Box(Modifier.animateItem(fadeInSpec = tween(220), placementSpec = tween(220), fadeOutSpec = tween(120))) {
+                // Fade only: a placement animation slid the bubble above over the reply header while the reply grew.
+                Box(Modifier.animateItem(fadeInSpec = tween(220), placementSpec = null, fadeOutSpec = tween(120))) {
                     if (message.role == Role.USER) {
                         UserMessage(message, canEdit = !state.streaming) { vm.editMessage(message.id, it) }
                     } else {
                         AssistantMessage(
                             message = message,
                             streaming = state.streaming && isLast,
-                            status = state.status,
+                            status = if (state.streaming && isLast) state.status else null, // only the reply in progress
                             fallbackName = shortModelName(message.model.orEmpty()),
                             isLast = isLast,
                             onRegenerate = vm::regenerate,
