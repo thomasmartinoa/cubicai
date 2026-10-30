@@ -113,10 +113,18 @@ private fun typography(): Typography {
     )
 }
 
+/** True when the app should be dark: the user's choice in Settings, or the phone's setting for "system". */
 @Composable
-fun CubicTheme(content: @Composable () -> Unit) {
+fun isDark(theme: String) = when (theme) {
+    "light" -> false
+    "dark" -> true
+    else -> isSystemInDarkTheme()
+}
+
+@Composable
+fun CubicTheme(dark: Boolean, content: @Composable () -> Unit) {
     MaterialTheme(
-        colorScheme = if (isSystemInDarkTheme()) Dark else Light,
+        colorScheme = if (dark) Dark else Light,
         typography = typography(),
         shapes = Bevels,
         content = content,

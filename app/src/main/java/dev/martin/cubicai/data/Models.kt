@@ -32,6 +32,9 @@ data class Message(
     /** Persona that wrote this reply, for the label above it. */
     val persona: String? = null,
     val stopped: Boolean = false,
+    /** Token counts the provider reported for this reply: the whole conversation it read, and what it wrote. */
+    val promptTokens: Int = 0,
+    val outputTokens: Int = 0,
     val id: String = newId(),
 )
 
@@ -89,6 +92,8 @@ private fun Message.toJson(): JSONObject = JSONObject().apply {
     error?.let { put("error", it) }
     model?.let { put("model", it) }
     persona?.let { put("persona", it) }
+    if (promptTokens > 0) put("promptTokens", promptTokens)
+    if (outputTokens > 0) put("outputTokens", outputTokens)
 }
 
 private fun messageFromJson(o: JSONObject) = Message(
@@ -104,4 +109,6 @@ private fun messageFromJson(o: JSONObject) = Message(
     model = o.str("model"),
     persona = o.str("persona"),
     stopped = o.optBoolean("stopped"),
+    promptTokens = o.optInt("promptTokens"),
+    outputTokens = o.optInt("outputTokens"),
 )

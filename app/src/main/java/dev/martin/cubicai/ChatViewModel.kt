@@ -50,6 +50,8 @@ data class UiState(
     val notice: String? = null,
     /** Next message creates an image instead of a text reply (providers that support it). */
     val imageMode: Boolean = false,
+    /** Context window of the selected model in tokens; 0 while unknown. */
+    val contextLimit: Int = 0,
 )
 
 /** How many recent messages keep their photos in the request; older ones are summarised as a note. */
@@ -92,6 +94,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             val chats = withContext(io) { store.loadAll() }.map(::markInterrupted)
             _state.update { it.copy(chats = chats) }
         }
+        refreshContextLimit()
     }
 
     // --- Settings -------------------------------------------------------------------------------
@@ -109,6 +112,22 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         mutateChat(chatId) { it.copy(providerId = provider.id, model = model) }
         _state.update { s -> if (s.current.id == chatId) s.copy(current = s.current.copy(providerId = provider.id, model = model)) else s }
         persist(chatId)
+        refreshContextLimit()
+    }
+
+    /** Looks up how many tokens the selected model can hold, for the context meter. */
+    private fun refreshContextLimit() {
+        val settings = _state.value.settings
+        val provider = settings.provider
+        val model = settings.model(provider)
+        _state.update { it.copy(contextLimit = modelCache[provider.id]?.firstOrNull { m -> m.id == model }?.contextTokens ?: 0) }
+        if (model.isBlank() || modelCache.containsKey(provider.id)) return
+        viewModelScope.launch {
+            val limit = runCatching { listModels(provider) }.getOrNull()?.firstOrNull { it.id == model }?.contextTokens ?: return@launch
+            // Only if the user hasn't switched model meanwhile.
+            val now = _state.value.settings
+            if (now.providerId == provider.id && now.model(provider) == model) _state.update { it.copy(contextLimit = limit) }
+        }
     }
 
     fun toggleWebSearch() = updateSettings { it.copy(webSearch = !it.webSearch) }
@@ -122,7 +141,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         if (baseUrls.isEmpty()) {
             throw ApiException(if (provider == Providers.LOCAL) "Pair with your PC first: Settings → Local PC." else "Set a base URL in Settings first.")
         }
-        return client.listModels(baseUrls, s.key(provider), s.pin(provider)).also { modelCache[provider.id] = it }
+        return client.listModels(baseUrls, s.key(provider), s.pin(provider)).also {
+            modelCache[provider.id] = it
+            refreshContextLimit() // the open chat's meter may have been waiting on this list
+        }
     }
 
     // --- Personas -------------------------------------------------------------------------------
@@ -229,6 +251,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val provider = chat.providerId?.let { id -> Providers.all.firstOrNull { it.id == id } }
         if (provider != null && !chat.model.isNullOrBlank()) {
             updateSettings { it.copy(providerId = provider.id, models = it.models + (provider.id to chat.model)) }
+            refreshContextLimit()
         }
     }
 
@@ -451,6 +474,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 flush(chatId, messageId, buffer)
                 _state.update { it.copy(status = event.text) }
             }
+            is StreamEvent.Usage -> updateMessage(chatId, messageId) { it.copy(promptTokens = event.prompt, outputTokens = event.output) }
         }
         val now = System.currentTimeMillis()
         synchronized(buffer) {

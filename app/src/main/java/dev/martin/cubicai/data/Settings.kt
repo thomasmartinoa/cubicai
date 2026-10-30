@@ -109,6 +109,8 @@ data class Settings(
     val webSearch: Boolean = false,
     /** Hides chats from the recent-apps screen and blocks screenshots. */
     val privacyScreen: Boolean = false,
+    /** "system", "light" or "dark". */
+    val theme: String = "system",
 ) {
     val provider get() = Providers.get(providerId)
 
@@ -169,6 +171,7 @@ class SettingsStore(context: Context) {
         aboutMe = prefs.getString("about_me", "").orEmpty(),
         webSearch = prefs.getBoolean("web_search", false),
         privacyScreen = prefs.getBoolean("privacy_screen", false),
+        theme = prefs.getString("theme", null) ?: "system",
     )
 
     fun save(s: Settings) = prefs.edit {
@@ -185,6 +188,7 @@ class SettingsStore(context: Context) {
         putString("about_me", s.aboutMe)
         putBoolean("web_search", s.webSearch)
         putBoolean("privacy_screen", s.privacyScreen)
+        putString("theme", s.theme)
     }
 
     private fun personasToJson(list: List<Persona>) = JSONArray(list.map {

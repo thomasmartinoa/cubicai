@@ -686,6 +686,11 @@ class Handler(BaseHTTPRequestHandler):
                     if chunk.get("done"):
                         tokens = chunk.get("eval_count", tokens)
                         gen_seconds = chunk.get("eval_duration", 0) / 1e9
+                        # Token counts only (no content), so the phone can show how full the context is.
+                        self._emit({"choices": [], "usage": {
+                            "prompt_tokens": chunk.get("prompt_eval_count", 0),
+                            "completion_tokens": chunk.get("eval_count", 0),
+                        }})
                         break
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()

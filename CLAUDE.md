@@ -16,7 +16,8 @@ Native Kotlin + Jetpack Compose, single `:app` module, package `dev.martin.cubic
 - `data/Attachments.kt`: images → downscaled JPEG; PDFs → page images via PdfRenderer; other files → text.
 - `net/LlmClient.kt`: OkHttp SSE streaming. `/chat/completions` normally; xAI + Search uses `/responses` with `web_search` + `x_search`. OpenRouter search uses `plugins:[{id:"web"}]`. Falls back across base URLs only on connect failure.
 - `ChatViewModel.kt`: all state (`UiState`), streaming, edit/regenerate, personas, TTS. The whole history is resent each turn; photos only from the last 6 photo messages.
-- `ui/`: Theme (cobalt + amber, Chakra Petch headings, cut-corner shapes), Cube (brand mark + thinking animation), ChatScreen, Messages, Behaviour sheet, Markdown (Markwon), ModelPicker, SettingsScreen.
+- `ui/`: Theme (cobalt + amber, Chakra Petch headings, cut-corner shapes), Cube (brand mark + thinking animation), ChatScreen, Messages, Behaviour sheet, Markdown (Markwon; streaming word fade, square bullets), ModelPicker, ContextMeter, SettingsScreen.
+- Token usage: requests ask for `stream_options.include_usage`; the reply stores `promptTokens`/`outputTokens`. ContextMeter (beside send) shows last prompt+output against the model's `contextTokens`, estimating ~4 chars/token (marked `~`) when a provider doesn't report counts.
 
 ## Gemini
 - Chat goes through Google's OpenAI-compatible endpoint (`/v1beta/openai`); default model `gemini-3.5-flash` (3.8 is often overloaded; 2.x models are closed to new keys and hidden from the picker).
@@ -26,11 +27,14 @@ Native Kotlin + Jetpack Compose, single `:app` module, package `dev.martin.cubic
 ## Design rules
 - Shapes come from `MaterialTheme.shapes` (all `CutCornerShape`); buttons pass `shape = MaterialTheme.shapes.small`. No rounded/circle shapes.
 - Headings use Chakra Petch via the typography; body stays Roboto.
-- Motion is short (120-260 ms) and tied to state: the cube rolls its light, the phase label shimmers (Thinking, Searching, Writing), a block cursor blinks while text streams, reasoning opens itself while the model thinks, list items fade in, the send/mic/stop button cross-fades.
+- One edge per surface: 16dp page gutter (messages, home, composer box, settings), 20dp inside bottom sheets. Icon buttons that start a row are pulled in by their 12-15dp inner padding so the icon, not the touch target, sits on the edge. Check with `uiautomator dump` bounds, not by eye.
+- Menus use `CubicMenu` (raised tone + hairline edge). Selected rows in sheets get a tinted band. Destructive actions (Delete, Unpair) are `colorScheme.error`, including dialog confirms.
+- Settings sections are `SettingsCard`s with `SettingRow`; toggles use `CutSwitch` (Material's Switch is pill-shaped). Theme is System/Light/Dark (`Settings.theme`, `isDark()`), and the system bar icons follow it.
+- Motion is short (120-260 ms) and tied to state: the cube rolls its light, the phase label shimmers (Thinking, Searching, Writing), streamed words fade in one after another (`StreamFader`, 320 ms per word, alpha only so lines aren't re-measured) while the reply's height eases open, reasoning opens itself while the model thinks, list items fade in, the send/mic/stop button cross-fades.
 - Never put a secret (API key, token) in the repo; keys are entered in Settings and stored encrypted by `SecretBox`.
 
 ## Local PC mode (server/)
-- `server/cubicai_server.py`: stdlib-only HTTPS gateway: phone → (TLS 1.3, pinned self-signed cert, bearer token) → Ollama on 127.0.0.1:11434. Converts OpenAI chat format ↔ Ollama `/api/chat` (thinking → `delta.reasoning`, `cubic_status` progress events, `citations`).
+- `server/cubicai_server.py`: stdlib-only HTTPS gateway: phone → (TLS 1.3, pinned self-signed cert, bearer token) → Ollama on 127.0.0.1:11434. Converts OpenAI chat format ↔ Ollama `/api/chat` (thinking → `delta.reasoning`, `cubic_status` progress events, `citations`, final `usage` from `prompt_eval_count`/`eval_count`).
 - Only loopback + private (home) addresses may connect; Tailscale (100.64/10) only while `remote` is on (`cubicai_server.py remote on|off`, or the panel). Others are dropped before TLS.
 - Context: a Modelfile `num_ctx` wins; otherwise settings.json `num_ctx` (default 16384), capped at the model's max. Reported as `context_length` in /v1/models. `keep_alive` 15m.
 - Web search runs on the PC via SearXNG in Docker (`cubicai-searxng`, 127.0.0.1:8888, config in ~/.config/cubicai-server/searxng). Request flag `cubic_web_search: true`. Page fetches are limited to public addresses (SSRF guard, incl. redirects).

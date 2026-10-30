@@ -33,6 +33,8 @@ sealed interface StreamEvent {
     data class Reasoning(val text: String) : StreamEvent
     data class Citation(val url: String) : StreamEvent
     data class Status(val text: String) : StreamEvent
+    /** Tokens the model read (the whole conversation) and wrote for this reply. */
+    data class Usage(val prompt: Int, val output: Int) : StreamEvent
 }
 
 class ApiException(message: String) : Exception(message)
@@ -267,6 +269,7 @@ class LlmClient {
     private fun chatBody(model: String, messages: List<ApiMessage>, webPlugin: Boolean) = JSONObject().apply {
         put("model", model)
         put("stream", true)
+        put("stream_options", JSONObject().put("include_usage", true)) // token counts in the last chunk
         put("messages", JSONArray(messages.map { m ->
             JSONObject().put("role", m.role).put("content", if (m.images.isEmpty()) m.text else JSONArray().apply {
                 if (m.text.isNotEmpty()) put(JSONObject().put("type", "text").put("text", m.text))
@@ -282,6 +285,10 @@ class LlmClient {
         json.optJSONObject("error")?.let { throw ApiException(it.str("message") ?: "Provider error") }
         json.str("cubic_status")?.let { onEvent(StreamEvent.Status(it)) } // progress from the PC gateway
         json.optJSONArray("citations").strings().filter { it.startsWith("http") }.forEach { onEvent(StreamEvent.Citation(it)) }
+        json.optJSONObject("usage")?.let { u ->
+            val prompt = u.optInt("prompt_tokens")
+            if (prompt > 0) onEvent(StreamEvent.Usage(prompt, u.optInt("completion_tokens")))
+        }
 
         val choice = json.optJSONArray("choices")?.optJSONObject(0) ?: return
         val delta = choice.optJSONObject("delta") ?: choice.optJSONObject("message") ?: return
@@ -339,6 +346,10 @@ class LlmClient {
                     .flatMap { it.optJSONArray("annotations").objects() }
                     .mapNotNull { it.str("url") }
                     .forEach { onEvent(StreamEvent.Citation(it)) }
+                response.optJSONObject("usage")?.let { u ->
+                    val prompt = u.optInt("input_tokens")
+                    if (prompt > 0) onEvent(StreamEvent.Usage(prompt, u.optInt("output_tokens")))
+                }
             }
 
             type == "error" ->
@@ -376,7 +387,7 @@ class LlmClient {
             429 -> "Rate limited or out of free quota. Wait a moment, pick another model, or check your plan."
             503 -> "The model is overloaded right now. Try again or pick another model."
             else -> null
-        }
+        }?.takeUnless { detail.contains("try again", ignoreCase = true) } // the provider already said it
         return listOfNotNull("Error $code: $detail".trim(), hint).joinToString("\n")
     }
 }

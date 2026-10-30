@@ -1,12 +1,14 @@
 package dev.martin.cubicai
 
 import android.content.Intent
+import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
+import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
 import androidx.compose.animation.AnimatedContent
@@ -25,6 +27,7 @@ import androidx.core.content.IntentCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.martin.cubicai.ui.ChatScreen
 import dev.martin.cubicai.ui.CubicTheme
+import dev.martin.cubicai.ui.isDark
 import dev.martin.cubicai.ui.SettingsScreen
 
 class MainActivity : ComponentActivity() {
@@ -35,8 +38,14 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         if (savedInstanceState == null) handleShare(intent)
         setContent {
-            CubicTheme {
-                val state by vm.state.collectAsStateWithLifecycle()
+            val state by vm.state.collectAsStateWithLifecycle()
+            val dark = isDark(state.settings.theme)
+            // Status and navigation bar icons follow the app's theme, which may differ from the phone's.
+            LaunchedEffect(dark) {
+                val bars = if (dark) SystemBarStyle.dark(Color.TRANSPARENT) else SystemBarStyle.light(Color.TRANSPARENT, Color.TRANSPARENT)
+                enableEdgeToEdge(statusBarStyle = bars, navigationBarStyle = bars)
+            }
+            CubicTheme(dark) {
                 LaunchedEffect(state.settings.privacyScreen) {
                     if (state.settings.privacyScreen) window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
                     else window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)

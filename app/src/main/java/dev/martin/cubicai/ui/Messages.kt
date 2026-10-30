@@ -3,8 +3,8 @@ package dev.martin.cubicai.ui
 import android.widget.Toast
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.infiniteRepeatable
@@ -17,6 +17,7 @@ import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.rounded.Download
 import androidx.compose.runtime.LaunchedEffect
@@ -61,7 +62,6 @@ import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Share
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
-import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -108,7 +108,7 @@ fun UserMessage(message: Message, canEdit: Boolean, onEdit: (String) -> Unit) {
                     style = MaterialTheme.typography.bodyLarge,
                 )
             }
-            DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+            CubicMenu(expanded = menu, onDismissRequest = { menu = false }) {
                 DropdownMenuItem(
                     text = { Text("Copy") },
                     leadingIcon = { Icon(Icons.Rounded.ContentCopy, null) },
@@ -212,8 +212,8 @@ fun AssistantMessage(
             spinning = streaming,
         )
         if (message.reasoning.isNotBlank()) ReasoningBlock(message.reasoning, active = thinking)
-        if (hasText) MarkdownText(message.content)
-        if (writing) TypingCursor()
+        // The height eases open as lines arrive, so the reply above glides up instead of jumping a line at a time.
+        if (hasText) MarkdownText(message.content, Modifier.animateContentSize(tween(180)), streaming = streaming)
         if (images.isNotEmpty()) CreatedImages(images)
         if (message.stopped) Text(
             "Stopped",
@@ -227,6 +227,8 @@ fun AssistantMessage(
             Modifier.fillMaxWidth().padding(top = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            // Pulled left by the buttons' inner padding so the first icon lines up with the text above.
+            Row(Modifier.offset(x = (-15).dp), verticalAlignment = Alignment.CenterVertically) {
             if (hasText) {
                 SmallAction(Icons.Rounded.ContentCopy, "Copy") { copyToClipboard(context, message.content) }
                 SmallAction(Icons.AutoMirrored.Rounded.VolumeUp, "Read aloud") { onSpeak(message.content) }
@@ -237,8 +239,10 @@ fun AssistantMessage(
                 Toast.makeText(context, if (saved) "Saved to Pictures/CubicAI" else "Couldn't save the image", Toast.LENGTH_SHORT).show()
             }
             if (isLast) SmallAction(Icons.Rounded.Refresh, "Regenerate", onRegenerate)
+            }
             Spacer(Modifier.weight(1f))
-            message.model?.let {
+            // The header already names the model unless a behaviour's name is shown there.
+            if (message.persona != null) message.model?.let {
                 Text(shortModelName(it), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
@@ -282,11 +286,12 @@ private fun ReasoningBlock(reasoning: String, active: Boolean) {
     val arrow by animateFloatAsState(if (expanded) 180f else 0f, tween(180), label = "arrow")
     Column(Modifier.padding(bottom = 8.dp)) {
         Row(
-            Modifier.clip(MaterialTheme.shapes.extraSmall).clickable { expanded = !expanded }.padding(vertical = 4.dp, horizontal = 2.dp),
+            Modifier.clip(MaterialTheme.shapes.extraSmall).clickable { expanded = !expanded }.padding(end = 4.dp).heightIn(min = 40.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Icon(Icons.Rounded.Psychology, null, Modifier.size(18.dp), tint = muted)
-            Spacer(Modifier.width(6.dp))
+            // Same 16dp mark + 8dp gap as the reply header, so both labels start on one line.
+            Icon(Icons.Rounded.Psychology, null, Modifier.size(16.dp), tint = muted)
+            Spacer(Modifier.width(8.dp))
             Text(if (active) "Thinking" else "Thought process", style = MaterialTheme.typography.labelLarge, color = muted)
             Icon(Icons.Rounded.ExpandMore, null, Modifier.size(18.dp).graphicsLayer { rotationZ = arrow }, tint = muted)
         }
@@ -380,21 +385,6 @@ private fun Dots(color: Color) {
     }
 }
 
-/** Blinking block after the text while it streams in. */
-@Composable
-private fun TypingCursor() {
-    val alpha by rememberInfiniteTransition(label = "cursor").animateFloat(
-        initialValue = 0.2f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(tween(550), RepeatMode.Reverse),
-        label = "cursor",
-    )
-    Box(
-        Modifier.padding(top = 2.dp).size(width = 8.dp, height = 14.dp).graphicsLayer { this.alpha = alpha }
-            .background(MaterialTheme.colorScheme.primary),
-    )
-}
-
 @Composable
 private fun ErrorCard(error: String, onRetry: (() -> Unit)?) {
     Surface(
@@ -402,7 +392,7 @@ private fun ErrorCard(error: String, onRetry: (() -> Unit)?) {
         shape = MaterialTheme.shapes.medium,
         modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
     ) {
-        Column(Modifier.padding(start = 14.dp, end = 6.dp, top = 12.dp, bottom = if (onRetry == null) 12.dp else 0.dp)) {
+        Column(Modifier.padding(start = 16.dp, end = 6.dp, top = 12.dp, bottom = if (onRetry == null) 12.dp else 0.dp)) {
             Text(error, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onErrorContainer)
             onRetry?.let { TextButton(onClick = it, modifier = Modifier.align(Alignment.End)) { Text("Retry") } }
         }
@@ -417,7 +407,8 @@ private fun Sources(urls: List<String>) {
     val shown = if (showAll) urls else urls.take(6)
     Column(Modifier.padding(top = 10.dp)) {
         Text("Sources", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        // Chips keep 48dp touch targets; the negative row gap makes the visible gaps 8dp both ways.
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy((-8).dp)) {
             shown.forEach { url ->
                 AssistChip(
                     onClick = { runCatching { uriHandler.openUri(url) } },

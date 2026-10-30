@@ -59,25 +59,31 @@ fun BehaviourSheet(vm: ChatViewModel, onDismiss: () -> Unit) {
         onDismissRequest = { vm.setAboutMe(aboutMe); onDismiss() },
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
     ) {
+        // Same layout as the model picker: content on the 20dp edge, full-width rows, the chosen one on a tinted band.
+        val edge = Modifier.padding(horizontal = 20.dp)
         Column(
-            Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp).navigationBarsPadding(),
+            Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).navigationBarsPadding(),
         ) {
-            Text("Behaviour", style = MaterialTheme.typography.titleLarge)
+            Text("Behaviour", style = MaterialTheme.typography.titleLarge, modifier = edge)
             Text(
                 "Used in this chat and in new chats. Each chat remembers its own.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = edge,
             )
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(12.dp))
             s.personas.forEach { p ->
+                val on = p.id == selected
                 Row(
-                    Modifier.fillMaxWidth().clip(MaterialTheme.shapes.small).clickable { vm.selectPersona(p.id) }.padding(vertical = 4.dp),
+                    Modifier.fillMaxWidth()
+                        .background(if (on) MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.5f) else Color.Transparent)
+                        .clickable { vm.selectPersona(p.id) }
+                        .padding(horizontal = 20.dp, vertical = 10.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    val on = p.id == selected
                     val tone = if (on) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
                     Box(
-                        Modifier.padding(15.dp).size(18.dp)
+                        Modifier.padding(end = 16.dp).size(18.dp)
                             .border(2.dp, tone, CutCornerShape(5.dp))
                             .padding(3.dp)
                             .background(if (on) tone else Color.Transparent, CutCornerShape(2.dp)),
@@ -95,26 +101,27 @@ fun BehaviourSheet(vm: ChatViewModel, onDismiss: () -> Unit) {
                     if (!p.builtIn) IconButton(onClick = { editing = p }) { Icon(Icons.Rounded.Edit, "Edit ${p.name}") }
                 }
             }
-            OutlinedButton(shape = MaterialTheme.shapes.small, onClick = { editing = Persona(id = "", name = "", instructions = "") }, modifier = Modifier.padding(top = 8.dp)) {
+            OutlinedButton(shape = MaterialTheme.shapes.small, onClick = { editing = Persona(id = "", name = "", instructions = "") }, modifier = edge.padding(top = 8.dp)) {
                 Icon(Icons.Rounded.Add, null)
                 Spacer(Modifier.width(6.dp))
                 Text("New behaviour")
             }
 
             Spacer(Modifier.height(20.dp))
-            Text("About you", style = MaterialTheme.typography.titleMedium)
+            Text("About you", style = MaterialTheme.typography.titleMedium, modifier = edge)
             Text(
                 "Shared with every behaviour except None. For example your name, city, job or how you like answers.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = edge,
             )
             OutlinedTextField(
                 value = aboutMe,
                 onValueChange = { aboutMe = it },
-                placeholder = { Text("I live in Kochi and prefer metric units.") },
+                placeholder = { Text("e.g. I live in Kochi and prefer metric units.", color = MaterialTheme.colorScheme.outline) },
                 minLines = 3,
                 maxLines = 8,
-                modifier = Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 24.dp),
+                modifier = edge.fillMaxWidth().padding(top = 8.dp, bottom = 24.dp),
             )
         }
     }

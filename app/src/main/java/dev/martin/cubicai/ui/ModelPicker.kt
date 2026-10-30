@@ -1,6 +1,8 @@
 package dev.martin.cubicai.ui
 
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.foundation.rememberScrollState
@@ -22,8 +24,6 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.ListItem
-import androidx.compose.material3.ListItemDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
@@ -80,9 +80,14 @@ fun ModelPickerSheet(vm: ChatViewModel, onOpenSettings: () -> Unit, onDismiss: (
     }
 
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
-        Column(Modifier.padding(horizontal = 16.dp).padding(bottom = 16.dp)) {
-            Text("Choose a model", style = MaterialTheme.typography.titleLarge, modifier = Modifier.padding(bottom = 12.dp))
-            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        // Everything sits on the sheet's 20dp edge; the provider tabs scroll edge to edge but start on it too.
+        val edge = Modifier.padding(horizontal = 20.dp)
+        Column(Modifier.padding(bottom = 16.dp)) {
+            Text("Choose a model", style = MaterialTheme.typography.titleLarge, modifier = edge.padding(bottom = 12.dp))
+            Row(
+                Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 20.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
                 Providers.all.forEach { p ->
                     FilterChip(
                         selected = p.id == providerId,
@@ -104,15 +109,17 @@ fun ModelPickerSheet(vm: ChatViewModel, onOpenSettings: () -> Unit, onDismiss: (
                     if (query.isNotBlank()) IconButton(onClick = { choose(query.trim()) }) { Icon(Icons.Rounded.Check, "Use this id") }
                 },
                 singleLine = true,
-                modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
+                modifier = edge.fillMaxWidth().padding(top = 12.dp),
             )
-            Row(Modifier.padding(vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(edge.padding(vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 if (provider == Providers.OPENROUTER) FilterChip(freeOnly, { freeOnly = !freeOnly }, label = { Text("Free") })
                 if (models.orEmpty().any { it.vision }) FilterChip(visionOnly, { visionOnly = !visionOnly }, label = { Text("Sees images") })
             }
             error?.let {
-                Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
-                TextButton(onClick = { onDismiss(); onOpenSettings() }) { Text("Open Settings") }
+                Column(edge) {
+                    Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                    TextButton(onClick = { onDismiss(); onOpenSettings() }, modifier = Modifier.offset(x = (-12).dp)) { Text("Open Settings") }
+                }
             }
             when {
                 models == null -> Box(Modifier.fillMaxWidth().padding(32.dp), contentAlignment = Alignment.Center) {
@@ -120,25 +127,50 @@ fun ModelPickerSheet(vm: ChatViewModel, onOpenSettings: () -> Unit, onDismiss: (
                 }
                 filtered.isEmpty() -> Text(
                     if (query.isNotBlank()) "No match. Tap ✓ to use \"${query.trim()}\" as the model id." else "No models.",
-                    Modifier.padding(vertical = 24.dp),
+                    edge.padding(vertical = 24.dp),
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 else -> LazyColumn(Modifier.heightIn(max = 460.dp)) {
                     items(filtered, key = { it.id }) { m ->
+                        // "hf.co/Owner/Long-Model-Name:Q4" reads better as the name, with the owner below it.
+                        val owner = m.id.substringBeforeLast('/', "")
                         val tags = listOfNotNull(
+                            owner.takeIf { it.isNotEmpty() },
                             "recommended".takeIf { m.recommended },
                             "free".takeIf { m.free },
                             "sees images".takeIf { m.vision },
                             m.contextTokens.takeIf { it > 0 }?.let { "${contextLabel(it)} context" },
                             m.sizeBytes.takeIf { it > 0 }?.let { "%.1f GB".format(it / 1e9) },
                         ).joinToString(", ")
-                        ListItem(
-                            headlineContent = { Text(m.id) },
-                            supportingContent = if (tags.isNotEmpty()) ({ Text(tags) }) else null,
-                            trailingContent = if (m.id == selected) ({ Icon(Icons.Rounded.Check, "Selected", Modifier.size(20.dp)) }) else null,
-                            colors = ListItemDefaults.colors(containerColor = Color.Transparent),
-                            modifier = Modifier.clickable { choose(m.id) },
-                        )
+                        val isSelected = m.id == selected
+                        // Full-width rows with text on the 20dp edge; the chosen one gets a tinted band, not just a tick.
+                        Row(
+                            Modifier.fillMaxWidth()
+                                .background(if (isSelected) MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.5f) else Color.Transparent)
+                                .clickable { choose(m.id) }
+                                .padding(horizontal = 20.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    m.id.substringAfterLast('/'),
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                                if (tags.isNotEmpty()) Text(
+                                    tags,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            if (isSelected) Icon(
+                                Icons.Rounded.Check,
+                                "Selected",
+                                Modifier.padding(start = 12.dp).size(20.dp),
+                                tint = MaterialTheme.colorScheme.primary,
+                            )
+                        }
                     }
                 }
             }
@@ -146,7 +178,7 @@ fun ModelPickerSheet(vm: ChatViewModel, onOpenSettings: () -> Unit, onDismiss: (
     }
 }
 
-private fun contextLabel(tokens: Int): String = when {
+fun contextLabel(tokens: Int): String = when {
     tokens >= 1_000_000 -> "%dM".format((tokens + 524_287) / 1_048_576)
     else -> "${tokens / 1024}K"
 }

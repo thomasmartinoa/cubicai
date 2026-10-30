@@ -4,6 +4,7 @@ import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.net.Uri
 import android.speech.RecognizerIntent
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
@@ -19,6 +20,7 @@ import androidx.compose.animation.scaleOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.material3.SmallFloatingActionButton
 import androidx.compose.runtime.derivedStateOf
@@ -68,7 +70,6 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DrawerValue
-import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledIconButton
@@ -102,6 +103,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
@@ -119,6 +121,10 @@ import dev.martin.cubicai.data.Role
 import dev.martin.cubicai.data.SearchMode
 import kotlinx.coroutines.launch
 import java.io.File
+import java.time.Instant
+import java.time.LocalDate
+import java.time.ZoneId
+import java.time.temporal.ChronoUnit
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -139,6 +145,9 @@ fun ChatScreen(vm: ChatViewModel, onOpenSettings: () -> Unit) {
             keyboard?.hide()
         }
     }
+
+    // Back closes the drawer first instead of leaving the app.
+    BackHandler(enabled = drawerState.isOpen) { scope.launch { drawerState.close() } }
 
     LaunchedEffect(state.notice) {
         state.notice?.let {
@@ -246,6 +255,11 @@ private fun MessageList(state: UiState, vm: ChatViewModel) {
                 }
             }
         }
+        // Text scrolling up fades out under the top bar instead of being cut off at a hard edge.
+        Box(
+            Modifier.align(Alignment.TopCenter).fillMaxWidth().height(14.dp)
+                .background(Brush.verticalGradient(listOf(MaterialTheme.colorScheme.background, Color.Transparent))),
+        )
         AnimatedVisibility(
             visible = !atBottom,
             enter = fadeIn(tween(150)) + scaleIn(tween(150), initialScale = 0.7f),
@@ -272,16 +286,13 @@ private fun EmptyState(state: UiState, onSuggestion: (String) -> Unit, onOpenSet
     }
     val persona = state.settings.personas.firstOrNull { it.id == state.current.personaId }
     Column(
-        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp, vertical = 32.dp),
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 32.dp),
         verticalArrangement = Arrangement.Center,
     ) {
         Cube(56.dp)
         Spacer(Modifier.height(20.dp))
-        Text(
-            if (needsKey) "One step left" else "Ask anything, or add a photo or file",
-            style = MaterialTheme.typography.headlineMedium,
-        )
-        Spacer(Modifier.height(12.dp))
+        Text(if (needsKey) "One step left" else "How can I help?", style = MaterialTheme.typography.headlineMedium)
+        Spacer(Modifier.height(8.dp))
         if (needsKey) {
             Text(
                 if (provider == Providers.LOCAL) "Pair with your PC to chat with your own models over home Wi-Fi or Tailscale."
@@ -291,6 +302,8 @@ private fun EmptyState(state: UiState, onSuggestion: (String) -> Unit, onOpenSet
             Spacer(Modifier.height(16.dp))
             Button(shape = MaterialTheme.shapes.small, onClick = onOpenSettings) { Text("Open settings") }
         } else {
+            Text("Ask anything, or add a photo or file.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.height(16.dp))
             AssistChip(
                 onClick = onBehaviour,
                 label = { Text("Behaviour: ${persona?.name ?: "None"}") },
@@ -357,7 +370,7 @@ private fun Composer(state: UiState, vm: ChatViewModel) {
         shape = MaterialTheme.shapes.large,
         color = MaterialTheme.colorScheme.surfaceContainer,
         border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp),
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), // same 16dp edge as the messages
     ) {
         Column(Modifier.animateContentSize(tween(180))) {
             AnimatedVisibility(
@@ -380,10 +393,11 @@ private fun Composer(state: UiState, vm: ChatViewModel) {
                     disabledIndicatorColor = Color.Transparent,
                 ),
             )
-            Row(Modifier.fillMaxWidth().padding(start = 6.dp, end = 8.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+            // 4dp + the buttons' 12dp inner padding puts the + and mic icons on the text field's 16dp edges.
+            Row(Modifier.fillMaxWidth().padding(start = 4.dp, end = 4.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
                 Box {
                     IconButton(onClick = { attachMenu = true }) { Icon(Icons.Rounded.Add, "Attach") }
-                    DropdownMenu(expanded = attachMenu, onDismissRequest = { attachMenu = false }) {
+                    CubicMenu(expanded = attachMenu, onDismissRequest = { attachMenu = false }) {
                         DropdownMenuItem(
                             text = { Text("Camera") },
                             leadingIcon = { Icon(Icons.Rounded.PhotoCamera, null) },
@@ -432,6 +446,7 @@ private fun Composer(state: UiState, vm: ChatViewModel) {
                     )
                 }
                 Spacer(Modifier.weight(1f))
+                if (state.current.messages.isNotEmpty()) ContextMeter(state.current.messages, state.contextLimit)
                 AnimatedContent(
                     targetState = when { state.streaming -> 2; canSend -> 1; else -> 0 },
                     transitionSpec = { (fadeIn(tween(120)) + scaleIn(tween(120), initialScale = 0.8f)) togetherWith fadeOut(tween(80)) },
@@ -451,7 +466,7 @@ private fun Composer(state: UiState, vm: ChatViewModel) {
 @Composable
 private fun PendingAttachments(state: UiState, vm: ChatViewModel) {
     Row(
-        Modifier.horizontalScroll(rememberScrollState()).padding(start = 12.dp, end = 12.dp, top = 12.dp),
+        Modifier.horizontalScroll(rememberScrollState()).padding(start = 16.dp, end = 16.dp, top = 12.dp), // on the text's 16dp edge
         horizontalArrangement = Arrangement.spacedBy(8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -483,51 +498,61 @@ private fun ChatDrawer(
     onSettings: () -> Unit,
 ) {
     ModalDrawerSheet(drawerContainerColor = MaterialTheme.colorScheme.surfaceContainerLow) {
+        // 24dp mark at the items' icon column, so "CubicAI" starts where the item labels do.
         Row(Modifier.padding(horizontal = 28.dp, vertical = 20.dp), verticalAlignment = Alignment.CenterVertically) {
-            CubeMark()
+            Cube(24.dp)
             Spacer(Modifier.width(12.dp))
             Text("CubicAI", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
         }
         NavigationDrawerItem(
+            shape = MaterialTheme.shapes.small,
             label = { Text("New chat") },
             icon = { Icon(Icons.Rounded.AddBox, null) },
             selected = false,
             onClick = onNew,
             modifier = Modifier.padding(horizontal = 12.dp),
         )
-        if (chats.isNotEmpty()) Text(
-            "Recent",
-            Modifier.padding(start = 28.dp, top = 16.dp, bottom = 6.dp),
-            style = MaterialTheme.typography.labelMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
+        val today = remember { LocalDate.now() }
+        val groups = remember(chats) { chats.groupBy { dateGroup(it.updatedAt, today) } }
         LazyColumn(Modifier.weight(1f)) {
-            items(chats, key = { it.id }) { chat ->
-                var menu by remember { mutableStateOf(false) }
-                NavigationDrawerItem(
-                    label = { Text(chat.title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                    selected = chat.id == currentId,
-                    onClick = { onOpen(chat.id) },
-                    badge = {
-                        Box {
-                            IconButton(onClick = { menu = true }, modifier = Modifier.size(48.dp)) {
-                                Icon(Icons.Rounded.MoreVert, "Options", Modifier.size(18.dp))
+            groups.forEach { (label, group) ->
+                item(key = "group:$label") {
+                    Text(
+                        label,
+                        Modifier.padding(start = 28.dp, top = 16.dp, bottom = 6.dp),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                items(group, key = { it.id }) { chat ->
+                    var menu by remember { mutableStateOf(false) }
+                    NavigationDrawerItem(
+                        shape = MaterialTheme.shapes.small,
+                        label = { Text(chat.title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                        selected = chat.id == currentId,
+                        onClick = { onOpen(chat.id) },
+                        badge = {
+                            Box {
+                                IconButton(onClick = { menu = true }, modifier = Modifier.size(48.dp)) {
+                                    Icon(Icons.Rounded.MoreVert, "Options", Modifier.size(18.dp))
+                                }
+                                CubicMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                                    DropdownMenuItem(
+                                        text = { Text("Delete", color = MaterialTheme.colorScheme.error) },
+                                        leadingIcon = { Icon(Icons.Rounded.Delete, null, tint = MaterialTheme.colorScheme.error) },
+                                        onClick = { menu = false; onDelete(chat.id) },
+                                    )
+                                }
                             }
-                            DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                                DropdownMenuItem(
-                                    text = { Text("Delete") },
-                                    leadingIcon = { Icon(Icons.Rounded.Delete, null) },
-                                    onClick = { menu = false; onDelete(chat.id) },
-                                )
-                            }
-                        }
-                    },
-                    modifier = Modifier.padding(horizontal = 12.dp),
-                )
+                        },
+                        modifier = Modifier.padding(horizontal = 12.dp),
+                    )
+                }
             }
         }
         HorizontalDivider(Modifier.padding(horizontal = 16.dp))
         NavigationDrawerItem(
+            shape = MaterialTheme.shapes.small,
             label = { Text("Settings") },
             icon = { Icon(Icons.Rounded.Settings, null) },
             selected = false,
@@ -535,5 +560,17 @@ private fun ChatDrawer(
             modifier = Modifier.padding(12.dp),
         )
         Spacer(Modifier.width(1.dp))
+    }
+}
+
+/** Drawer section for a chat last touched at [time]. */
+private fun dateGroup(time: Long, today: LocalDate): String {
+    val days = ChronoUnit.DAYS.between(Instant.ofEpochMilli(time).atZone(ZoneId.systemDefault()).toLocalDate(), today)
+    return when {
+        days <= 0 -> "Today"
+        days == 1L -> "Yesterday"
+        days < 7 -> "Previous 7 days"
+        days < 30 -> "Previous 30 days"
+        else -> "Older"
     }
 }
