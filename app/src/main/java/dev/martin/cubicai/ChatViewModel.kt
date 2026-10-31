@@ -1,6 +1,9 @@
 package dev.martin.cubicai
 
 import android.app.Application
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.speech.tts.TextToSpeech
 import androidx.lifecycle.AndroidViewModel
@@ -9,6 +12,7 @@ import dev.martin.cubicai.data.Attachment
 import dev.martin.cubicai.data.AttachmentProcessor
 import dev.martin.cubicai.data.Chat
 import dev.martin.cubicai.data.ChatStore
+import dev.martin.cubicai.data.MediaRequest
 import dev.martin.cubicai.data.Message
 import dev.martin.cubicai.data.Pairing
 import dev.martin.cubicai.data.Persona
@@ -21,19 +25,35 @@ import dev.martin.cubicai.data.Settings
 import dev.martin.cubicai.data.SettingsStore
 import dev.martin.cubicai.net.ApiException
 import dev.martin.cubicai.net.ApiMessage
+import dev.martin.cubicai.net.Generator
+import dev.martin.cubicai.net.LanFinder
+import dev.martin.cubicai.net.Links
 import dev.martin.cubicai.net.LlmClient
+import dev.martin.cubicai.net.MediaGoneException
+import dev.martin.cubicai.net.MediaProgress
 import dev.martin.cubicai.net.ModelInfo
 import dev.martin.cubicai.net.StreamEvent
+import dev.martin.cubicai.net.cancelMedia
+import dev.martin.cubicai.net.downloadMedia
+import dev.martin.cubicai.net.followMedia
+import dev.martin.cubicai.net.mediaGenerators
+import dev.martin.cubicai.net.saveOnPc
+import dev.martin.cubicai.net.submitMedia
+import dev.martin.cubicai.ui.saveToGallery
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONObject
 import java.io.File
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
@@ -54,7 +74,34 @@ data class UiState(
     val imageMode: Boolean = false,
     /** Context window of the selected model in tokens; 0 while unknown. */
     val contextLimit: Int = 0,
+    /** What the PC's ComfyUI can make (loaded when the Create sheet opens). */
+    val generators: List<Generator> = emptyList(),
+    val loadingGenerators: Boolean = false,
+    /** Why the last attempt to list them failed, shown in the Create sheet. */
+    val generatorsError: String? = null,
+    /** Next message is made by ComfyUI on the PC with these options, instead of getting a chat reply. */
+    val create: CreateOptions? = null,
+    /** Live progress of PC generations, by reply message id. */
+    val mediaProgress: Map<String, MediaProgress> = emptyMap(),
 )
+
+data class CreateOptions(
+    val generator: Generator,
+    val aspect: String = generator.aspects.firstOrNull() ?: "",
+    val seconds: Int = generator.defaultSeconds,
+    val language: String = generator.languages.firstOrNull { it.startsWith("English") } ?: generator.languages.firstOrNull().orEmpty(),
+    val lyrics: String = "",
+    /** More controls; null keeps the workflow's own value (and a random seed). */
+    val seed: Long? = null,
+    val steps: Int? = null,
+    val cfg: Double? = null,
+    val negative: String? = null,
+) {
+    val tuned get() = seed != null || steps != null || cfg != null || negative != null
+}
+
+/** Reconnect attempts while following a PC job before giving up (with growing pauses, about ten minutes). */
+private const val MEDIA_RECONNECTS = 40
 
 /** How many recent messages keep their photos in the request; older ones are summarised as a note. */
 private const val MAX_IMAGE_MESSAGES = 6
@@ -74,6 +121,15 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private val store = ChatStore(app)
     private val settingsStore = SettingsStore(app)
     private val client = LlmClient()
+
+    /** Fires when the phone gets a working network again, so a job that lost its PC retries straight away. */
+    private val networkBack = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+    private val connectivity = app.getSystemService(ConnectivityManager::class.java)
+    private val networkWatch = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            networkBack.tryEmit(Unit)
+        }
+    }
     private val io = Dispatchers.IO.limitedParallelism(1) // serialises chat file writes
     private val modelCache = mutableMapOf<String, List<ModelInfo>>()
 
@@ -92,6 +148,19 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         viewModelScope.launch(Dispatchers.IO) { cameraDir.listFiles()?.forEach { it.delete() } } // leftovers from a crash
+        runCatching { connectivity?.registerDefaultNetworkCallback(networkWatch) }
+        // When the router gives the PC a new home address, find it again and keep the new one.
+        val finder = LanFinder(app)
+        client.links = {
+            val nets = connectivity?.allNetworks.orEmpty().mapNotNull { connectivity?.getNetworkCapabilities(it) }
+            Links(
+                lan = nets.any { it.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) || it.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) },
+                vpn = nets.any { it.hasTransport(NetworkCapabilities.TRANSPORT_VPN) },
+            )
+        }
+        client.findPc = { fp -> if (_state.value.settings.isPaired) finder.find(fp) else null }
+        // An IPv6 find means IPv4 isn't getting through right now: it updates that address, not the home one.
+        client.onPcMoved = { url -> updateSettings { if (url.startsWith("https://[")) it.copy(localLan6Url = url) else it.copy(localUrl = url) } }
         viewModelScope.launch {
             val chats = withContext(io) { store.loadAll() }.map(::markInterrupted)
             _state.update { it.copy(chats = chats) }
@@ -136,6 +205,219 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     fun toggleImageMode() = _state.update { it.copy(imageMode = !it.imageMode) }
 
+    // --- Create on the PC (ComfyUI) ------------------------------------------------------------
+
+    fun loadGenerators() {
+        val s = _state.value.settings
+        if (!s.isPaired || _state.value.loadingGenerators) return
+        _state.update { it.copy(loadingGenerators = true, generatorsError = null) }
+        viewModelScope.launch {
+            val result = runCatching { client.mediaGenerators(s.baseUrls(Providers.LOCAL), s.key(Providers.LOCAL), s.localFingerprint) }
+            _state.update { st ->
+                st.copy(
+                    loadingGenerators = false,
+                    generators = result.getOrDefault(st.generators),
+                    generatorsError = result.exceptionOrNull()?.let { it.message ?: "Couldn't reach your PC" },
+                    // A generator that disappeared from the PC (model removed) can't stay selected.
+                    create = st.create?.takeIf { c -> result.getOrNull()?.any { it.id == c.generator.id } != false },
+                )
+            }
+        }
+    }
+
+    fun setCreate(options: CreateOptions?) {
+        _state.update { it.copy(create = options, imageMode = false) }
+        if (options != null) updateSettings {
+            it.copy(lastCreate = listOf(options.generator.id, options.aspect, options.seconds, options.language).joinToString("|"))
+        }
+    }
+
+    /** The last choice, if the PC still offers that generator. */
+    fun lastCreate(): CreateOptions? {
+        val parts = _state.value.settings.lastCreate.split("|")
+        val g = _state.value.generators.firstOrNull { it.id == parts[0] } ?: return null
+        val base = CreateOptions(g)
+        return base.copy(
+            aspect = parts.getOrNull(1)?.takeIf { it in g.aspects } ?: base.aspect,
+            seconds = parts.getOrNull(2)?.toIntOrNull()?.takeIf { it in 1..g.maxSeconds } ?: base.seconds,
+            language = parts.getOrNull(3)?.takeIf { it in g.languages } ?: base.language,
+        )
+    }
+
+    private fun createParams(o: CreateOptions, prompt: String) = JSONObject()
+        .put("generator", o.generator.id)
+        .put("kind", o.generator.kind) // for the progress card's shape; the PC ignores it
+        .put("prompt", prompt)
+        .apply {
+            if (o.aspect.isNotEmpty()) put("aspect", o.aspect)
+            if (o.seconds > 0) put("seconds", o.seconds)
+            if (o.language.isNotEmpty()) put("language", o.language)
+            if (o.generator.lyrics) put("lyrics", o.lyrics)
+            o.seed?.let { put("seed", it) }
+            o.steps?.let { put("steps", it) }
+            o.cfg?.let { put("cfg", it) }
+            o.negative?.let { put("negative", it) }
+        }
+
+    /** The seed of the latest result in this chat, offered for making the same picture again. */
+    fun lastSeed(): Long? = _state.value.current.messages.lastOrNull { it.media?.seed != null }?.media?.seed
+
+    /**
+     * The photo a job works on: the one sent with the prompt, or for a generator that can't work without one,
+     * the latest picture in the chat (so "now make it night" edits the last result).
+     */
+    private fun sourceImage(history: List<Message>, generatorId: String): Attachment? {
+        val prompt = history.lastOrNull { it.role == Role.USER }
+        prompt?.attachments?.firstOrNull { it.isImage }?.let { return it }
+        val required = _state.value.generators.firstOrNull { it.id == generatorId }?.image == "required"
+        return if (required) history.lastOrNull { m -> m.attachments.any { it.isImage } }?.attachments?.lastOrNull { it.isImage } else null
+    }
+
+    /** Starts a PC generation for the last user message, as a new reply. */
+    private fun createMedia(generatorName: String, params: JSONObject) {
+        val snapshot = _state.value
+        // Shapes the progress card like the photo being worked on (the app's own field; the PC ignores it).
+        sourceImage(snapshot.current.messages, params.getString("generator"))?.let { a ->
+            val o = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            android.graphics.BitmapFactory.decodeFile(a.path, o)
+            if (o.outWidth > 0 && o.outHeight > 0) params.put("frame", "${o.outWidth}:${o.outHeight}")
+        }
+        val reply = Message(
+            role = Role.ASSISTANT,
+            model = generatorName,
+            media = MediaRequest(params.getString("generator"), params.toString()),
+        )
+        val chat = snapshot.current.copy(messages = snapshot.current.messages + reply, updatedAt = System.currentTimeMillis())
+        _state.update { s -> s.copy(current = chat, chats = listOf(chat) + s.chats.filter { it.id != chat.id }) }
+        persist(chat.id)
+        watchMedia(chat.id, reply)
+    }
+
+    /**
+     * Submits (if not yet) and follows a PC job until its files are here. The job lives on the PC, so a
+     * dropped connection is retried, and leaving the chat only stops watching; reopening it picks up again.
+     */
+    private fun watchMedia(chatId: String, reply: Message) {
+        val request = reply.media ?: return
+        val settings = _state.value.settings
+        val baseUrls = settings.baseUrls(Providers.LOCAL)
+        val token = settings.key(Providers.LOCAL)
+        val pin = settings.localFingerprint
+        _state.update { it.copy(streaming = true, status = null) }
+        val run = ++runId
+        job = viewModelScope.launch {
+            var cancelled = false
+            try {
+                if (!settings.isPaired) throw ApiException("Pair with your PC first: Settings → Local PC.")
+                var jobId = request.jobId
+                if (jobId == null) {
+                    setProgress(reply.id, MediaProgress("sending", "Sending to your PC"))
+                    val all = (_state.value.chats.firstOrNull { it.id == chatId } ?: _state.value.current).messages
+                    val history = all.take(all.indexOfFirst { it.id == reply.id }.coerceAtLeast(0))
+                    val source = history.lastOrNull { it.role == Role.USER }
+                    val image = sourceImage(history, request.generator)?.let { File(it.path) }
+                    val audio = source?.attachments?.firstOrNull { it.isAudio }?.let { File(it.path) }
+                    val id = client.submitMedia(baseUrls, token, pin, JSONObject(request.params), image, audio)
+                    jobId = id
+                    updateMessage(chatId, reply.id) { it.copy(media = request.copy(jobId = id)) }
+                    persist(chatId)
+                }
+                // Following the job and fetching its files both ride out a dropped or slow connection.
+                suspend fun <T> reconnecting(block: suspend () -> T): T {
+                    var failures = 0
+                    while (true) {
+                        try {
+                            return block()
+                        } catch (e: MediaGoneException) {
+                            throw e
+                        } catch (e: ApiException) {
+                            if (++failures > MEDIA_RECONNECTS) throw ApiException("Lost contact with your PC. Tap Retry to check on it again.")
+                            val last = _state.value.mediaProgress[reply.id]
+                            setProgress(reply.id, (last ?: MediaProgress("running", "")).copy(phase = "Reconnecting to your PC", step = 0, steps = 0))
+                            // Waits a growing while, but tries again as soon as the phone gets a network back.
+                            withTimeoutOrNull(minOf(2000L * failures, 15_000L)) { networkBack.first(); delay(1500) }
+                        }
+                    }
+                }
+                val final = reconnecting { client.followMedia(baseUrls, token, pin, jobId) { setProgress(reply.id, it) } }
+                when (final.state) {
+                    "done" -> {
+                        val files = final.files.map { f ->
+                            val dest = File(store.attachmentDir, "${newId()}.${f.name.substringAfterLast('.', "bin")}")
+                            reconnecting {
+                                setProgress(reply.id, final.copy(phase = "Downloading"))
+                                client.downloadMedia(baseUrls, token, pin, jobId, f.index, dest)
+                            }
+                            Attachment(f.kind, f.name, dest.path)
+                        }
+                        updateMessage(chatId, reply.id) {
+                            it.copy(attachments = files, error = null, media = it.media?.copy(seed = final.seed))
+                        }
+                    }
+                    "cancelled" -> updateMessage(chatId, reply.id) { it.copy(stopped = true, media = it.media?.copy(jobId = null)) }
+                    else -> updateMessage(chatId, reply.id) {
+                        it.copy(error = final.error ?: "Your PC couldn't make this.", media = it.media?.copy(jobId = null))
+                    }
+                }
+            } catch (e: CancellationException) {
+                cancelled = true
+                throw e
+            } catch (e: MediaGoneException) {
+                updateMessage(chatId, reply.id) { it.copy(error = e.message, media = it.media?.copy(jobId = null)) }
+            } catch (e: Exception) {
+                updateMessage(chatId, reply.id) { it.copy(error = e.message ?: "Something went wrong") }
+            } finally {
+                if (!cancelled) setProgress(reply.id, null)
+                if (runId == run) _state.update { it.copy(streaming = false, status = null) }
+                persist(chatId)
+            }
+        }
+    }
+
+    private fun setProgress(messageId: String, progress: MediaProgress?) = _state.update {
+        it.copy(mediaProgress = if (progress == null) it.mediaProgress - messageId else it.mediaProgress + (messageId to progress))
+    }
+
+    /** Picks a PC job back up when its chat is opened again (after switching chats or restarting the app). */
+    private fun resumeMedia(chat: Chat) {
+        val last = chat.messages.lastOrNull() ?: return
+        if (last.mediaPending && last.media?.jobId != null && !_state.value.streaming) watchMedia(chat.id, last)
+    }
+
+    /** Saves a result to the phone's gallery and, if it was made on the PC, keeps a copy there too. */
+    fun saveMedia(message: Message) {
+        val files = message.attachments.filter { it.isMedia }
+        if (files.isEmpty()) return
+        val context = getApplication<Application>()
+        viewModelScope.launch {
+            val saved = withContext(Dispatchers.IO) { files.all { saveToGallery(context, it) } }
+            if (!saved) {
+                _state.update { it.copy(notice = "Couldn't save to your phone") }
+                return@launch
+            }
+            val where = when {
+                files.all { it.isImage } -> "Pictures/CubicAI"
+                files.all { it.isVideo } -> "Movies/CubicAI"
+                files.all { it.isAudio } -> "Music/CubicAI"
+                else -> "your phone's CubicAI folders"
+            }
+            val s = _state.value.settings
+            if (message.media == null || !s.isPaired) {
+                _state.update { it.copy(notice = "Saved to $where") }
+                return@launch
+            }
+            val pc = runCatching {
+                files.forEach { a ->
+                    val mime = mimeFor(a)
+                    client.saveOnPc(s.baseUrls(Providers.LOCAL), s.key(Providers.LOCAL), s.localFingerprint, a.kind, a.name, File(a.path), mime)
+                }
+            }
+            _state.update {
+                it.copy(notice = if (pc.isSuccess) "Saved to $where and your PC" else "Saved to $where. Couldn't reach your PC to keep a copy there.")
+            }
+        }
+    }
+
     suspend fun listModels(provider: Provider): List<ModelInfo> {
         modelCache[provider.id]?.let { return it }
         val s = _state.value.settings
@@ -143,7 +425,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         if (baseUrls.isEmpty()) {
             throw ApiException(if (provider == Providers.LOCAL) "Pair with your PC first: Settings → Local PC." else "Set a base URL in Settings first.")
         }
-        return client.listModels(baseUrls, s.key(provider), s.pin(provider), onRemoteUrl = ::learnRemoteUrl).also {
+        return client.listModels(baseUrls, s.key(provider), s.pin(provider), onRemoteUrl = ::learnRemoteUrl, onLan6Url = ::learnLan6Url).also {
             modelCache[provider.id] = it
             refreshContextLimit() // the open chat's meter may have been waiting on this list
         }
@@ -159,6 +441,13 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         // Called from the network thread; settings are saved on the main thread like every other change.
         viewModelScope.launch {
             if (url != _state.value.settings.localRemoteUrl && _state.value.settings.isPaired) updateSettings { it.copy(localRemoteUrl = url) }
+        }
+    }
+
+    private fun learnLan6Url(url: String) {
+        if (url.isEmpty()) return
+        viewModelScope.launch {
+            if (url != _state.value.settings.localLan6Url && _state.value.settings.isPaired) updateSettings { it.copy(localLan6Url = url) }
         }
     }
 
@@ -205,6 +494,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 providerId = Providers.LOCAL.id,
                 localUrl = pairing.url,
                 localRemoteUrl = pairing.remoteUrl,
+                localLan6Url = "",
                 localFingerprint = pairing.fingerprint,
                 apiKeys = it.apiKeys + (Providers.LOCAL.id to pairing.token),
             )
@@ -231,7 +521,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     fun unpair() {
         updateSettings {
-            it.copy(localUrl = "", localRemoteUrl = "", localFingerprint = "", apiKeys = it.apiKeys + (Providers.LOCAL.id to ""))
+            it.copy(localUrl = "", localRemoteUrl = "", localLan6Url = "", localFingerprint = "", apiKeys = it.apiKeys + (Providers.LOCAL.id to ""))
         }
         modelCache.remove(Providers.LOCAL.id)
     }
@@ -273,11 +563,14 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             updateSettings { it.copy(providerId = provider.id, models = it.models + (provider.id to chat.model)) }
             refreshContextLimit()
         }
+        _state.update { it.copy(streaming = false, status = null) } // the old chat's run was just cancelled
+        resumeMedia(chat)
     }
 
     fun deleteChat(id: String) {
         val chat = _state.value.chats.firstOrNull { it.id == id } ?: return
         if (_state.value.current.id == id) job?.cancel()
+        cancelPcJobs(chat)
         _state.update { s ->
             s.copy(chats = s.chats - chat, current = if (s.current.id == id) Chat(personaId = s.settings.personaId) else s.current)
         }
@@ -286,8 +579,17 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     fun deleteAllChats() {
         job?.cancel()
+        _state.value.chats.forEach(::cancelPcJobs)
         _state.update { it.copy(chats = emptyList(), current = Chat(personaId = it.settings.personaId), pending = emptyList()) }
         viewModelScope.launch(io) { store.deleteAll() }
+    }
+
+    /** A deleted chat's unfinished PC jobs are stopped too, so nothing it asked for is left on the PC. */
+    private fun cancelPcJobs(chat: Chat) {
+        val ids = chat.messages.filter { it.mediaPending }.mapNotNull { it.media?.jobId }
+        if (ids.isEmpty()) return
+        val s = _state.value.settings
+        viewModelScope.launch { ids.forEach { client.cancelMedia(s.baseUrls(Providers.LOCAL), s.key(Providers.LOCAL), s.localFingerprint, it) } }
     }
 
     // --- Composer -------------------------------------------------------------------------------
@@ -346,7 +648,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             )
         }
         _state.update { it.copy(current = chat, pending = emptyList(), draft = "") }
-        if (s.imageMode && s.settings.provider.images) createImage() else complete()
+        val create = s.create
+        when {
+            create != null && s.settings.provider == Providers.LOCAL -> createMedia(create.generator.name, createParams(create, text.trim()))
+            s.imageMode && s.settings.provider.images -> createImage()
+            else -> complete()
+        }
     }
 
     fun editMessage(id: String, text: String) {
@@ -354,14 +661,34 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val index = c.messages.indexOfFirst { it.id == id }
         if (_state.value.streaming || index < 0) return
         val edited = c.messages[index].copy(content = text.trim())
+        val reply = c.messages.getOrNull(index + 1)
         discard(c.messages.drop(index + 1).flatMap { it.attachments }) // later turns are gone; so are their files
         _state.update { it.copy(current = c.copy(messages = c.messages.take(index) + edited)) }
-        complete()
+        // A prompt that made something on the PC makes it again, with the new wording.
+        val media = reply?.media
+        if (media != null) {
+            createMedia(reply.model ?: media.generator, JSONObject(media.params).put("prompt", edited.content).apply { remove("seed") })
+        } else complete()
     }
 
     fun regenerate() {
         val c = _state.value.current
         if (_state.value.streaming) return
+        val lastReply = c.messages.lastOrNull()?.takeIf { it.role == Role.ASSISTANT }
+        lastReply?.media?.let { media ->
+            // The job is still on the PC (lost touch with it, or its download failed): collect it before making
+            // it anew. A job that failed, was stopped or is gone has no jobId any more.
+            if (media.jobId != null && lastReply.attachments.isEmpty() && lastReply.error != null) {
+                updateMessage(c.id, lastReply.id) { it.copy(error = null) }
+                watchMedia(c.id, lastReply.copy(error = null))
+                return
+            }
+            discard(lastReply.attachments)
+            _state.update { it.copy(current = c.copy(messages = c.messages.dropLast(1))) }
+            val params = JSONObject(media.params).apply { remove("seed") }
+            createMedia(lastReply.model ?: media.generator, params)
+            return
+        }
         val provider = _state.value.settings.provider
         // A failed or unwanted picture is redone as a picture, not as text.
         val wasImage = provider.images && c.messages.lastOrNull { it.role == Role.ASSISTANT }?.model == provider.imageModel
@@ -374,6 +701,15 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     fun stop() {
         job?.cancel()
+        val c = _state.value.current
+        val pending = c.messages.lastOrNull()?.takeIf { it.mediaPending } ?: return
+        setProgress(pending.id, null)
+        updateMessage(c.id, pending.id) { it.copy(stopped = true, media = it.media?.copy(jobId = null)) }
+        persist(c.id)
+        pending.media?.jobId?.let { id ->
+            val s = _state.value.settings
+            viewModelScope.launch { client.cancelMedia(s.baseUrls(Providers.LOCAL), s.key(Providers.LOCAL), s.localFingerprint, id) }
+        }
     }
 
     // --- Completion -----------------------------------------------------------------------------
@@ -535,13 +871,23 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             if (settings.aboutMe.isNotBlank()) append("\n\nAbout the user (use when relevant):\n").append(settings.aboutMe.trim())
             append("\n\nCurrent date and time: ").append(now)
         }
-        val kept = history.filter { it.role == Role.USER || it.content.isNotEmpty() } // drop failed/empty replies
+        // Drop failed/empty replies. Things made on the PC stay as a short note so the model knows they exist.
+        val kept = history.mapNotNull { m ->
+            when {
+                m.role == Role.USER || m.content.isNotEmpty() -> m
+                m.media != null && m.attachments.isNotEmpty() -> {
+                    val what = m.attachments.first().let { if (it.isVideo) "a video" else if (it.isAudio) "a sound clip" else "an image" }
+                    Message(id = m.id, role = m.role, content = "[Made $what with ${m.model ?: "ComfyUI"} on the user's PC]")
+                }
+                else -> null
+            }
+        }
         // The whole conversation is resent every turn, so the model remembers earlier photos and files.
         // Photos from older messages are swapped for a note so a long chat can't overflow the model's context;
         // the model's own earlier replies about them still carry what it saw.
         val withImages = kept.filter { m -> m.attachments.any { it.isImage } }.takeLast(MAX_IMAGE_MESSAGES).map { it.id }.toSet()
         val turns = kept.map { m ->
-            val files = m.attachments.filterNot { it.isImage }.joinToString("") { a ->
+            val files = m.attachments.filter { it.kind == Attachment.KIND_TEXT }.joinToString("") { a ->
                 "\n\n<file name=\"${a.name}\">\n${AttachmentProcessor.readText(a)}\n</file>"
             }
             val photos = m.attachments.filter { it.isImage }
@@ -578,6 +924,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private fun markInterrupted(chat: Chat): Chat {
         val last = chat.messages.lastOrNull() ?: return chat
         if (last.role != Role.ASSISTANT || last.content.isNotEmpty() || last.error != null || last.stopped || last.attachments.isNotEmpty()) return chat
+        if (last.media?.jobId != null) return chat // still on the PC: followed again when the chat is opened
         return chat.copy(messages = chat.messages.dropLast(1) + last.copy(error = "The reply was interrupted before it finished."))
     }
 
@@ -625,5 +972,18 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     override fun onCleared() {
         tts?.shutdown()
+        runCatching { connectivity?.unregisterNetworkCallback(networkWatch) }
     }
+}
+
+private fun mimeFor(a: Attachment) = when (a.path.substringAfterLast('.').lowercase()) {
+    "png" -> "image/png"
+    "jpg", "jpeg" -> "image/jpeg"
+    "webp" -> "image/webp"
+    "mp4" -> "video/mp4"
+    "webm" -> "video/webm"
+    "flac" -> "audio/flac"
+    "mp3" -> "audio/mpeg"
+    "wav" -> "audio/wav"
+    else -> "application/octet-stream"
 }

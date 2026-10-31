@@ -9,13 +9,15 @@
 - Message content is never logged or stored.
 
 Usage:
-    cubicai_server.py serve [--port 8443] [--bind 0.0.0.0]   run the gateway
+    cubicai_server.py serve [--port 8443] [--bind ::]   run the gateway (:: = IPv6 and IPv4)
     cubicai_server.py pair [--url https://HOST:PORT]          show the pairing QR code / link
     cubicai_server.py remote on|off|status                    allow the paired phone in over Tailscale
     cubicai_server.py rotate                                  new token (un-pairs every phone)
 """
 
 import argparse
+import base64
+import binascii
 import collections
 import datetime
 import hashlib
@@ -26,6 +28,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import socket
 import ssl
 import subprocess
@@ -39,6 +42,8 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+import cubicai_media as media
 
 CONFIG_DIR = Path(os.environ.get("CUBICAI_CONFIG_DIR", "~/.config/cubicai-server")).expanduser()
 OLLAMA_URL = os.environ.get("CUBICAI_OLLAMA_URL", "http://127.0.0.1:11434")
@@ -194,7 +199,40 @@ def client_allowed(ip):
         return True
     if any(addr in n for n in TAILNET):
         return remote_enabled()
-    return any(addr in n for n in HOME)
+    return any(addr in n for n in HOME) or any(addr in n for n, _ in lan6())
+
+
+_LAN6_SKIP = ("lo", "tailscale", "docker", "br-", "veth", "virbr")
+_lan6_cache = {"at": 0.0, "nets": []}
+
+
+def lan6():
+    """This PC's IPv6 home networks as (network, own address): the ISP's prefix on the home Wi-Fi/Ethernet.
+    Phones on the same prefix are on the home network, the same as 192.168.x for IPv4."""
+    if time.time() - _lan6_cache["at"] < 30:
+        return _lan6_cache["nets"]
+    nets = []
+    try:
+        for line in open("/proc/net/if_inet6"):
+            hexaddr, _, plen, scope, flags, dev = line.split()
+            # Global scope only; temporary (0x01), deprecated (0x20) and tentative (0x40) addresses aren't used.
+            if scope != "00" or int(flags, 16) & 0x61 or dev.startswith(_LAN6_SKIP):
+                continue
+            addr = ipaddress.ip_address(bytes.fromhex(hexaddr))
+            if any(addr in n for n in TAILNET):
+                continue
+            nets.append((ipaddress.ip_network(f"{addr}/{int(plen, 16)}", strict=False), addr))
+    except OSError:
+        pass
+    _lan6_cache.update(at=time.time(), nets=nets)
+    return nets
+
+
+def lan6_url(port=DEFAULT_PORT):
+    """The PC's IPv6 home address, a second way in when the router fails to pass IPv4 between devices.
+    A ULA (fd00::/8, stable) is preferred to the ISP's prefix, which can change."""
+    nets = sorted(lan6(), key=lambda n: not n[1].is_private)
+    return f"https://[{nets[0][1]}]:{port}" if nets else None
 
 
 _ts_cache = {"at": 0.0, "ip": None}
@@ -603,23 +641,39 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorized():
             return
         path = self.path.split("?")[0].rstrip("/")
-        if path in ("/health", "/v1/health"):
+        if path.startswith("/v1/media/"):
+            self._media_get(path)
+        elif path in ("/health", "/v1/health"):
             self._json(200, {"ok": True})
         elif path == "/v1/cubicai/status":
             self._json(200, ACTIVITY.snapshot())
         elif path == "/v1/models":
             try:
                 # The phone learns the Tailscale address from here, so remote on/off needs no re-pairing.
-                self._json(200, {**list_models(), "cubic_remote": remote_url(self.server.server_address[1])})
+                port = self.server.server_address[1]
+                self._json(200, {**list_models(), "cubic_remote": remote_url(port), "cubic_lan6": lan6_url(port)})
             except Exception as e:
                 self._json(502, {"error": {"message": f"Can't reach Ollama: {e}"}})
         else:
             self._json(404, {"error": {"message": "Not found"}})
 
+    def do_DELETE(self):
+        if not self._authorized():
+            return
+        m = re.fullmatch(r"/v1/media/jobs/([\w-]+)", self.path.split("?")[0].rstrip("/"))
+        if m and media.jobs().cancel(m.group(1)):
+            self._json(200, {"ok": True})
+        else:
+            self._json(404, {"error": {"message": "No such job"}})
+
     def do_POST(self):
         if not self._authorized():
             return
-        if self.path.split("?")[0].rstrip("/") != "/v1/chat/completions":
+        path = self.path.split("?")[0].rstrip("/")
+        if path == "/v1/media/save":
+            self._media_save()
+            return
+        if path not in ("/v1/chat/completions", "/v1/media/jobs"):
             self._json(404, {"error": {"message": "Not found"}})
             return
         try:
@@ -636,8 +690,110 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             self._json(400, {"error": {"message": "Invalid JSON"}})
             return
+        if path == "/v1/media/jobs":
+            self._media_submit(body)
+            return
         self.connection.settimeout(900)  # authorized: allow long generations
         self._chat(body)
+
+    # --- Media (ComfyUI) ---
+
+    def _media_submit(self, body):
+        def decode(field):
+            raw = body.get(field)
+            return base64.b64decode(raw) if raw else None
+        try:
+            image, audio = decode("image"), decode("audio")
+            job = media.jobs().submit(str(body.get("generator", "")), body, image, audio, self.client_address[0])
+        except (ValueError, binascii.Error) as e:
+            self._json(400, {"error": {"message": str(e)}})
+            return
+        rid = ACTIVITY.begin(self.client_address[0], job.gen["name"], False)
+
+        def track(j):
+            if j.state in media.TERMINAL:
+                ACTIVITY.end(rid, {"done": "ok"}.get(j.state, j.state))
+            else:
+                ACTIVITY.phase(rid, j.phase)
+        job.on_change = track
+        self._json(200, {"id": job.id})
+
+    def _media_get(self, path):
+        if path == "/v1/media/generators":
+            self._json(200, {"generators": media.generators(), "comfy_running": media.comfy_running()})
+            return
+        m = re.fullmatch(r"/v1/media/jobs/([\w-]+)(/events|/files/(\d+))?", path)
+        job = media.jobs().get(m.group(1)) if m else None
+        if job is None:
+            self._json(404, {"error": {"message": "This result is no longer on your PC."}})
+        elif m.group(2) == "/events":
+            self._media_events(job)
+        elif m.group(3) is not None:
+            self._media_file(job, int(m.group(3)))
+        else:
+            self._json(200, job.snapshot())
+
+    def _media_events(self, job):
+        """Server-sent progress until the job ends; the phone reconnects here if the network drops."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        self.connection.settimeout(60)
+        seen, sent_preview = -1, None
+        try:
+            while True:
+                with job.cond:
+                    if job.version == seen:
+                        job.cond.wait(15)
+                    version, state = job.version, job.state
+                if version == seen:
+                    self.wfile.write(b": still working\n\n")  # keeps NAT and Tailscale paths open
+                    self.wfile.flush()
+                    continue
+                seen = version
+                fresh = job.preview is not None and job.preview is not sent_preview
+                sent_preview = job.preview
+                self._emit(job.snapshot(preview=fresh))
+                if state in media.TERMINAL:
+                    break
+        except (BrokenPipeError, ConnectionResetError, ssl.SSLError, OSError):
+            pass  # the phone went away; the job carries on and it can reconnect
+
+    def _media_file(self, job, index):
+        f = next((f for f in job.files if f["index"] == index), None)
+        if f is None or not f["path"].exists():
+            self._json(404, {"error": {"message": "No such file"}})
+            return
+        size = f["path"].stat().st_size
+        self.send_response(200)
+        self.send_header("Content-Type", f["mime"])
+        self.send_header("Content-Length", str(size))
+        self.end_headers()
+        self.connection.settimeout(120)
+        try:
+            with open(f["path"], "rb") as src:
+                shutil.copyfileobj(src, self.wfile, 1 << 20)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ssl.SSLError, OSError):
+            self.close_connection = True
+            return  # not delivered: the phone can ask again
+        media.jobs().delivered(job, index)
+
+    def _media_save(self):
+        query = urllib.parse.parse_qs(self.path.partition("?")[2])
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            self.connection.settimeout(120)
+            where = media.save(query.get("kind", [""])[0], query.get("name", ["cubicai"])[0], self.rfile, length)
+            self._body_read = True
+        except ValueError as e:
+            self._json(400, {"error": {"message": str(e)}})
+            return
+        log(f"saved a {query.get('kind', [''])[0]} from {self.client_address[0]}")
+        self._json(200, {"ok": True, "path": where})
 
     def _emit(self, obj):
         self.wfile.write(b"data: " + json.dumps(obj).encode() + b"\n\n")
@@ -688,6 +844,9 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     messages.insert(0, {"role": "system", "content": context})
 
+            if media.COMFY.busy:
+                self._emit({"cubic_status": "Your PC is busy making something, so this reply will be slower…"})
+            media.COMFY.free_for_chat()  # ComfyUI may still hold the GPU from an image just made
             # Keep a model warm between chats; Ollama still evicts it early if another model needs the VRAM.
             payload = {"model": model, "messages": messages, "stream": True, "options": {},
                        "keep_alive": load_settings().get("keep_alive", "15m")}
@@ -754,10 +913,28 @@ class TLSServer(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, address, tls, token):
+        # "::" listens on IPv6 and IPv4 at once (IPv4 peers arrive as ::ffff:a.b.c.d and are unwrapped below).
+        self.address_family = socket.AF_INET6 if ":" in address[0] else socket.AF_INET
         super().__init__(address, Handler)
         self.tls, self.token = tls, token
         self.slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
         self.per_address, self.per_address_lock = {}, threading.Lock()
+
+    def server_bind(self):
+        if self.address_family == socket.AF_INET6:
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        super().server_bind()
+
+    def get_request(self):
+        conn, addr = super().get_request()
+        try:
+            ip = ipaddress.ip_address(addr[0])
+            if getattr(ip, "ipv4_mapped", None):
+                ip = ip.ipv4_mapped
+            addr = (str(ip), addr[1])
+        except ValueError:
+            pass
+        return conn, addr
 
     def verify_request(self, request, client_address):
         # Dropped before TLS: outsiders can't even see a certificate.
@@ -815,26 +992,51 @@ class TLSServer(ThreadingHTTPServer):
         self.RequestHandlerClass(conn, client_address, self)
 
 
+def announce(port, fp):
+    """Announces the gateway on the home network (mDNS, through avahi) so a paired phone can find the PC again
+    after the router hands it a new address. Only the certificate fingerprint is published, which the phone
+    checks before trusting anything; the token never leaves pairing. Without avahi it's simply skipped."""
+    tool = shutil.which("avahi-publish-service")
+    if not tool:
+        log("mDNS: avahi-publish-service not found; the phone can't find the PC by itself if its address changes")
+        return None
+    try:
+        proc = subprocess.Popen(
+            [tool, f"CubicAI on {socket.gethostname()}", "_cubicai._tcp", str(port), f"fp={fp}"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except OSError as e:
+        log(f"mDNS: couldn't announce ({e})")
+        return None
+    log("mDNS: announced as _cubicai._tcp")
+    return proc
+
+
 def serve(bind, port):
     cert, key, token, fp = identity()
     tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     tls.minimum_version = ssl.TLSVersion.TLSv1_3
     tls.load_cert_chain(cert, key)
     server = TLSServer((bind, port), tls, token)
+    media.jobs()  # clears anything a previous run left in the temp and ComfyUI folders
     log(f"CubicAI server on https://{lan_ip()}:{port} (bind {bind}) → Ollama {OLLAMA_URL}, search {SEARXNG_URL}")
     log("remote access over Tailscale: " + (f"on ({tailscale_ip() or 'Tailscale not connected'})" if remote_enabled() else "off"))
     log(f"cert fingerprint {fp[:16]}…  — run '{Path(sys.argv[0]).name} pair' to pair a phone")
+    mdns = announce(port, fp)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        if mdns:
+            mdns.terminate()
 
 
 def main():
     p = argparse.ArgumentParser(description="Private gateway from the CubicAI app to Ollama")
     sub = p.add_subparsers(dest="cmd")
     s = sub.add_parser("serve")
-    s.add_argument("--bind", default="0.0.0.0")
+    s.add_argument("--bind", default="::")
     s.add_argument("--port", type=int, default=DEFAULT_PORT)
     pr = sub.add_parser("pair")
     pr.add_argument("--url", help="address the phone should use, e.g. https://192.168.1.20:8443")
@@ -857,7 +1059,7 @@ def main():
         rotate_token()
         print("New token created. Restart the server and pair your phone again.")
     else:
-        serve(getattr(a, "bind", "0.0.0.0"), getattr(a, "port", DEFAULT_PORT))
+        serve(getattr(a, "bind", "::"), getattr(a, "port", DEFAULT_PORT))
 
 
 if __name__ == "__main__":

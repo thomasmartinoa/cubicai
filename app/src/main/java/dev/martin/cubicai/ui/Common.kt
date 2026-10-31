@@ -38,6 +38,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import dev.martin.cubicai.data.Attachment
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -50,19 +51,36 @@ fun shareText(context: Context, text: String) {
     context.startActivity(Intent.createChooser(send, null))
 }
 
-/** Copies an image into Pictures/CubicAI. Only ever called from a tap on "Save", never automatically. */
-fun saveToGallery(context: Context, path: String): Boolean = runCatching {
-    val source = File(path)
-    val values = ContentValues().apply {
-        put(MediaStore.Images.Media.DISPLAY_NAME, "CubicAI-${System.currentTimeMillis()}.${source.extension.ifBlank { "png" }}")
-        put(MediaStore.Images.Media.MIME_TYPE, if (source.extension == "jpg") "image/jpeg" else "image/png")
-        put(MediaStore.Images.Media.RELATIVE_PATH, "${Environment.DIRECTORY_PICTURES}/CubicAI")
+/**
+ * Copies a picture, video or sound into Pictures, Movies or Music /CubicAI. Only ever called from a tap on
+ * "Save", never automatically; and the file is written to the gallery but stays in the chat as well.
+ */
+fun saveToGallery(context: Context, attachment: Attachment): Boolean = runCatching {
+    val source = File(attachment.path)
+    val ext = source.extension.lowercase().ifBlank { "png" }
+    val (collection, folder, mime) = when {
+        attachment.isVideo -> Triple(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, Environment.DIRECTORY_MOVIES, "video/$ext")
+        attachment.isAudio -> Triple(
+            MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, Environment.DIRECTORY_MUSIC,
+            if (ext == "mp3") "audio/mpeg" else "audio/$ext",
+        )
+        else -> Triple(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, Environment.DIRECTORY_PICTURES, if (ext == "jpg") "image/jpeg" else "image/$ext")
     }
-    val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)!!
+    val values = ContentValues().apply {
+        put(MediaStore.MediaColumns.DISPLAY_NAME, "CubicAI-${System.currentTimeMillis()}.$ext")
+        put(MediaStore.MediaColumns.MIME_TYPE, mime)
+        put(MediaStore.MediaColumns.RELATIVE_PATH, "$folder/CubicAI")
+    }
+    val uri = context.contentResolver.insert(collection, values)!!
     context.contentResolver.openOutputStream(uri)!!.use { out -> source.inputStream().use { it.copyTo(out) } }
 }.isSuccess
 
 fun shortModelName(model: String) = model.substringAfterLast('/').removeSuffix(":free")
+
+/** For labels: also without the quantisation tag (":Q4_K_M"), which says little at a glance. The picker keeps it. */
+fun displayModelName(model: String) = shortModelName(model).replace(QUANT_TAG, "")
+
+private val QUANT_TAG = Regex(":(q\\d\\w*|iq\\d\\w*|f16|bf16|fp16|latest)$", RegexOption.IGNORE_CASE)
 
 fun domainOf(url: String) = runCatching { Uri.parse(url).host?.removePrefix("www.") }.getOrNull() ?: url
 

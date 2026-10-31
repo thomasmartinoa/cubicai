@@ -15,6 +15,7 @@ A personal Android AI chat app built with Kotlin and Jetpack Compose. It talks t
 - **Many providers in one place**: Local PC (Ollama), Google Gemini, xAI (Grok), OpenRouter, or any OpenAI-compatible endpoint. Each chat remembers its own model and behaviour.
 - **Web search** with source chips: on your PC through a private SearXNG, on Grok through xAI's web and X search, on OpenRouter through its web plugin.
 - **Photos, camera, files and PDFs**: images are downscaled before sending; PDFs are sent as page images, other files as text.
+- **Create images, video, music and speech on your own PC** through ComfyUI, from home or over Tailscale: live preview while it renders, results kept only in the chat until you tap Save.
 - **Image creation** with Gemini (needs a Google account with billing; the free tier has no image quota).
 - **Context meter** beside the send button: how much of the model's context window the chat fills, plus the tokens read and written so far. Tap it for details.
 - **Behaviours** (system prompts): built-in ones, your own, and an "About you" note added to all of them except None.
@@ -74,7 +75,7 @@ phone ──TLS 1.3, pinned certificate, bearer token──► cubicai_server.py
 
 - Linux with **Python 3** (the server uses only the standard library; it is tested on 3.14)
 - [**Ollama**](https://ollama.com) with at least one model pulled, for example `ollama pull gemma4:e4b`
-- Optional: **Docker** for web search, **Tailscale** to use your PC away from home, and **GTK 4 + libadwaita** (`python-gobject`) for the control panel
+- Optional: **Docker** for web search, **Tailscale** to use your PC away from home, **GTK 4 + libadwaita** (`python-gobject`) for the control panel, and **Avahi** (`avahi-daemon` running) so the phone finds the PC again when the router gives it a new address
 
 ### 1. Set up the server
 
@@ -88,10 +89,10 @@ python3 -m venv .venv
 
 The first start creates the certificate, the token and `settings.json` in `~/.config/cubicai-server` (readable only by you).
 
-Allow the port through your firewall if you have one, for example with ufw:
+Allow the port through your firewall if you have one, for example with ufw (on the home Wi-Fi or Ethernet interface, so IPv6 is covered too; the server itself turns away anyone outside your home network):
 
 ```sh
-sudo ufw allow 8443/tcp
+sudo ufw allow in on wlp0s20f3 to any port 8443 proto tcp   # your interface name: ip -br link
 ```
 
 ### 2. Run it in the background (systemd)
@@ -149,6 +150,10 @@ Then tap the **Search** chip under the message box. The server searches, reads t
    ```
 3. Open CubicAI once while you're at home (or tap **Test connection**). The phone learns the PC's Tailscale address by itself, so you don't need to pair again.
 
+Some routers stop passing IPv4 between two Wi-Fi devices after one reconnects (it can last 10+ minutes) while IPv6 keeps working. The PC tells the app its IPv6 home address too, and the app falls back to it, so this goes unnoticed. Only phones on your home IPv6 prefix are let in.
+
+If your router hands the PC a new home address, the app finds it again on the home network (the server announces itself over mDNS with its certificate's fingerprint, so only your own PC is accepted) and keeps the new address. No re-pairing needed.
+
 Away from home, the app tries your home address first and then the Tailscale one. `remote off` blocks Tailscale again straight away, including connections that are already open.
 
 ### 6. Optional: the control panel
@@ -165,6 +170,39 @@ Icon=network-server
 Categories=Network;Utility;
 EOF
 ```
+
+### 7. Optional: create images, video, music and speech (ComfyUI)
+
+With [ComfyUI](https://github.com/comfyanonymous/ComfyUI) installed on the PC, the **Create** chip under the message box (Local PC only) makes things there and sends them to the phone:
+
+| Tab | Generators (shown only when their models are installed) |
+|---|---|
+| Image | Qwen Image 2.1 Uncensored, Z-Image Turbo, Flux 3 Klein, Flux 2 Klein, Illustrious XL |
+| Edit | Qwen Image Edit, Flux 2 Klein Edit, Remove background, Upscale 2× (attach a photo) |
+| Video | Wan 2.2 5B (text or photo), Wan 2.2 14B (brings a photo to life) |
+| Music | ACE-Step 1.5 (style prompt, optional lyrics) |
+| Voice | Chatterbox (reads your text; attach a voice recording to copy that voice) |
+
+How it behaves:
+
+- **Started on demand.** The server starts ComfyUI for the first job and stops it after 10 idle minutes. Ollama's models are unloaded first so the GPU has room, and ComfyUI's are freed again before the next chat.
+- **Nothing piles up on the PC.** Results wait in `~/.cache/cubicai-server/media` only until the phone has downloaded them, at most an hour. Inputs and outputs inside ComfyUI's own folders are deleted after each job, and workflows run without embedded metadata.
+- **Save keeps a copy in both places.** Tap **Save** on a result: it goes to the phone's Pictures, Movies or Music `/CubicAI` folder, and a copy goes to `AI_local/CubicAI/{Images,Videos,Music}` on the PC. Deleting the chat deletes everything else, and stops any job it still had running on the PC.
+- **Edit, then edit again.** With an Edit generator chosen and no photo attached, the change applies to the latest picture in the chat, so you can say "now make it night" after an edit.
+- **Survives the trip.** The job keeps running on the PC if the phone drops off Wi-Fi or you leave the chat. Reopening the chat picks it up again, and a job that lost the PC retries as soon as the phone is back on a network.
+- **More controls when you want them.** Folded away under **More controls** in the Create sheet: a fixed **seed** (same seed and prompt give the same result, so you can change a few words and vary just that; "Use the last picture's seed" picks up the previous result's), and for Qwen Image 2.1, Illustrious and Wan 5B, **steps**, **CFG** and **Avoid** (negative prompt). They start at each workflow's own values; **Reset** goes back. The distilled models (Z-Image, Flux Klein) don't offer steps or CFG, since other values mostly spoil their results.
+- **Chat and create share one GPU.** A chat sent while something is being made is slower (the PC says so); afterwards the chat model is reloaded fully onto the GPU. A second creation waits for the first. If ComfyUI crashes (out of memory, say), the reply says so and Retry starts it again.
+
+Setup (paths in the unit files assume ComfyUI at `/mnt/storage/games/AI_local/ComfyUI`; edit them if yours is elsewhere):
+
+```sh
+cp server/cubicai-comfyui.service server/cubicai-server.service ~/.config/systemd/user/
+mkdir -p /mnt/storage/games/AI_local/ComfyUI/{input,output}/cubicai /mnt/storage/games/AI_local/CubicAI
+systemctl --user daemon-reload
+systemctl --user restart cubicai-server
+```
+
+The workflows are the ones saved in ComfyUI's `user/default/workflows`; `server/cubicai_media.py` lists which file each generator uses and which inputs it sets.
 
 ### Context length
 
@@ -201,6 +239,8 @@ The app is a single `:app` module (`dev.martin.cubicai`):
 | **The connection to your PC dropped before the reply finished** | The server restarted or the network dropped mid-reply. Tap **Retry**. |
 | Replies pause for a few seconds and then catch up | Usually a weak Wi-Fi signal (the 2.4 GHz band is the usual culprit). Nothing is lost; the text arrives once the link recovers. |
 | Gemini image creation says quota exceeded | Google's free tier has no image quota. Turn on billing for the key's project. |
+| **Create** shows nothing to make | ComfyUI isn't installed where the unit file expects it, or none of the listed models are present. Check `journalctl --user -u cubicai-comfyui`. |
+| A creation fails with "ComfyUI rejected the workflow" | A model or custom node the workflow uses is missing or was renamed. Open the workflow in ComfyUI to see which. |
 | Search returns nothing on Local PC | Check the SearXNG container is running: `docker ps --filter name=cubicai-searxng`. |
 
 ## License

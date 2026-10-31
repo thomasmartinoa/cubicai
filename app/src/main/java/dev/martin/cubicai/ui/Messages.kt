@@ -1,6 +1,5 @@
 package dev.martin.cubicai.ui
 
-import android.widget.Toast
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
@@ -31,6 +30,8 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.layout.ContentScale
 import kotlinx.coroutines.delay
+import dev.martin.cubicai.net.MediaProgress
+import org.json.JSONObject
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
@@ -198,13 +199,18 @@ fun AssistantMessage(
     isLast: Boolean,
     onRegenerate: () -> Unit,
     onSpeak: (String) -> Unit,
+    progress: MediaProgress? = null,
+    onSave: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val images = message.attachments.filter { it.isImage }
+    val media = message.attachments.filter { it.isMedia }
     val hasText = message.content.isNotEmpty()
+    val making = message.mediaPending
     val thinking = streaming && !hasText && message.reasoning.isNotBlank()
-    val waiting = streaming && !hasText && message.reasoning.isBlank() && images.isEmpty()
+    val waiting = streaming && !hasText && message.reasoning.isBlank() && images.isEmpty() && !making
     val writing = streaming && hasText
+    val request = remember(message.media?.params) { message.media?.params?.let { runCatching { JSONObject(it) }.getOrNull() } }
 
     // Seconds spent thinking, ticking only while the model is.
     val seconds by produceState(0, thinking) {
@@ -215,6 +221,11 @@ fun AssistantMessage(
         }
     }
     val phase = when {
+        making && !message.stopped -> when {
+            progress == null -> if (streaming) "Sending to your PC" else "Waiting for your PC"
+            progress.steps > 0 -> "${progress.phase} · ${progress.step}/${progress.steps}"
+            else -> progress.phase.ifBlank { "Working" }
+        }
         status != null -> status
         thinking -> if (seconds > 0) "Thinking for ${seconds}s" else "Thinking"
         waiting -> "Thinking"
@@ -226,21 +237,33 @@ fun AssistantMessage(
         ReplyHeader(
             name = message.persona ?: fallbackName.ifBlank { "CubicAI" },
             phase = phase,
-            spinning = streaming,
+            spinning = streaming || (making && !message.stopped),
         )
+        if (making && !message.stopped) MediaProgressCard(progress, request?.optString("kind").orEmpty(), request?.optString("aspect")?.ifEmpty { request.optString("frame") })
         if (message.reasoning.isNotBlank()) ReasoningBlock(message.reasoning, active = thinking)
         // The height eases open as lines arrive, so the reply above glides up instead of jumping a line at a time.
         if (hasText) MarkdownText(message.content, Modifier.animateContentSize(tween(180)), streaming = streaming)
         if (images.isNotEmpty()) CreatedImages(images)
-        if (message.stopped) Text(
-            "Stopped",
-            Modifier.padding(top = 4.dp),
-            style = MaterialTheme.typography.labelMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
+        message.attachments.filter { it.isVideo }.forEach { VideoPlayer(it.path, Modifier.padding(top = 4.dp)) }
+        val sound = if (message.media?.generator == "chatterbox") "Speech" else "Music"
+        message.attachments.filter { it.isAudio }.forEach { AudioPlayer(it, sound, Modifier.padding(top = 4.dp)) }
+        if (message.stopped) Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "Stopped",
+                Modifier.padding(top = 4.dp),
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            // A stopped creation left nothing behind, so offer to run it again rather than make you retype it.
+            if (message.media != null && media.isEmpty() && isLast && !streaming) {
+                TextButton(onClick = onRegenerate, shape = MaterialTheme.shapes.small, modifier = Modifier.padding(start = 8.dp)) {
+                    Text("Try again")
+                }
+            }
+        }
         message.error?.let { ErrorCard(it, onRetry = if (isLast) onRegenerate else null) }
         if (message.citations.isNotEmpty()) Sources(message.citations)
-        if (!streaming && (hasText || images.isNotEmpty())) Row(
+        if (!streaming && (hasText || media.isNotEmpty())) Row(
             Modifier.fillMaxWidth().padding(top = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
@@ -251,16 +274,16 @@ fun AssistantMessage(
                 SmallAction(Icons.AutoMirrored.Rounded.VolumeUp, "Read aloud") { onSpeak(message.content) }
                 SmallAction(Icons.Rounded.Share, "Share") { shareText(context, message.content) }
             }
-            if (images.isNotEmpty()) SmallAction(Icons.Rounded.Download, "Save to gallery") {
-                val saved = saveToGallery(context, images.first().path)
-                Toast.makeText(context, if (saved) "Saved to Pictures/CubicAI" else "Couldn't save the image", Toast.LENGTH_SHORT).show()
+            if (media.isNotEmpty()) {
+                SmallAction(Icons.Rounded.Download, "Save", onSave)
+                if (!hasText) SmallAction(Icons.Rounded.Share, "Share") { shareFile(context, media.first()) }
             }
             if (isLast) SmallAction(Icons.Rounded.Refresh, "Regenerate", onRegenerate)
             }
             Spacer(Modifier.weight(1f))
             // The header already names the model unless a behaviour's name is shown there.
             if (message.persona != null) message.model?.let {
-                Text(shortModelName(it), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(displayModelName(it), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
     }
@@ -279,11 +302,12 @@ private fun CreatedImages(images: List<Attachment>) {
     var viewing by remember { mutableStateOf<String?>(null) }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 4.dp)) {
         images.forEach { a ->
+            val ratio = remember(a.path) { imageRatio(a.path) }
             LocalImage(
                 a.path,
-                Modifier.fillMaxWidth().heightIn(max = 420.dp).clip(MaterialTheme.shapes.medium).clickable { viewing = a.path },
+                Modifier.mediaFrame(ratio).clip(MaterialTheme.shapes.medium).clickable { viewing = a.path },
                 maxSize = 1024,
-                contentScale = ContentScale.Fit,
+                contentScale = ContentScale.Crop,
             )
         }
     }
@@ -340,7 +364,15 @@ private fun ReplyHeader(name: String, phase: String?, spinning: Boolean) {
     Row(Modifier.padding(bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
         Cube(16.dp, spinning = spinning)
         Spacer(Modifier.width(8.dp))
-        Text(name, style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary)
+        // One line: a long model name is cut short rather than wrapping or pushing the status out.
+        Text(
+            name,
+            Modifier.weight(1f, fill = false),
+            style = MaterialTheme.typography.titleSmall,
+            color = MaterialTheme.colorScheme.primary,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
         AnimatedContent(
             targetState = phase,
             transitionSpec = { fadeIn(tween(160)) togetherWith fadeOut(tween(100)) },

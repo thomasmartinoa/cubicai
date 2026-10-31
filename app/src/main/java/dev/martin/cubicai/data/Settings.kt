@@ -100,6 +100,8 @@ data class Settings(
     val localUrl: String = "",
     /** The same PC over Tailscale (https://100.x.y.z:8443), present only if remote access was on when pairing. */
     val localRemoteUrl: String = "",
+    /** The same PC's IPv6 home address, learned from it: a way in when the router stops passing IPv4. */
+    val localLan6Url: String = "",
     /** SHA-256 of the PC's self-signed certificate; the only certificate we accept for the PC. */
     val localFingerprint: String = "",
     val personaId: String = Personas.NONE,
@@ -111,6 +113,8 @@ data class Settings(
     val privacyScreen: Boolean = false,
     /** "system", "light" or "dark". */
     val theme: String = "system",
+    /** Last thing made on the PC ("generator|aspect|seconds|language"), preselected when the Create sheet opens. */
+    val lastCreate: String = "",
 ) {
     val provider get() = Providers.get(providerId)
 
@@ -127,7 +131,7 @@ data class Settings(
     /** Where to reach a provider, in the order to try them (home Wi-Fi before Tailscale). */
     fun baseUrls(p: Provider): List<String> = when (p.id) {
         Providers.CUSTOM.id -> listOf(customBaseUrl.trim().trimEnd('/')).filter { it.isNotBlank() }
-        Providers.LOCAL.id -> listOf(localUrl, localRemoteUrl).filter { it.isNotBlank() }.map { it.trimEnd('/') + "/v1" }
+        Providers.LOCAL.id -> listOf(localUrl, localLan6Url, localRemoteUrl).filter { it.isNotBlank() }.map { it.trimEnd('/') + "/v1" }
         else -> listOf(p.baseUrl)
     }
 
@@ -165,10 +169,12 @@ class SettingsStore(context: Context) {
         customBaseUrl = prefs.getString("custom_base_url", "").orEmpty(),
         localUrl = prefs.getString("local_url", "").orEmpty(),
         localRemoteUrl = prefs.getString("local_remote_url", "").orEmpty(),
+        localLan6Url = prefs.getString("local_lan6_url", "").orEmpty(),
         localFingerprint = prefs.getString("local_fingerprint", "").orEmpty(),
         personaId = prefs.getString("persona", null) ?: Personas.NONE,
         customPersonas = runCatching { personasFromJson(prefs.getString("custom_personas", "[]")!!) }.getOrDefault(emptyList()),
         aboutMe = prefs.getString("about_me", "").orEmpty(),
+        lastCreate = prefs.getString("last_create", "").orEmpty(),
         webSearch = prefs.getBoolean("web_search", false),
         privacyScreen = prefs.getBoolean("privacy_screen", false),
         theme = prefs.getString("theme", null) ?: "system",
@@ -182,10 +188,12 @@ class SettingsStore(context: Context) {
         putString("custom_base_url", s.customBaseUrl)
         putString("local_url", s.localUrl)
         putString("local_remote_url", s.localRemoteUrl)
+        putString("local_lan6_url", s.localLan6Url)
         putString("local_fingerprint", s.localFingerprint)
         putString("persona", s.personaId)
         putString("custom_personas", personasToJson(s.customPersonas))
         putString("about_me", s.aboutMe)
+        putString("last_create", s.lastCreate)
         putBoolean("web_search", s.webSearch)
         putBoolean("privacy_screen", s.privacyScreen)
         putString("theme", s.theme)

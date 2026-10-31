@@ -42,6 +42,7 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -51,6 +52,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.shape.CutCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.AddBox
 import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material.icons.rounded.ArrowUpward
@@ -70,7 +72,6 @@ import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.Stop
 import androidx.compose.material3.Button
 import androidx.compose.material3.CenterAlignedTopAppBar
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -97,6 +98,7 @@ import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -137,6 +139,7 @@ fun ChatScreen(vm: ChatViewModel, onOpenSettings: () -> Unit) {
     val snackbar = remember { SnackbarHostState() }
     var showModels by remember { mutableStateOf(false) }
     var showBehaviour by remember { mutableStateOf(false) }
+    var showCreate by remember { mutableStateOf(false) }
 
     // An open keyboard would cover the drawer's Settings entry.
     val keyboard = LocalSoftwareKeyboardController.current
@@ -185,9 +188,10 @@ fun ChatScreen(vm: ChatViewModel, onOpenSettings: () -> Unit) {
                                 .padding(horizontal = 10.dp, vertical = 4.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            // Takes what's left after the arrow, so a long name is cut short instead of pushing it out.
+                            Column(Modifier.weight(1f, fill = false), horizontalAlignment = Alignment.CenterHorizontally) {
                                 Text(
-                                    shortModelName(state.settings.model(provider)).ifBlank { "Pick a model" },
+                                    displayModelName(state.settings.model(provider)).ifBlank { "Pick a model" },
                                     style = MaterialTheme.typography.titleMedium,
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis,
@@ -212,17 +216,25 @@ fun ChatScreen(vm: ChatViewModel, onOpenSettings: () -> Unit) {
                 Box(Modifier.weight(1f).fillMaxWidth()) {
                     // The welcome screen hands over to the conversation with a short fade instead of a hard cut.
                     Crossfade(state.current.messages.isEmpty(), animationSpec = tween(220), label = "emptyState") { empty ->
-                        if (empty) EmptyState(state, onSuggestion = vm::sendSuggestion, onOpenSettings = onOpenSettings, onBehaviour = { showBehaviour = true })
+                        if (empty) EmptyState(
+                            state,
+                            onSuggestion = vm::sendSuggestion,
+                            onOpenSettings = onOpenSettings,
+                            onBehaviour = { showBehaviour = true },
+                            onCreate = { showCreate = true },
+                            onIdea = vm::setDraft,
+                        )
                         else MessageList(state, vm)
                     }
                 }
-                Composer(state, vm)
+                Composer(state, vm, onCreate = { showCreate = true })
             }
         }
     }
 
     if (showModels) ModelPickerSheet(vm, onOpenSettings = onOpenSettings, onDismiss = { showModels = false })
     if (showBehaviour) BehaviourSheet(vm, onDismiss = { showBehaviour = false })
+    if (showCreate) CreateSheet(vm) { showCreate = false }
 }
 
 @Composable
@@ -252,10 +264,12 @@ private fun MessageList(state: UiState, vm: ChatViewModel) {
                             message = message,
                             streaming = state.streaming && isLast,
                             status = if (state.streaming && isLast) state.status else null, // only the reply in progress
-                            fallbackName = shortModelName(message.model.orEmpty()),
+                            fallbackName = displayModelName(message.model.orEmpty()),
                             isLast = isLast,
                             onRegenerate = vm::regenerate,
                             onSpeak = vm::speak,
+                            progress = state.mediaProgress[message.id],
+                            onSave = { vm.saveMedia(message) },
                         )
                     }
                 }
@@ -283,7 +297,14 @@ private fun MessageList(state: UiState, vm: ChatViewModel) {
 }
 
 @Composable
-private fun EmptyState(state: UiState, onSuggestion: (String) -> Unit, onOpenSettings: () -> Unit, onBehaviour: () -> Unit) {
+private fun EmptyState(
+    state: UiState,
+    onSuggestion: (String) -> Unit,
+    onOpenSettings: () -> Unit,
+    onBehaviour: () -> Unit,
+    onCreate: () -> Unit,
+    onIdea: (String) -> Unit,
+) {
     val provider = state.settings.provider
     val needsKey = when (provider) {
         Providers.LOCAL -> !state.settings.isPaired
@@ -291,13 +312,21 @@ private fun EmptyState(state: UiState, onSuggestion: (String) -> Unit, onOpenSet
         else -> state.settings.key(provider).isBlank()
     }
     val persona = state.settings.personas.firstOrNull { it.id == state.current.personaId }
+    val create = state.create?.takeIf { provider == Providers.LOCAL && !needsKey }
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 32.dp),
         verticalArrangement = Arrangement.Center,
     ) {
         Cube(56.dp)
         Spacer(Modifier.height(20.dp))
-        Text(if (needsKey) "One step left" else "How can I help?", style = MaterialTheme.typography.headlineMedium)
+        Text(
+            when {
+                needsKey -> "One step left"
+                create != null -> "What should your PC make?"
+                else -> "How can I help?"
+            },
+            style = MaterialTheme.typography.headlineMedium,
+        )
         Spacer(Modifier.height(8.dp))
         if (needsKey) {
             Text(
@@ -307,6 +336,25 @@ private fun EmptyState(state: UiState, onSuggestion: (String) -> Unit, onOpenSet
             )
             Spacer(Modifier.height(16.dp))
             Button(shape = MaterialTheme.shapes.small, onClick = onOpenSettings) { Text("Open settings") }
+        } else if (create != null) {
+            // Creating: what's chosen, a way to change it, and prompt ideas that fill the box (a run takes a while,
+            // so nothing is sent until the user has looked at it).
+            val g = create.generator
+            val photo = when {
+                state.pending.any { it.isImage } -> ""
+                g.image == "required" -> if (g.prompt) " Add a photo with +, then describe what to do." else " Add a photo with +, then tap send."
+                g.image == "optional" -> " Add a photo with + to start from it."
+                else -> if (g.audio == "optional") " Add a voice recording with + to speak in that voice." else ""
+            }
+            Text("${g.note}.$photo", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.height(16.dp))
+            AssistChip(
+                onClick = onCreate,
+                label = { Text(createSummary(create)) },
+                leadingIcon = { Icon(Icons.Rounded.AutoAwesome, null, Modifier.size(18.dp)) },
+            )
+            Spacer(Modifier.height(24.dp))
+            Suggestions(createIdeas(g), onIdea)
         } else {
             Text("Ask anything, or add a photo or file.", color = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.height(16.dp))
@@ -316,32 +364,43 @@ private fun EmptyState(state: UiState, onSuggestion: (String) -> Unit, onOpenSet
                 leadingIcon = { Icon(Icons.Rounded.Tune, null, Modifier.size(18.dp)) },
             )
             Spacer(Modifier.height(24.dp))
-            listOf(
-                "Summarise today's top news",
-                "Explain how vaccines train the immune system",
-                "Help me write a polite complaint email",
-                "Plan a 3-day trip to Munnar",
-            ).forEachIndexed { i, prompt ->
-                var shown by remember { mutableStateOf(false) }
-                LaunchedEffect(Unit) { delay(70L * i); shown = true }
-                AnimatedVisibility(shown, enter = fadeIn(tween(260)) + slideInVertically(tween(260)) { it / 5 }) {
-                    Text(
-                        prompt,
-                        Modifier.fillMaxWidth().padding(vertical = 4.dp)
-                            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, MaterialTheme.shapes.medium)
-                            .clip(MaterialTheme.shapes.medium)
-                            .clickable { onSuggestion(prompt) }
-                            .padding(horizontal = 16.dp, vertical = 14.dp),
-                        style = MaterialTheme.typography.bodyLarge,
-                    )
-                }
+            Suggestions(
+                listOf(
+                    "Summarise today's top news",
+                    "Explain how vaccines train the immune system",
+                    "Help me write a polite complaint email",
+                    "Plan a 3-day trip to Munnar",
+                ),
+                onSuggestion,
+            )
+        }
+    }
+}
+
+@Composable
+private fun Suggestions(prompts: List<String>, onClick: (String) -> Unit) {
+    // Keyed by the list so switching generator replays the fade-in.
+    key(prompts) {
+        prompts.forEachIndexed { i, prompt ->
+            var shown by remember { mutableStateOf(false) }
+            LaunchedEffect(Unit) { delay(70L * i); shown = true }
+            AnimatedVisibility(shown, enter = fadeIn(tween(260)) + slideInVertically(tween(260)) { it / 5 }) {
+                Text(
+                    prompt,
+                    Modifier.fillMaxWidth().padding(vertical = 4.dp)
+                        .border(1.dp, MaterialTheme.colorScheme.outlineVariant, MaterialTheme.shapes.medium)
+                        .clip(MaterialTheme.shapes.medium)
+                        .clickable { onClick(prompt) }
+                        .padding(horizontal = 16.dp, vertical = 14.dp),
+                    style = MaterialTheme.typography.bodyLarge,
+                )
             }
         }
     }
 }
 
 @Composable
-private fun Composer(state: UiState, vm: ChatViewModel) {
+private fun Composer(state: UiState, vm: ChatViewModel, onCreate: () -> Unit) {
     val context = LocalContext.current
     var attachMenu by remember { mutableStateOf(false) }
     var cameraUri by rememberSaveable { mutableStateOf<Uri?>(null) }
@@ -370,7 +429,14 @@ private fun Composer(state: UiState, vm: ChatViewModel) {
         try { speech.launch(intent) } catch (_: ActivityNotFoundException) { vm.showNotice("Voice input isn't available on this phone") }
     }
 
-    val canSend = (state.draft.isNotBlank() || state.pending.isNotEmpty()) && !state.attaching
+    // Creating on the PC is offered while the PC is the chosen provider.
+    val create = state.create?.takeIf { state.settings.provider == Providers.LOCAL }
+    // A generator that needs a photo can also work on the latest picture already in the chat.
+    val chatPhoto = state.current.messages.any { m -> m.attachments.any { it.isImage } }
+    val hasPhoto = state.pending.any { it.isImage } || (create?.generator?.image == "required" && chatPhoto)
+    val canSend = !state.attaching && if (create != null) {
+        (!create.generator.prompt || state.draft.isNotBlank()) && (create.generator.image != "required" || hasPhoto)
+    } else state.draft.isNotBlank() || state.pending.isNotEmpty()
 
     Surface(
         shape = MaterialTheme.shapes.large,
@@ -387,7 +453,15 @@ private fun Composer(state: UiState, vm: ChatViewModel) {
             TextField(
                 value = state.draft,
                 onValueChange = vm::setDraft,
-                placeholder = { Text(if (state.imageMode) "Describe the image you want" else "Ask anything") },
+                placeholder = {
+                    Text(
+                        when {
+                            create != null -> createPlaceholder(create.generator, hasPhoto, usesLast = hasPhoto && state.pending.none { it.isImage })
+                            state.imageMode -> "Describe the image you want"
+                            else -> "Ask anything"
+                        },
+                    )
+                },
                 maxLines = 6,
                 modifier = Modifier.fillMaxWidth(),
                 colors = TextFieldDefaults.colors(
@@ -424,12 +498,27 @@ private fun Composer(state: UiState, vm: ChatViewModel) {
                         )
                     }
                 }
-                if (state.settings.provider.search != SearchMode.NONE) {
+                if (state.settings.provider.search != SearchMode.NONE && create == null) {
                     FilterChip(
                         selected = state.settings.webSearch,
                         onClick = vm::toggleWebSearch,
                         label = { Text("Search") },
                         leadingIcon = { Icon(Icons.Rounded.Language, null, Modifier.size(18.dp)) },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = MaterialTheme.colorScheme.primary,
+                            selectedLabelColor = MaterialTheme.colorScheme.onPrimary,
+                            selectedLeadingIconColor = MaterialTheme.colorScheme.onPrimary,
+                        ),
+                    )
+                }
+                if (state.settings.provider == Providers.LOCAL && state.settings.isPaired) {
+                    Spacer(Modifier.width(6.dp))
+                    FilterChip(
+                        selected = create != null,
+                        onClick = onCreate,
+                        label = { Text(create?.generator?.name ?: "Create", maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                        modifier = Modifier.widthIn(max = 230.dp),
+                        leadingIcon = { Icon(Icons.Rounded.AutoAwesome, null, Modifier.size(18.dp)) },
                         colors = FilterChipDefaults.filterChipColors(
                             selectedContainerColor = MaterialTheme.colorScheme.primary,
                             selectedLabelColor = MaterialTheme.colorScheme.onPrimary,
@@ -452,7 +541,7 @@ private fun Composer(state: UiState, vm: ChatViewModel) {
                     )
                 }
                 Spacer(Modifier.weight(1f))
-                if (state.current.messages.isNotEmpty()) ContextMeter(state.current.messages, state.contextLimit)
+                if (state.current.messages.isNotEmpty() && create == null) ContextMeter(state.current.messages, state.contextLimit)
                 AnimatedContent(
                     targetState = when { state.streaming -> 2; canSend -> 1; else -> 0 },
                     transitionSpec = { (fadeIn(tween(120)) + scaleIn(tween(120), initialScale = 0.8f)) togetherWith fadeOut(tween(80)) },
@@ -490,7 +579,7 @@ private fun PendingAttachments(state: UiState, vm: ChatViewModel) {
                 Box(Modifier.align(Alignment.TopEnd).size(48.dp).offset(x = 12.dp, y = (-12).dp).clickable { vm.removePending(a) })
             }
         }
-        if (state.attaching) CircularProgressIndicator(Modifier.size(24.dp), strokeWidth = 2.dp)
+        if (state.attaching) Cube(24.dp, spinning = true)
     }
 }
 

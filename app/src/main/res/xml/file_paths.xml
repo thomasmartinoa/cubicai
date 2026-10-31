@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <paths>
     <cache-path name="camera" path="camera/" />
+    <!-- Only for "Share" on a picture, video or sound made on the PC (a one-off read grant to the chosen app). -->
+    <files-path name="attachments" path="attachments/" />
 </paths>

@@ -25,6 +25,7 @@ object AttachmentProcessor {
         return when {
             mime.startsWith("image/") -> listOf(image(context, uri, name, outDir))
             mime == "application/pdf" || name.endsWith(".pdf", ignoreCase = true) -> pdf(context, uri, name, outDir)
+            mime.startsWith("audio/") -> listOf(audio(context, uri, name, outDir))
             else -> listOf(text(context, uri, name, outDir))
         }
     }
@@ -45,6 +46,21 @@ object AttachmentProcessor {
             decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
         }
         return saveJpeg(bitmap, name, outDir)
+    }
+
+    /** Sound files are kept as they are: a voice sample for speech made on the PC. Chat models don't get them. */
+    private fun audio(context: Context, uri: Uri, name: String, outDir: File): Attachment {
+        val ext = name.substringAfterLast('.', "m4a").lowercase().take(5)
+        val file = File(outDir, "${newId()}.$ext")
+        context.contentResolver.openInputStream(uri)!!.use { input ->
+            file.outputStream().use { out ->
+                if (input.copyTo(out) > MAX_FILE_BYTES) {
+                    file.delete()
+                    throw IllegalArgumentException("$name is too large (max 8 MB)")
+                }
+            }
+        }
+        return Attachment(Attachment.KIND_AUDIO, name, file.absolutePath)
     }
 
     /** PDFs are rendered page by page into images so vision models can read them, layout included. */

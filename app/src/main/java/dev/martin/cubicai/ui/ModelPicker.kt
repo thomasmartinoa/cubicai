@@ -19,7 +19,6 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Search
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
@@ -123,7 +122,7 @@ fun ModelPickerSheet(vm: ChatViewModel, onOpenSettings: () -> Unit, onDismiss: (
             }
             when {
                 models == null -> Box(Modifier.fillMaxWidth().padding(32.dp), contentAlignment = Alignment.Center) {
-                    CircularProgressIndicator()
+                    Cube(28.dp, spinning = true)
                 }
                 filtered.isEmpty() -> Text(
                     if (query.isNotBlank()) "No match. Tap ✓ to use \"${query.trim()}\" as the model id." else "No models.",
@@ -134,13 +133,17 @@ fun ModelPickerSheet(vm: ChatViewModel, onOpenSettings: () -> Unit, onDismiss: (
                     items(filtered, key = { it.id }) { m ->
                         // "hf.co/Owner/Long-Model-Name:Q4" reads better as the name, with the owner below it.
                         val owner = m.id.substringBeforeLast('/', "")
+                        // The quantisation tag goes with the details too, so a long name doesn't break mid-word.
+                        val name = displayModelName(m.id)
+                        val quant = shortModelName(m.id).removePrefix(name).removePrefix(":")
                         val tags = listOfNotNull(
                             owner.takeIf { it.isNotEmpty() },
+                            quant.takeIf { it.isNotEmpty() },
                             "recommended".takeIf { m.recommended },
                             "free".takeIf { m.free },
-                            "sees images".takeIf { m.vision },
-                            m.contextTokens.takeIf { it > 0 }?.let { "${contextLabel(it)} context" },
-                            m.sizeBytes.takeIf { it > 0 }?.let { "%.1f GB".format(it / 1e9) },
+                            "sees\u00A0images".takeIf { m.vision },
+                            m.contextTokens.takeIf { it > 0 }?.let { "${contextLabel(it)}\u00A0context" },
+                            m.sizeBytes.takeIf { it > 0 }?.let { "%.1f\u00A0GB".format(it / 1e9) },
                         ).joinToString(", ")
                         val isSelected = m.id == selected
                         // Full-width rows with text on the 20dp edge; the chosen one gets a tinted band, not just a tick.
@@ -153,7 +156,8 @@ fun ModelPickerSheet(vm: ChatViewModel, onOpenSettings: () -> Unit, onDismiss: (
                         ) {
                             Column(Modifier.weight(1f)) {
                                 Text(
-                                    m.id.substringAfterLast('/'),
+                                    // A zero-width space after each "-" lets a long id wrap between its parts.
+                                    name.replace("-", "-\u200B"),
                                     style = MaterialTheme.typography.bodyLarge,
                                     maxLines = 2,
                                     overflow = TextOverflow.Ellipsis,
