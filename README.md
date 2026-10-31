@@ -196,6 +196,13 @@ With [ComfyUI](https://github.com/comfyanonymous/ComfyUI) installed on the PC, t
 | Music | ACE-Step 1.5 (style prompt, optional lyrics) |
 | Voice | Chatterbox (reads your text; attach a voice recording to copy that voice) |
 
+<p align="center">
+  <img src="docs/screenshots/create-sheet.png" width="200" alt="The Create sheet with More controls open: seed, steps and CFG">
+  <img src="docs/screenshots/create-progress.png" width="200" alt="An image rendering on the PC, with a live preview and progress">
+  <img src="docs/screenshots/create-image.png" width="200" alt="The finished image with Save, Share and Regenerate">
+  <img src="docs/screenshots/create-music.png" width="200" alt="A piece of music made on the PC, in the chat's player">
+</p>
+
 How it behaves:
 
 - **Started on demand.** The server starts ComfyUI for the first job and stops it after 10 idle minutes. Ollama's models are unloaded first so the GPU has room, and ComfyUI's are freed again before the next chat.
