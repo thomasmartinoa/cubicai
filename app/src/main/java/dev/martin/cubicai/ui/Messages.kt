@@ -19,6 +19,8 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.rounded.Download
+import androidx.compose.material.icons.rounded.Face
+import androidx.compose.material.icons.rounded.Notes
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.produceState
 import androidx.compose.ui.geometry.Offset
@@ -132,25 +134,32 @@ fun UserMessage(message: Message, canEdit: Boolean, onEdit: (String) -> Unit) {
 }
 
 @Composable
-private fun EditDialog(initial: String, onDismiss: () -> Unit, onSave: (String) -> Unit) {
+private fun EditDialog(
+    initial: String,
+    onDismiss: () -> Unit,
+    onSave: (String) -> Unit,
+    title: String = "Edit message",
+    note: String = "Sending replaces the replies that came after this message.",
+    confirm: String = "Send",
+) {
     // Opens ready to type: field focused, keyboard up, cursor after the last word.
     var text by remember { mutableStateOf(TextFieldValue(initial, TextRange(initial.length))) }
     val focus = remember { FocusRequester() }
     LaunchedEffect(Unit) { focus.requestFocus() }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Edit message") },
+        title = { Text(title) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(
-                    "Sending replaces the replies that came after this message.",
+                    note,
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 OutlinedTextField(text, { text = it }, Modifier.fillMaxWidth().focusRequester(focus), maxLines = 10)
             }
         },
-        confirmButton = { TextButton(onClick = { onSave(text.text) }, enabled = text.text.isNotBlank()) { Text("Send") } },
+        confirmButton = { TextButton(onClick = { onSave(text.text) }, enabled = text.text.isNotBlank()) { Text(confirm) } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
 }
@@ -201,6 +210,10 @@ fun AssistantMessage(
     onSpeak: (String) -> Unit,
     progress: MediaProgress? = null,
     onSave: () -> Unit = {},
+    /** Makes this picture the character's face in the chat. */
+    onUseAsFace: (() -> Unit)? = null,
+    /** Makes what the model asked for again, with the prompt the user changed. */
+    onEditPrompt: ((String) -> Unit)? = null,
 ) {
     val context = LocalContext.current
     val images = message.attachments.filter { it.isImage }
@@ -247,6 +260,20 @@ fun AssistantMessage(
         message.attachments.filter { it.isVideo }.forEach { VideoPlayer(it.path, Modifier.padding(top = 4.dp)) }
         val sound = if (message.media?.generator == "chatterbox") "Speech" else "Music"
         message.attachments.filter { it.isAudio }.forEach { AudioPlayer(it, sound, Modifier.padding(top = 4.dp)) }
+        // What the chat model asked for, in its own words.
+        message.media?.call?.let { call ->
+            val asked = remember(call.arguments) { runCatching { JSONObject(call.arguments) }.getOrDefault(JSONObject()) }
+            var editing by remember { mutableStateOf(false) }
+            ModelPrompt(asked, voice = request?.optString("kind") == "audio", onEdit = { editing = true }.takeIf { onEditPrompt != null && !streaming && !making })
+            if (editing) EditDialog(
+                asked.optString("prompt"),
+                onDismiss = { editing = false },
+                onSave = { onEditPrompt?.invoke(it); editing = false },
+                title = "Edit the prompt",
+                note = "Makes it again as a new reply; this one stays.",
+                confirm = "Make again",
+            )
+        }
         if (message.stopped) Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
                 "Stopped",
@@ -277,6 +304,7 @@ fun AssistantMessage(
             if (media.isNotEmpty()) {
                 SmallAction(Icons.Rounded.Download, "Save", onSave)
                 if (!hasText) SmallAction(Icons.Rounded.Share, "Share") { shareFile(context, media.first()) }
+                if (images.isNotEmpty() && onUseAsFace != null) SmallAction(Icons.Rounded.Face, "Use as face", onUseAsFace)
             }
             if (isLast) SmallAction(Icons.Rounded.Refresh, "Regenerate", onRegenerate)
             }
@@ -312,6 +340,39 @@ private fun CreatedImages(images: List<Attachment>) {
         }
     }
     viewing?.let { ImageViewer(it) { viewing = null } }
+}
+
+/** The prompt the chat model wrote for something it made, folded away like its thoughts. */
+@Composable
+private fun ModelPrompt(asked: JSONObject, voice: Boolean, onEdit: (() -> Unit)?) {
+    var expanded by remember { mutableStateOf(false) }
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    val arrow by animateFloatAsState(if (expanded) 180f else 0f, tween(180), label = "arrow")
+    Column(Modifier.padding(top = 4.dp)) {
+        Row(
+            Modifier.clip(MaterialTheme.shapes.extraSmall).clickable { expanded = !expanded }.padding(end = 4.dp).heightIn(min = 40.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(Icons.Rounded.Notes, null, Modifier.size(16.dp), tint = muted)
+            Spacer(Modifier.width(8.dp))
+            Text(if (voice) "What it says" else "Prompt", style = MaterialTheme.typography.labelLarge, color = muted)
+            Icon(Icons.Rounded.ExpandMore, null, Modifier.size(18.dp).graphicsLayer { rotationZ = arrow }, tint = muted)
+        }
+        AnimatedVisibility(expanded, enter = expandVertically(tween(200)) + fadeIn(tween(200)), exit = shrinkVertically(tween(160)) + fadeOut(tween(120))) {
+            Surface(color = MaterialTheme.colorScheme.surfaceContainer, shape = MaterialTheme.shapes.medium, modifier = Modifier.padding(top = 4.dp)) {
+                Column(Modifier.fillMaxWidth().padding(start = 12.dp, top = 12.dp, end = 12.dp, bottom = if (onEdit != null) 0.dp else 12.dp)) {
+                    Text(asked.optString("prompt").trim(), style = MaterialTheme.typography.bodySmall, color = muted)
+                    asked.optString("negative").takeIf { it.isNotBlank() }?.let {
+                        Text("Avoid: $it", Modifier.padding(top = 8.dp), style = MaterialTheme.typography.bodySmall, color = muted, maxLines = 4, overflow = TextOverflow.Ellipsis)
+                    }
+                    // Pulled in by its 12dp inner padding so the label lines up with the text above.
+                    if (onEdit != null) TextButton(onClick = onEdit, shape = MaterialTheme.shapes.small, modifier = Modifier.offset(x = (-12).dp)) {
+                        Text("Edit and make again")
+                    }
+                }
+            }
+        }
+    }
 }
 
 @Composable

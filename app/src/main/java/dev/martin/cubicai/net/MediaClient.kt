@@ -36,6 +36,8 @@ data class Generator(
     val defaultSeconds: Int,
     val maxSeconds: Int,
     val languages: List<String>,
+    /** Built-in voices for speech without a recording of its own ("woman", "man"). */
+    val voices: List<String> = emptyList(),
     /** Whether a fixed seed can be given (to repeat a result or vary only the prompt). */
     val seed: Boolean = false,
     /** Sampling steps and CFG, only where tuning them helps; the defaults are the workflow's own. */
@@ -82,6 +84,7 @@ private fun Generator(o: JSONObject) = Generator(
     defaultSeconds = o.optJSONObject("seconds")?.optInt("default") ?: 0,
     maxSeconds = o.optJSONObject("seconds")?.optInt("max") ?: 0,
     languages = o.optJSONArray("languages").strings(),
+    voices = o.optJSONArray("voices").strings(),
     seed = o.optBoolean("seed"),
     steps = o.optJSONObject("steps")?.let(::Tune),
     cfg = o.optJSONObject("cfg")?.let(::Tune),

@@ -36,6 +36,9 @@ CACHE_DIR = Path(os.environ.get("CUBICAI_CACHE_DIR", "~/.cache/cubicai-server"))
 TEMP_DIR = CACHE_DIR / "media"
 INFO_CACHE = CACHE_DIR / "object_info.json"  # ComfyUI's node list, so models can be checked while it's stopped
 WORKFLOWS = COMFY_DIR / "user" / "default" / "workflows"
+# Reference voices for speech without a sample of its own (woman.wav, man.wav). Chatterbox's built-in voice drifts
+# between a woman's and a man's from one seed to the next, so a character would change voice between messages.
+VOICES_DIR = Path(os.environ.get("CUBICAI_VOICES_DIR", "~/.config/cubicai-server/voices")).expanduser()
 SUBFOLDER = "cubicai"  # inside ComfyUI's input/ and output/, emptied after every job
 IDLE_STOP = int(os.environ.get("CUBICAI_COMFY_IDLE", "600"))  # seconds
 UNDELIVERED_TTL = 3600
@@ -102,7 +105,7 @@ GENERATORS = [
      "prompt": ["#1.text"], "seed": ["#1.seed"], "language": ["#1.language"],
      # The node's default penalty (2.0) keeps it from ever stopping: a short sentence came back as 25 s of babble.
      "fixed": {"#1.repetition_penalty": 1.2},
-     "audio": "optional", "audio_into": ["#2.audio"]},
+     "audio": "optional", "audio_into": ["#2.audio"], "voices": ["woman", "man"]},
 ]
 
 # Steps and CFG are offered only where the workflow sets them (distilled models are tuned to CFG 1 and a few
@@ -475,6 +478,10 @@ def _defaults(gen, info):
     return _DEFAULTS[key]
 
 
+def _voice_file(name):
+    return next(iter(sorted(VOICES_DIR.glob(f"{name}.*"))), None) if name.isalpha() else None
+
+
 def generators():
     info = COMFY.known_info()
     out = []
@@ -498,6 +505,9 @@ def generators():
             item["negative_default"] = defaults["negative"]
         if g.get("seconds"):
             item["seconds"] = {"default": g["seconds"]["default"], "max": g["seconds"]["max"]}
+        voices = [v for v in g.get("voices", []) if _voice_file(v)]
+        if voices:
+            item["voices"] = voices
         if g.get("language") and info:
             node_type = "FL_ChatterboxMultilingualTTS"
             entry = info.get(node_type, {}).get("input", {}).get("required", {}).get("language")
@@ -615,6 +625,9 @@ class Jobs:
             raise ValueError("That generator isn't available on your PC.")
         if gen.get("image") == "required" and not image_bytes:
             raise ValueError("Add a photo to use this.")
+        speaker = params.pop("speaker", None)
+        if not audio_bytes and speaker in gen.get("voices", []) and (voice := _voice_file(speaker)):
+            audio_bytes = voice.read_bytes()
         job = Job(gen, params, ip)
         job.dir.mkdir(mode=0o700)
         job.image, job.audio = image_bytes, audio_bytes

@@ -201,9 +201,16 @@ class SettingsStore(context: Context) {
 
     private fun personasToJson(list: List<Persona>) = JSONArray(list.map {
         JSONObject().put("id", it.id).put("name", it.name).put("instructions", it.instructions)
+            .put("looks", it.looks).put("facePath", it.facePath).put("voicePath", it.voicePath).put("sendsOnItsOwn", it.sendsOnItsOwn)
     }).toString()
 
     private fun personasFromJson(json: String) = JSONArray(json).objects().map {
-        Persona(it.getString("id"), it.getString("name"), it.optString("instructions"))
+        Persona(
+            it.getString("id"), it.getString("name"), it.optString("instructions"),
+            looks = it.optString("looks"),
+            facePath = it.str("facePath"),
+            voicePath = it.str("voicePath"),
+            sendsOnItsOwn = it.optBoolean("sendsOnItsOwn"),
+        )
     }
 }

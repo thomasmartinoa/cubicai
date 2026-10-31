@@ -120,6 +120,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.martin.cubicai.ChatViewModel
 import dev.martin.cubicai.UiState
 import dev.martin.cubicai.data.Chat
+import dev.martin.cubicai.data.Personas
 import dev.martin.cubicai.data.Providers
 import dev.martin.cubicai.data.Role
 import dev.martin.cubicai.data.SearchMode
@@ -270,6 +271,9 @@ private fun MessageList(state: UiState, vm: ChatViewModel) {
                             onSpeak = vm::speak,
                             progress = state.mediaProgress[message.id],
                             onSave = { vm.saveMedia(message) },
+                            // A face only means something for a character; a chat without a behaviour has none.
+                            onUseAsFace = if (state.current.personaId == Personas.NONE) null else ({ vm.useAsFace(message) }),
+                            onEditPrompt = { vm.remakeWithPrompt(message, it) },
                         )
                     }
                 }

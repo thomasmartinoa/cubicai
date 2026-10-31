@@ -7,6 +7,13 @@ data class Persona(
     val instructions: String,
     val summary: String = "",
     val builtIn: Boolean = false,
+    /** A character's appearance, given to the model so pictures of it match. */
+    val looks: String = "",
+    /** The face picture new pictures of the character start from, and the voice sample it speaks with. */
+    val facePath: String? = null,
+    val voicePath: String? = null,
+    /** The character may send pictures and voice messages without being asked, when the moment calls for it. */
+    val sendsOnItsOwn: Boolean = false,
 )
 
 object Personas {

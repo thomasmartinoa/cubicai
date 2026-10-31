@@ -234,7 +234,7 @@ private fun SettingRow(title: String, description: String, modifier: Modifier = 
  * Only draws the state: the row around it handles taps.
  */
 @Composable
-private fun CutSwitch(checked: Boolean) {
+internal fun CutSwitch(checked: Boolean) {
     val colors = MaterialTheme.colorScheme
     val thumbX by animateDpAsState(if (checked) 20.dp else 0.dp, tween(160), label = "thumb")
     val track by animateColorAsState(if (checked) colors.primary else colors.surfaceContainerHighest, tween(160), label = "track")

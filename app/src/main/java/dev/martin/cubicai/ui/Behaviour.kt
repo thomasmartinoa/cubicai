@@ -1,5 +1,7 @@
 package dev.martin.cubicai.ui
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -12,6 +14,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.layout.offset
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Edit
@@ -28,6 +31,13 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.material.icons.rounded.Face
+import androidx.compose.material.icons.rounded.GraphicEq
+import androidx.compose.ui.text.style.TextOverflow
+import kotlinx.coroutines.launch
+import dev.martin.cubicai.data.newId
+import java.io.File
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -107,6 +117,8 @@ fun BehaviourSheet(vm: ChatViewModel, onDismiss: () -> Unit) {
                 Text("New behaviour")
             }
 
+            if (s.isPaired) ChatCharacter(vm, edge)
+
             Spacer(Modifier.height(20.dp))
             Text("About you", style = MaterialTheme.typography.titleMedium, modifier = edge)
             Text(
@@ -128,6 +140,7 @@ fun BehaviourSheet(vm: ChatViewModel, onDismiss: () -> Unit) {
 
     editing?.let { p ->
         PersonaEditor(
+            vm = vm,
             persona = p,
             onDismiss = { editing = null },
             onSave = { vm.savePersona(it); editing = null },
@@ -136,15 +149,120 @@ fun BehaviourSheet(vm: ChatViewModel, onDismiss: () -> Unit) {
     }
 }
 
+/**
+ * This chat's copy of the character's face and voice, which the model's pictures and voice messages start from.
+ * It begins as the behaviour's own; changing it here leaves other chats alone until it's saved to the behaviour.
+ */
 @Composable
-private fun PersonaEditor(persona: Persona, onDismiss: () -> Unit, onSave: (Persona) -> Unit, onDelete: (() -> Unit)?) {
+private fun ChatCharacter(vm: ChatViewModel, edge: Modifier) {
+    val state by vm.state.collectAsStateWithLifecycle()
+    val chat = state.current
+    val persona = state.settings.personas.firstOrNull { it.id == chat.personaId }
+    val custom = persona?.takeIf { !it.builtIn }
+    val pickFace = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri -> uri?.let { vm.setChatCharacterFile(face = true, uri = it) } }
+    val pickVoice = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri -> uri?.let { vm.setChatCharacterFile(face = false, uri = it) } }
+    Spacer(Modifier.height(20.dp))
+    Text("Character in this chat", style = MaterialTheme.typography.titleMedium, modifier = edge)
+    Text(
+        "When the model sends a picture of itself it starts from this face, and its voice messages copy this voice.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = edge,
+    )
+    CharacterFile(
+        face = true,
+        path = chat.facePath ?: persona?.facePath,
+        caption = when {
+            chat.facePath != null -> "This chat's own face"
+            persona?.facePath != null -> "From ${persona.name}"
+            else -> "None yet. The first picture of the character becomes its face."
+        },
+        modifier = edge.padding(top = 12.dp),
+    ) {
+        TextButton(onClick = { pickFace.launch("image/*") }, shape = MaterialTheme.shapes.small) { Text(if (chat.facePath ?: persona?.facePath == null) "Add" else "Change") }
+        if (chat.facePath != null) {
+            if (custom != null) TextButton(onClick = { vm.saveCharacterToBehaviour(face = true) }, shape = MaterialTheme.shapes.small) { Text("Save to ${custom.name}", maxLines = 1, overflow = TextOverflow.Ellipsis) }
+            TextButton(onClick = { vm.setChatCharacterFile(face = true, uri = null) }, shape = MaterialTheme.shapes.small) { Text("Remove") }
+        }
+    }
+    CharacterFile(
+        face = false,
+        path = chat.voicePath ?: persona?.voicePath,
+        caption = when {
+            chat.voicePath != null -> "This chat's own voice"
+            persona?.voicePath != null -> "From ${persona.name}"
+            else -> "Built-in voice, a woman's or a man's to fit the character. Add a 5-10 s recording to copy a voice."
+        },
+        modifier = edge.padding(top = 12.dp),
+    ) {
+        TextButton(onClick = { pickVoice.launch("audio/*") }, shape = MaterialTheme.shapes.small) { Text(if (chat.voicePath ?: persona?.voicePath == null) "Add" else "Change") }
+        if (chat.voicePath != null) {
+            if (custom != null) TextButton(onClick = { vm.saveCharacterToBehaviour(face = false) }, shape = MaterialTheme.shapes.small) { Text("Save to ${custom.name}", maxLines = 1, overflow = TextOverflow.Ellipsis) }
+            TextButton(onClick = { vm.setChatCharacterFile(face = false, uri = null) }, shape = MaterialTheme.shapes.small) { Text("Remove") }
+        }
+    }
+}
+
+/** A face picture or voice sample: a small square (the face itself, or a sound mark), what it is, and its actions. */
+@Composable
+private fun CharacterFile(face: Boolean, path: String?, caption: String, modifier: Modifier = Modifier, actions: @Composable () -> Unit) {
+    Row(modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        // A hairline edge, so the empty square reads as a slot on the sheet and in a dialog alike.
+        val frame = Modifier.size(56.dp).clip(MaterialTheme.shapes.small)
+        if (face && path != null) LocalImage(path, frame, maxSize = 168)
+        else Box(
+            frame.background(MaterialTheme.colorScheme.surfaceContainerHighest)
+                .border(1.dp, MaterialTheme.colorScheme.outlineVariant, MaterialTheme.shapes.small),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                if (face) Icons.Rounded.Face else Icons.Rounded.GraphicEq,
+                null,
+                tint = if (path != null) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.outline,
+            )
+        }
+        Spacer(Modifier.width(16.dp))
+        Column(Modifier.weight(1f)) {
+            Text(if (face) "Face" else "Voice", style = MaterialTheme.typography.titleSmall)
+            Text(caption, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            // Text buttons pulled in by their 12dp inner padding, so the first label lines up with the text above.
+            Row(Modifier.offset(x = (-12).dp)) { actions() }
+        }
+    }
+}
+
+@Composable
+private fun PersonaEditor(vm: ChatViewModel, persona: Persona, onDismiss: () -> Unit, onSave: (Persona) -> Unit, onDelete: (() -> Unit)?) {
+    // A new behaviour gets its id now, so a face or voice picked before saving can be named after it.
+    val id = remember { persona.id.ifBlank { newId() } }
     var name by remember { mutableStateOf(persona.name) }
     var instructions by remember { mutableStateOf(persona.instructions) }
+    var looks by remember { mutableStateOf(persona.looks) }
+    var face by remember { mutableStateOf(persona.facePath) }
+    var voice by remember { mutableStateOf(persona.voicePath) }
+    var onItsOwn by remember { mutableStateOf(persona.sendsOnItsOwn) }
+    val scope = rememberCoroutineScope()
+    fun pick(isFace: Boolean) = { uri: android.net.Uri? ->
+        if (uri != null) scope.launch {
+            val path = vm.importCharacterFile(uri, "persona-$id-" + if (isFace) "face" else "voice") ?: return@launch
+            // A file picked a moment ago in this editor, and not saved, is replaced rather than left behind.
+            if (isFace) { if (face != persona.facePath) vm.discardCharacterFile(face); face = path }
+            else { if (voice != persona.voicePath) vm.discardCharacterFile(voice); voice = path }
+        }
+        Unit
+    }
+    val pickFace = rememberLauncherForActivityResult(ActivityResultContracts.GetContent(), pick(true))
+    val pickVoice = rememberLauncherForActivityResult(ActivityResultContracts.GetContent(), pick(false))
+    fun cancel() {
+        if (face != persona.facePath) vm.discardCharacterFile(face)
+        if (voice != persona.voicePath) vm.discardCharacterFile(voice)
+        onDismiss()
+    }
     AlertDialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = ::cancel,
         title = { Text(if (persona.id.isBlank()) "New behaviour" else "Edit behaviour") },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 OutlinedTextField(name, { name = it }, label = { Text("Name") }, singleLine = true, modifier = Modifier.fillMaxWidth())
                 OutlinedTextField(
                     instructions,
@@ -155,15 +273,61 @@ private fun PersonaEditor(persona: Persona, onDismiss: () -> Unit, onSave: (Pers
                     maxLines = 12,
                     modifier = Modifier.fillMaxWidth(),
                 )
-                onDelete?.let { TextButton(onClick = it) { Text("Delete behaviour", color = MaterialTheme.colorScheme.error) } }
+                OutlinedTextField(
+                    looks,
+                    { looks = it },
+                    label = { Text("Looks (optional)") },
+                    placeholder = { Text("For a character: age, hair, eyes, build, usual clothes. Pictures of it follow this.") },
+                    minLines = 2,
+                    maxLines = 6,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                CharacterFile(face = true, path = face, caption = if (face != null) "Pictures of the character start from it" else "None. The first picture of the character becomes it.") {
+                    TextButton(onClick = { pickFace.launch("image/*") }, shape = MaterialTheme.shapes.small) { Text(if (face == null) "Add" else "Change") }
+                    if (face != null) TextButton(onClick = { if (face != persona.facePath) vm.discardCharacterFile(face); face = null }, shape = MaterialTheme.shapes.small) { Text("Remove") }
+                }
+                CharacterFile(face = false, path = voice, caption = voice?.let { "Voice messages copy this voice" } ?: "Built-in voice") {
+                    TextButton(onClick = { pickVoice.launch("audio/*") }, shape = MaterialTheme.shapes.small) { Text(if (voice == null) "Add" else "Change") }
+                    if (voice != null) TextButton(onClick = { if (voice != persona.voicePath) vm.discardCharacterFile(voice); voice = null }, shape = MaterialTheme.shapes.small) { Text("Remove") }
+                }
+                Row(
+                    Modifier.fillMaxWidth().clip(MaterialTheme.shapes.small).clickable { onItsOwn = !onItsOwn }.padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Sends on its own", style = MaterialTheme.typography.titleSmall)
+                        Text(
+                            "May send pictures and voice messages without being asked, when the moment calls for it.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Spacer(Modifier.width(16.dp))
+                    CutSwitch(onItsOwn)
+                }
+                // Pulled in by its 12dp inner padding so the label lines up with the fields' edge.
+                onDelete?.let {
+                    TextButton(onClick = it, shape = MaterialTheme.shapes.small, modifier = Modifier.offset(x = (-12).dp)) {
+                        Text("Delete behaviour", color = MaterialTheme.colorScheme.error)
+                    }
+                }
             }
         },
         confirmButton = {
             TextButton(
-                onClick = { onSave(persona.copy(name = name.trim(), instructions = instructions.trim())) },
+                onClick = {
+                    // The behaviour's earlier face or voice, now replaced or removed, isn't kept.
+                    if (persona.facePath != face) vm.discardCharacterFile(persona.facePath)
+                    if (persona.voicePath != voice) vm.discardCharacterFile(persona.voicePath)
+                    onSave(persona.copy(
+                        id = id, name = name.trim(), instructions = instructions.trim(), looks = looks.trim(),
+                        facePath = face, voicePath = voice, sendsOnItsOwn = onItsOwn,
+                    ))
+                },
                 enabled = name.isNotBlank() && instructions.isNotBlank(),
+                shape = MaterialTheme.shapes.small,
             ) { Text("Save") }
         },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+        dismissButton = { TextButton(onClick = ::cancel, shape = MaterialTheme.shapes.small) { Text("Cancel") } },
     )
 }

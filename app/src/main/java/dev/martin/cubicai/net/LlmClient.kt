@@ -1,6 +1,7 @@
 package dev.martin.cubicai.net
 
 import dev.martin.cubicai.data.SearchMode
+import dev.martin.cubicai.data.ToolCall
 import dev.martin.cubicai.data.objects
 import dev.martin.cubicai.data.str
 import dev.martin.cubicai.data.strings
@@ -38,14 +39,28 @@ sealed interface StreamEvent {
     data class Status(val text: String) : StreamEvent
     /** Tokens the model read (the whole conversation) and wrote for this reply. */
     data class Usage(val prompt: Int, val output: Int) : StreamEvent
+    /** The model asked for a tool; sent once the reply has finished, with the arguments complete. */
+    data class Call(val call: ToolCall) : StreamEvent
 }
 
 open class ApiException(message: String) : Exception(message)
 
 private val NOT_CHAT = listOf("tts", "live", "image", "audio", "transcribe", "robotics", "computer-use", "customtools", "omni", "nano-banana", "argon")
 
-/** A message ready to send; images are already data URLs. */
-data class ApiMessage(val role: String, val text: String, val images: List<String> = emptyList())
+/**
+ * A message ready to send; images are already data URLs. An assistant message may carry the tool calls it made,
+ * and a "tool" message answers one of them ([toolCallId]).
+ */
+data class ApiMessage(
+    val role: String,
+    val text: String,
+    val images: List<String> = emptyList(),
+    val toolCalls: List<ToolCall> = emptyList(),
+    val toolCallId: String? = null,
+)
+
+/** Tools offered to the model: OpenAI-style function definitions, and whether it may call them this turn. */
+data class Tools(val functions: JSONArray, val allowed: Boolean = true)
 
 data class ModelInfo(
     val id: String,
@@ -55,6 +70,8 @@ data class ModelInfo(
     val recommended: Boolean = false,
     /** Tokens of conversation the model sees at once (the PC's setting, or the provider's limit). */
     val contextTokens: Int = 0,
+    /** Whether it can call tools; null when the provider doesn't say. */
+    val tools: Boolean? = null,
 )
 
 /**
@@ -134,10 +151,14 @@ class LlmClient {
     /** The address that answered last, tried first next time (e.g. Tailscale while away from home). */
     @Volatile private var preferredUrl: String? = null
 
-    /** Looks for the paired PC on the home network when none of its addresses answers (see [LanFinder]). */
     /** Reports the phone's networks; null tries every address. */
     @Volatile var links: (() -> Links)? = null
-    @Volatile var findPc: ((fingerprint: String) -> String?)? = null
+
+    /**
+     * Looks for the paired PC on the home network when none of its addresses answers (see [LanFinder]), passing
+     * over the addresses that were just tried.
+     */
+    @Volatile var findPc: ((fingerprint: String, tried: Set<String>) -> String?)? = null
 
     /** Told the PC's new home address ("https://ip:port") after [findPc] found it, so it can be stored. */
     @Volatile var onPcMoved: ((String) -> Unit)? = null
@@ -177,7 +198,8 @@ class LlmClient {
             System.currentTimeMillis() - lastSearch > 30_000
         ) {
             lastSearch = System.currentTimeMillis()
-            val found = finder(pin)
+            // Compared by origin: the base URLs carry the API path ("/v1"), found addresses don't.
+            val found = finder(pin, ordered.map { it.substringAfter("://").substringBefore('/').let { h -> "https://$h" } }.toSet())
             val suffix = home.substringAfter("://").substringAfter('/', "").let { if (it.isEmpty()) "" else "/$it" }
             val url = found?.let { it + suffix }
             if (url != null && url !in ordered) {
@@ -209,12 +231,37 @@ class LlmClient {
         search: SearchMode,
         webSearch: Boolean,
         pin: String? = null,
+        tools: Tools? = null,
+        /** Builds the messages again for a retry without tools (tool calls in the history become plain notes). */
+        withoutTools: (() -> List<ApiMessage>)? = null,
+        onEvent: (StreamEvent) -> Unit,
+    ) {
+        try {
+            streamOnce(baseUrls, apiKey, model, messages, search, webSearch, pin, tools, onEvent)
+        } catch (e: ToolsRefused) {
+            // Some models (or OpenRouter routes) don't take tools at all: answer without them rather than fail.
+            streamOnce(baseUrls, apiKey, model, withoutTools?.invoke() ?: messages, search, webSearch, pin, null, onEvent)
+        }
+    }
+
+    private class ToolsRefused(message: String) : ApiException(message)
+
+    private suspend fun streamOnce(
+        baseUrls: List<String>,
+        apiKey: String,
+        model: String,
+        messages: List<ApiMessage>,
+        search: SearchMode,
+        webSearch: Boolean,
+        pin: String?,
+        tools: Tools?,
         onEvent: (StreamEvent) -> Unit,
     ) = withContext(Dispatchers.IO) {
         val useResponses = webSearch && search == SearchMode.XAI_TOOLS
-        val body = if (useResponses) responsesBody(model, messages)
-        else chatBody(model, messages, webPlugin = webSearch && search == SearchMode.OPENROUTER_WEB)
+        val body = if (useResponses) responsesBody(model, messages, tools)
+        else chatBody(model, messages, webPlugin = webSearch && search == SearchMode.OPENROUTER_WEB, tools = tools)
             .apply { if (webSearch && search == SearchMode.LOCAL_PC) put("cubic_web_search", true) }
+        val calls = sortedMapOf<Int, Array<String>>() // index → id, name, arguments (arguments arrive in pieces)
 
         val payload = body.toString().toRequestBody(jsonType)
         var call: Call? = null
@@ -229,7 +276,12 @@ class LlmClient {
                     .post(payload)
                     .build()
             }.use { response ->
-                if (!response.isSuccessful) throw ApiException(errorMessage(response.code, response.body.string(), pc = pin != null))
+                if (!response.isSuccessful) {
+                    val text = response.body.string()
+                    val message = errorMessage(response.code, text, pc = pin != null)
+                    if (tools != null && response.code in 400..499 && text.contains("tool", ignoreCase = true)) throw ToolsRefused(message)
+                    throw ApiException(message)
+                }
                 val source = response.body.source()
                 // A stream that just stops (server restarted, Wi-Fi dropped) must not pass for a finished reply.
                 var finished = false
@@ -241,14 +293,17 @@ class LlmClient {
                     val json = runCatching { JSONObject(data) }.getOrNull() ?: continue
                     if (useResponses) {
                         if (json.optString("type") == "response.completed") finished = true
-                        parseResponsesEvent(json, onEvent)
+                        parseResponsesEvent(json, calls, onEvent)
                     } else {
                         if (json.optJSONArray("choices")?.optJSONObject(0)?.isNull("finish_reason") == false) finished = true
-                        parseChatChunk(json, onEvent)
+                        parseChatChunk(json, calls, onEvent)
                     }
                 }
                 if (!finished) {
                     throw ApiException((if (pin != null) "The connection to your PC" else "The connection") + " dropped before the reply finished.")
+                }
+                calls.values.filter { it[1].isNotEmpty() }.forEachIndexed { i, (id, name, args) ->
+                    onEvent(StreamEvent.Call(ToolCall(id.ifEmpty { "call_$i" }, name, args.ifBlank { "{}" })))
                 }
             }
         } catch (e: IOException) {
@@ -347,6 +402,7 @@ class LlmClient {
                         sizeBytes = o.optLong("size"),
                         recommended = o.optBoolean("cubic_recommended"),
                         contextTokens = o.optInt("context_length").takeIf { it > 0 } ?: if (google) 1_048_576 else 0,
+                        tools = o.optJSONArray("supported_parameters")?.let { "tools" in it.strings() },
                     ).let { if (google && id == "gemini-3.5-flash") it.copy(recommended = true) else it }
                 }.distinctBy { it.id } // the picker keys its list by id; a duplicate would crash it
                     .sortedWith(compareByDescending<ModelInfo> { it.recommended }.thenBy { it.id })
@@ -358,7 +414,7 @@ class LlmClient {
 
     // --- Chat Completions -----------------------------------------------------------------------
 
-    private fun chatBody(model: String, messages: List<ApiMessage>, webPlugin: Boolean) = JSONObject().apply {
+    private fun chatBody(model: String, messages: List<ApiMessage>, webPlugin: Boolean, tools: Tools?) = JSONObject().apply {
         put("model", model)
         put("stream", true)
         put("stream_options", JSONObject().put("include_usage", true)) // token counts in the last chunk
@@ -368,12 +424,22 @@ class LlmClient {
                 m.images.forEach { url ->
                     put(JSONObject().put("type", "image_url").put("image_url", JSONObject().put("url", url)))
                 }
-            })
+            }).apply {
+                if (m.toolCalls.isNotEmpty()) put("tool_calls", JSONArray(m.toolCalls.map { c ->
+                    JSONObject().put("id", c.id).put("type", "function")
+                        .put("function", JSONObject().put("name", c.name).put("arguments", c.arguments))
+                }))
+                m.toolCallId?.let { put("tool_call_id", it) }
+            }
         }))
         if (webPlugin) put("plugins", JSONArray().put(JSONObject().put("id", "web")))
+        if (tools != null) {
+            put("tools", tools.functions)
+            if (!tools.allowed) put("tool_choice", "none")
+        }
     }
 
-    private fun parseChatChunk(json: JSONObject, onEvent: (StreamEvent) -> Unit) {
+    private fun parseChatChunk(json: JSONObject, calls: MutableMap<Int, Array<String>>, onEvent: (StreamEvent) -> Unit) {
         json.optJSONObject("error")?.let { throw ApiException(it.str("message") ?: "Provider error") }
         json.str("cubic_status")?.let { onEvent(StreamEvent.Status(it)) } // progress from the PC gateway
         json.optJSONArray("citations").strings().filter { it.startsWith("http") }.forEach { onEvent(StreamEvent.Citation(it)) }
@@ -387,6 +453,15 @@ class LlmClient {
         (delta.str("reasoning_content") ?: delta.str("reasoning"))
             ?.takeIf { it.isNotEmpty() }?.let { onEvent(StreamEvent.Reasoning(it)) }
         delta.str("content")?.takeIf { it.isNotEmpty() }?.let { onEvent(StreamEvent.Text(it)) }
+        // Tool calls come in pieces keyed by index: the id and name first, then the arguments a chunk at a time.
+        delta.optJSONArray("tool_calls").objects().forEach { c ->
+            val slot = calls.getOrPut(c.optInt("index", calls.size)) { arrayOf("", "", "") }
+            c.str("id")?.let { slot[0] = it }
+            c.optJSONObject("function")?.let { f ->
+                f.str("name")?.let { slot[1] = it }
+                f.str("arguments")?.let { slot[2] += it }
+            }
+        }
         delta.optJSONArray("annotations").objects().forEach { a ->
             a.optJSONObject("url_citation")?.str("url")?.let { onEvent(StreamEvent.Citation(it)) }
         }
@@ -394,21 +469,40 @@ class LlmClient {
 
     // --- Responses API (xAI search tools) -------------------------------------------------------
 
-    private fun responsesBody(model: String, messages: List<ApiMessage>) = JSONObject().apply {
+    private fun responsesBody(model: String, messages: List<ApiMessage>, tools: Tools?) = JSONObject().apply {
         put("model", model)
         put("stream", true)
-        put("input", JSONArray(messages.map { m ->
-            JSONObject().put("role", m.role).put("content", if (m.images.isEmpty()) m.text else JSONArray().apply {
-                if (m.text.isNotEmpty()) put(JSONObject().put("type", "input_text").put("text", m.text))
-                m.images.forEach { url -> put(JSONObject().put("type", "input_image").put("image_url", url)) }
-            })
+        // Tool calls and their results are items of their own here, not fields of a message.
+        put("input", JSONArray(messages.flatMap { m ->
+            when {
+                m.toolCallId != null -> listOf(
+                    JSONObject().put("type", "function_call_output").put("call_id", m.toolCallId).put("output", m.text),
+                )
+                else -> listOfNotNull(
+                    if (m.text.isEmpty() && m.images.isEmpty() && m.toolCalls.isNotEmpty()) null
+                    else JSONObject().put("role", m.role).put("content", if (m.images.isEmpty()) m.text else JSONArray().apply {
+                        if (m.text.isNotEmpty()) put(JSONObject().put("type", "input_text").put("text", m.text))
+                        m.images.forEach { url -> put(JSONObject().put("type", "input_image").put("image_url", url)) }
+                    }),
+                ) + m.toolCalls.map { c ->
+                    JSONObject().put("type", "function_call").put("call_id", c.id).put("name", c.name).put("arguments", c.arguments)
+                }
+            }
         }))
         put("tools", JSONArray()
             .put(JSONObject().put("type", "web_search"))
-            .put(JSONObject().put("type", "x_search")))
+            .put(JSONObject().put("type", "x_search"))
+            .apply {
+                // The same functions, in the Responses API's flatter shape.
+                tools?.functions.objects().mapNotNull { it.optJSONObject("function") }.forEach { f ->
+                    put(JSONObject().put("type", "function").put("name", f.optString("name"))
+                        .put("description", f.optString("description")).put("parameters", f.optJSONObject("parameters")))
+                }
+            })
+        if (tools != null && !tools.allowed) put("tool_choice", "none")
     }
 
-    private fun parseResponsesEvent(json: JSONObject, onEvent: (StreamEvent) -> Unit) {
+    private fun parseResponsesEvent(json: JSONObject, calls: MutableMap<Int, Array<String>>, onEvent: (StreamEvent) -> Unit) {
         val type = json.optString("type")
         when {
             type == "response.output_text.delta" ->
@@ -422,7 +516,16 @@ class LlmClient {
 
             type == "response.output_item.added" -> {
                 val item = json.optJSONObject("item") ?: return
-                searchStatus(item.optString("type") + " " + item.optString("name"))?.let { onEvent(StreamEvent.Status(it)) }
+                if (item.optString("type") != "function_call") {
+                    searchStatus(item.optString("type") + " " + item.optString("name"))?.let { onEvent(StreamEvent.Status(it)) }
+                }
+            }
+
+            type == "response.output_item.done" -> {
+                val item = json.optJSONObject("item") ?: return
+                if (item.optString("type") == "function_call") {
+                    calls[calls.size] = arrayOf(item.optString("call_id"), item.optString("name"), item.optString("arguments"))
+                }
             }
 
             type.contains("search") && (type.endsWith(".in_progress") || type.endsWith(".searching")) ->

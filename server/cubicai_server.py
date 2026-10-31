@@ -356,6 +356,7 @@ def list_models():
             "size": tags[name],
             "input_modalities": ["text"] + (["image"] if "vision" in caps else []),
             "context_length": context_for(name),
+            "supported_parameters": ["tools"] if "tools" in caps else [],
         })
     # Recommend the biggest vision model that fits in VRAM: smart enough, still fast.
     budget = gpu_memory() or 8 * 1024 ** 3
@@ -375,14 +376,35 @@ def loaded_models():
         return set()
 
 
+def native_tool_calls(calls):
+    """OpenAI tool_calls (arguments as a JSON string) → Ollama's (arguments as an object)."""
+    out = []
+    for c in calls or []:
+        fn = c.get("function") or {}
+        args = fn.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args or "{}")
+            except ValueError:
+                args = {}
+        out.append({"function": {"name": fn.get("name", ""), "arguments": args or {}}})
+    return out
+
+
 def to_native(messages, vision):
-    """OpenAI-style messages → Ollama /api/chat messages (images as bare base64)."""
+    """OpenAI-style messages → Ollama /api/chat messages (images as bare base64, tool calls and results kept)."""
     out = []
     last_user = max((i for i, m in enumerate(messages) if m.get("role") == "user"), default=-1)
     for i, m in enumerate(messages):
         content = m.get("content")
+        if m.get("role") == "tool":
+            out.append({"role": "tool", "content": content if isinstance(content, str) else "", "tool_name": m.get("name") or ""})
+            continue
         if isinstance(content, str) or content is None:
-            out.append({"role": m["role"], "content": content or ""})
+            msg = {"role": m["role"], "content": content or ""}
+            if m.get("tool_calls"):
+                msg["tool_calls"] = native_tool_calls(m["tool_calls"])
+            out.append(msg)
             continue
         texts, images = [], []
         for part in content:
@@ -852,6 +874,10 @@ class Handler(BaseHTTPRequestHandler):
                        "keep_alive": load_settings().get("keep_alive", "15m")}
             if "thinking" in caps:
                 payload["think"] = True
+            # Tools the app offers (making pictures and voice messages on this PC), for models that can call them.
+            # Ollama has no tool_choice; "none" (nothing more to make this turn) leaves the tools out instead.
+            if body.get("tools") and "tools" in caps and body.get("tool_choice") != "none":
+                payload["tools"] = body["tools"]
             payload["options"]["num_ctx"] = context_for(model)
             ACTIVITY.phase(rid, "Waiting for model")
             tokens, gen_seconds = 0, 0.0
@@ -873,6 +899,14 @@ class Handler(BaseHTTPRequestHandler):
                     if msg.get("content"):
                         delta["content"] = msg["content"]
                         ACTIVITY.phase(rid, "Answering")
+                    if msg.get("tool_calls"):
+                        # Ollama sends each call whole; OpenAI clients expect string arguments and an id.
+                        delta["tool_calls"] = [{
+                            "index": n, "id": f"call_{rid}_{n}", "type": "function",
+                            "function": {"name": (c.get("function") or {}).get("name", ""),
+                                         "arguments": json.dumps((c.get("function") or {}).get("arguments") or {})},
+                        } for n, c in enumerate(msg["tool_calls"])]
+                        ACTIVITY.phase(rid, "Asking for a creation")
                     if delta:
                         self._emit({"choices": [{"index": 0, "delta": delta}]})
                     if chunk.get("done"):

@@ -33,8 +33,21 @@ data class Attachment(val kind: String, val name: String, val path: String) {
  * A reply made by ComfyUI on the PC. [jobId] is set once the PC accepted the job, so the app can pick the
  * progress back up after switching chats or a restart; [params] is the request, kept for Regenerate.
  */
-/** [seed]: the one the PC used for the result, kept apart from [params] so Regenerate still varies it. */
-data class MediaRequest(val generator: String, val params: String, val jobId: String? = null, val seed: Long? = null)
+/**
+ * [seed]: the one the PC used for the result, kept apart from [params] so Regenerate still varies it.
+ * [call]: set when the chat model asked for this itself (its `create` tool call), so the model gets the result
+ * back and carries on; null for something made from the Create sheet.
+ */
+data class MediaRequest(
+    val generator: String,
+    val params: String,
+    val jobId: String? = null,
+    val seed: Long? = null,
+    val call: ToolCall? = null,
+)
+
+/** A tool call from the chat model; [arguments] is its JSON object as text. */
+data class ToolCall(val id: String, val name: String, val arguments: String)
 
 data class Message(
     val role: String,
@@ -67,6 +80,12 @@ data class Chat(
     /** Model this chat last used; reopening the chat switches back to it. */
     val providerId: String? = null,
     val model: String? = null,
+    /**
+     * This chat's copy of the character: the face picture new pictures of it start from, and the voice sample
+     * its voice messages copy. Null falls back to the behaviour's own.
+     */
+    val facePath: String? = null,
+    val voicePath: String? = null,
 )
 
 // --- JSON helpers -------------------------------------------------------------------------------
@@ -86,6 +105,8 @@ fun Chat.toJson(): JSONObject = JSONObject()
     .put("personaId", personaId)
     .put("providerId", providerId)
     .put("model", model)
+    .put("facePath", facePath)
+    .put("voicePath", voicePath)
     .put("messages", JSONArray(messages.map { it.toJson() }))
 
 fun chatFromJson(o: JSONObject) = Chat(
@@ -95,6 +116,8 @@ fun chatFromJson(o: JSONObject) = Chat(
     personaId = o.optString("personaId", Personas.NONE),
     providerId = o.str("providerId"),
     model = o.str("model"),
+    facePath = o.str("facePath"),
+    voicePath = o.str("voicePath"),
     messages = o.optJSONArray("messages").objects().map(::messageFromJson),
 )
 
@@ -114,7 +137,9 @@ private fun Message.toJson(): JSONObject = JSONObject().apply {
     if (promptTokens > 0) put("promptTokens", promptTokens)
     if (outputTokens > 0) put("outputTokens", outputTokens)
     media?.let {
-        put("media", JSONObject().put("generator", it.generator).put("params", it.params).put("jobId", it.jobId).put("seed", it.seed))
+        put("media", JSONObject().put("generator", it.generator).put("params", it.params).put("jobId", it.jobId).put("seed", it.seed).apply {
+            it.call?.let { c -> put("call", JSONObject().put("id", c.id).put("name", c.name).put("arguments", c.arguments)) }
+        })
     }
 }
 
@@ -134,6 +159,12 @@ private fun messageFromJson(o: JSONObject) = Message(
     promptTokens = o.optInt("promptTokens"),
     outputTokens = o.optInt("outputTokens"),
     media = o.optJSONObject("media")?.let {
-        MediaRequest(it.getString("generator"), it.optString("params", "{}"), it.str("jobId"), if (it.has("seed")) it.optLong("seed") else null)
+        MediaRequest(
+            it.getString("generator"),
+            it.optString("params", "{}"),
+            it.str("jobId"),
+            if (it.has("seed")) it.optLong("seed") else null,
+            it.optJSONObject("call")?.let { c -> ToolCall(c.optString("id"), c.optString("name"), c.optString("arguments", "{}")) },
+        )
     },
 )

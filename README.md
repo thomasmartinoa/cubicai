@@ -16,6 +16,7 @@ A personal Android AI chat app built with Kotlin and Jetpack Compose. It talks t
 - **Web search** with source chips: on your PC through a private SearXNG, on Grok through xAI's web and X search, on OpenRouter through its web plugin.
 - **Photos, camera, files and PDFs**: images are downscaled before sending; PDFs are sent as page images, other files as text.
 - **Create images, video, music and speech on your own PC** through ComfyUI: live preview while it renders, photo edits that build on each other, a fixed seed, steps and CFG when you want them, and nothing kept on the PC unless you tap Save.
+- **Chat models that send pictures and voice messages**: ask in any chat ("send me a photo of that", "say it as a voice message") and the model writes the prompt from the conversation, makes it on your PC, looks at the result and carries on. Characters keep the same face and voice, and can send things on their own.
 - **Image creation** with Gemini (needs a Google account with billing; the free tier has no image quota).
 - **Context meter** beside the send button: how much of the model's context window the chat fills, plus the tokens read and written so far. Tap it for details.
 - **Behaviours** (system prompts): built-in ones, your own, and an "About you" note added to all of them except None.
@@ -194,7 +195,7 @@ With [ComfyUI](https://github.com/comfyanonymous/ComfyUI) installed on the PC, t
 | Edit | Qwen Image Edit, Flux 2 Klein Edit, Remove background, Upscale 2× (attach a photo) |
 | Video | Wan 2.2 5B (text or photo), Wan 2.2 14B (brings a photo to life) |
 | Music | ACE-Step 1.5 (style prompt, optional lyrics) |
-| Voice | Chatterbox (reads your text; attach a voice recording to copy that voice) |
+| Voice | Chatterbox (reads your text in a woman's or a man's voice; attach a voice recording to copy that voice) |
 
 <p align="center">
   <img src="docs/screenshots/create-sheet.png" width="200" alt="The Create sheet with More controls open: seed, steps and CFG">
@@ -202,6 +203,19 @@ With [ComfyUI](https://github.com/comfyanonymous/ComfyUI) installed on the PC, t
   <img src="docs/screenshots/create-image.png" width="200" alt="The finished image with Save, Share and Regenerate">
   <img src="docs/screenshots/create-music.png" width="200" alt="A piece of music made on the PC, in the chat's player">
 </p>
+
+Chatterbox's own built-in voice drifts between a woman's and a man's from one clip to the next, so the server speaks with a fixed reference voice instead: put a clean 10 s recording of each at `~/.config/cubicai-server/voices/woman.wav` and `man.wav`. Two speakers from the free [CMU ARCTIC](http://festvox.org/cmu_arctic/) corpus work well:
+
+```sh
+mkdir -p ~/.config/cubicai-server/voices && cd ~/.config/cubicai-server/voices
+for v in slt:woman rms:man; do
+  for n in 0001 0002 0005 0008; do curl -sfLO http://festvox.org/cmu_arctic/cmu_arctic/cmu_us_${v%:*}_arctic/wav/arctic_a$n.wav; done
+  ffmpeg -v error -i arctic_a0001.wav -i arctic_a0002.wav -i arctic_a0005.wav -i arctic_a0008.wav \
+    -filter_complex concat=n=4:v=0:a=1 -ar 24000 ${v#*:}.wav && rm arctic_a*.wav
+done
+```
+
+The Create sheet then offers **Woman** and **Man** under Voice; an attached recording still wins.
 
 How it behaves:
 
@@ -214,6 +228,16 @@ How it behaves:
 - **Chat and create share one GPU.** A chat sent while something is being made is slower (the PC says so); afterwards the chat model is reloaded fully onto the GPU. A second creation waits for the first. If ComfyUI crashes (out of memory, say), the reply says so and Retry starts it again.
 
 Using it: tap **Create**, pick a generator (and shape, length or language where it applies), tap **Done**, then type what you want and send. Attach a photo for Edit and for photo-to-video, or a short voice recording for Chatterbox to copy. The result arrives in the chat with **Save**, **Share** and **Regenerate**.
+
+#### Pictures and voice messages from the chat
+
+With the PC paired, chat models that can call tools (all current Ollama chat models, Gemini, Grok, most OpenRouter models) can make things themselves. Ask in the chat, and the model writes the prompt from the conversation (who, where, what they wear, the light), picks the picture model (photoreal, best quality and readable text, or anime), and sends the result. A "Prompt" fold-out under it shows what it asked for, with **Edit and make again**.
+
+- **It looks at what it made.** Local models that see images, and Grok, are shown the picture and carry on from it, or try once more if it's clearly off. Other cloud models are only told it was sent; your pictures don't go to them.
+- **Characters stay the same person.** A behaviour can have **Looks**, a **face** picture and a **voice** sample (5-10 s). Pictures of the character start from its face (with Qwen Image Edit), so it looks the same each time; voice messages copy its voice, or use a woman's or a man's voice to fit the character. Without a face, the first picture of the character becomes it. Each chat keeps its own copy: **Use as face** on any picture changes it for that chat, and **Save to** the behaviour makes it the default.
+- **Sends on its own.** Turn this on for a behaviour and the character may send a picture or voice message without being asked, when the moment calls for it.
+- **"Make that night"** changes the latest picture in the chat instead of starting over.
+- Up to two creations per message you send. Video and music from the chat come next; use the Create sheet for them for now.
 
 Setup (paths in the unit files assume ComfyUI at `/mnt/storage/games/AI_local/ComfyUI`; edit them if yours is elsewhere):
 

@@ -91,6 +91,7 @@ fun createSummary(o: CreateOptions): String {
         g.name,
         o.aspect.takeIf { g.aspects.isNotEmpty() && it.isNotEmpty() },
         o.seconds.takeIf { g.maxSeconds > 0 }?.let { if (it < 60 || it % 60 != 0) "$it s" else "${it / 60} min" },
+        o.speaker.takeIf { g.voices.isNotEmpty() && it.isNotEmpty() }?.replaceFirstChar { it.uppercase() },
         o.language.takeIf { g.languages.isNotEmpty() && it.isNotEmpty() }?.substringBefore(" ("),
         o.seed?.let { "seed $it" },
         "tuned".takeIf { o.steps != null || o.cfg != null || o.negative != null },
@@ -254,6 +255,12 @@ private fun Options(o: CreateOptions, lastSeed: Long?, onChange: (CreateOptions)
             options.forEach { n -> Choice(if (n < 60 || n % 60 != 0) "$n s" else "${n / 60} min", n == o.seconds) { onChange(o.copy(seconds = n)) } }
         }
     }
+    if (g.voices.isNotEmpty()) {
+        Label("Voice")
+        FlowRow(edge, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            g.voices.forEach { v -> Choice(v.replaceFirstChar { it.uppercase() }, v == o.speaker) { onChange(o.copy(speaker = v)) } }
+        }
+    }
     if (g.languages.isNotEmpty()) {
         Label("Language")
         var open by remember { mutableStateOf(false) }
@@ -267,7 +274,7 @@ private fun Options(o: CreateOptions, lastSeed: Long?, onChange: (CreateOptions)
             }
         }
         Text(
-            "Attach a short voice recording (Files) to make it speak in that voice.",
+            "Attach a short voice recording (Files) to make it speak in that voice instead.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = edge.padding(top = 6.dp),
