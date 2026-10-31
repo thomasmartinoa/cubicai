@@ -584,9 +584,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch(io) { store.deleteAll() }
     }
 
-    /** A deleted chat's unfinished PC jobs are stopped too, so nothing it asked for is left on the PC. */
+    /**
+     * A deleted chat's jobs still on the PC are stopped and dropped too (running ones, and finished ones whose
+     * download failed), so nothing it asked for is left there.
+     */
     private fun cancelPcJobs(chat: Chat) {
-        val ids = chat.messages.filter { it.mediaPending }.mapNotNull { it.media?.jobId }
+        val ids = chat.messages.filter { it.attachments.isEmpty() }.mapNotNull { it.media?.jobId }
         if (ids.isEmpty()) return
         val s = _state.value.settings
         viewModelScope.launch { ids.forEach { client.cancelMedia(s.baseUrls(Providers.LOCAL), s.key(Providers.LOCAL), s.localFingerprint, it) } }

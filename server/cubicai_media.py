@@ -665,6 +665,14 @@ class Jobs:
     def _janitor(self):
         while True:
             time.sleep(60)
+            # ComfyUI can record a cancelled run just after we cleared it, prompt included. With nothing running,
+            # our own ComfyUI's history is emptied (one started by hand, outside the unit, is left alone).
+            if COMFY.busy == 0 and not self.queue and _unit_active() and comfy_running():
+                try:
+                    if _comfy("/history", timeout=5):
+                        _comfy("/history", {"clear": True}, timeout=5)
+                except Exception:
+                    pass
             now = time.time()
             with self.lock:
                 stale = [j for j in self.jobs.values() if j.state in TERMINAL and now - j.created > UNDELIVERED_TTL]
