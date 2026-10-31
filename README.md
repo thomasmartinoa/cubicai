@@ -1,6 +1,6 @@
 # CubicAI
 
-A personal Android AI chat app built with Kotlin and Jetpack Compose. It talks to cloud models (Gemini, Grok, OpenRouter, any OpenAI-compatible API) and to **your own Ollama models on your PC**, through a small private gateway that only your phone can use.
+A personal Android AI chat app built with Kotlin and Jetpack Compose. It talks to cloud models (Gemini, Grok, OpenRouter, any OpenAI-compatible API) and to **your own PC**: chat with your Ollama models and create images, video, music and speech with ComfyUI, through a small private gateway that only your phone can use, at home or away.
 
 <p align="center">
   <img src="docs/screenshots/home-dark.png" width="200" alt="Home screen, dark theme">
@@ -15,11 +15,12 @@ A personal Android AI chat app built with Kotlin and Jetpack Compose. It talks t
 - **Many providers in one place**: Local PC (Ollama), Google Gemini, xAI (Grok), OpenRouter, or any OpenAI-compatible endpoint. Each chat remembers its own model and behaviour.
 - **Web search** with source chips: on your PC through a private SearXNG, on Grok through xAI's web and X search, on OpenRouter through its web plugin.
 - **Photos, camera, files and PDFs**: images are downscaled before sending; PDFs are sent as page images, other files as text.
-- **Create images, video, music and speech on your own PC** through ComfyUI, from home or over Tailscale: live preview while it renders, results kept only in the chat until you tap Save.
+- **Create images, video, music and speech on your own PC** through ComfyUI: live preview while it renders, photo edits that build on each other, a fixed seed, steps and CFG when you want them, and nothing kept on the PC unless you tap Save.
 - **Image creation** with Gemini (needs a Google account with billing; the free tier has no image quota).
 - **Context meter** beside the send button: how much of the model's context window the chat fills, plus the tokens read and written so far. Tap it for details.
 - **Behaviours** (system prompts): built-in ones, your own, and an "About you" note added to all of them except None.
 - **Voice input, read aloud, copy, share, edit and regenerate**, search across chats, and a light, dark or system theme.
+- **Keeps working when the network doesn't**: falls back from home Wi-Fi to the PC's IPv6 address or Tailscale, finds the PC again when its address changes, picks a job up again after a drop or an app restart, and says plainly why it can't reach the PC.
 - **Private by design**: API keys and the PC token are encrypted with an Android Keystore key, there is no account or analytics, and an optional privacy screen hides the app from the recents view and screenshots.
 
 <p align="center">
@@ -63,19 +64,25 @@ Keys are stored on the phone only, encrypted. They are never written to this rep
 The `server/` folder holds a small gateway that lets the phone use Ollama on your PC without exposing Ollama itself:
 
 ```
-phone ──TLS 1.3, pinned certificate, bearer token──► cubicai_server.py :8443 ──► Ollama 127.0.0.1:11434
-                                                              └──► SearXNG 127.0.0.1:8888 (web search)
+phone ──TLS 1.3, pinned certificate, bearer token──► cubicai_server.py :8443 ──► Ollama  127.0.0.1:11434 (chat)
+                                                              ├──► SearXNG 127.0.0.1:8888  (web search)
+                                                              └──► ComfyUI 127.0.0.1:8188  (create)
 ```
 
-- Only devices on your home network can connect. Tailscale connections are allowed only while **remote access** is on. Everyone else is dropped before the TLS handshake.
+- Only devices on your home network (IPv4, or your home IPv6 prefix) can connect. Tailscale connections are allowed only while **remote access** is on. Everyone else is dropped before the TLS handshake.
 - The phone pins the server's self-signed certificate and sends a secret token with every request.
-- Message content is never logged or stored on the PC.
+- Message content is never logged or stored on the PC, and created files only until the phone has them.
 
 ### Requirements
 
 - Linux with **Python 3** (the server uses only the standard library; it is tested on 3.14)
 - [**Ollama**](https://ollama.com) with at least one model pulled, for example `ollama pull gemma4:e4b`
-- Optional: **Docker** for web search, **Tailscale** to use your PC away from home, **GTK 4 + libadwaita** (`python-gobject`) for the control panel, and **Avahi** (`avahi-daemon` running) so the phone finds the PC again when the router gives it a new address
+- Optional:
+  - **Docker**, for web search
+  - **Tailscale**, to use your PC away from home
+  - **Avahi** (`avahi-daemon` running, plus `avahi-publish-service`, in `avahi` or `avahi-utils`), so the phone finds the PC again when the router gives it a new address
+  - **ComfyUI** and an NVIDIA GPU (tested with 8 GB), for creating images, video, music and speech
+  - **GTK 4 + libadwaita** (`python-gobject`), for the control panel
 
 ### 1. Set up the server
 
@@ -150,11 +157,17 @@ Then tap the **Search** chip under the message box. The server searches, reads t
    ```
 3. Open CubicAI once while you're at home (or tap **Test connection**). The phone learns the PC's Tailscale address by itself, so you don't need to pair again.
 
-Some routers stop passing IPv4 between two Wi-Fi devices after one reconnects (it can last 10+ minutes) while IPv6 keeps working. The PC tells the app its IPv6 home address too, and the app falls back to it, so this goes unnoticed. Only phones on your home IPv6 prefix are let in.
+`remote off` blocks Tailscale again straight away, including connections that are already open. Right after the phone leaves Wi-Fi, Tailscale can take about a minute to reconnect; the app says so if you try during that minute.
 
-If your router hands the PC a new home address, the app finds it again on the home network (the server announces itself over mDNS with its certificate's fingerprint, so only your own PC is accepted) and keeps the new address. No re-pairing needed.
+#### How the phone reaches your PC
 
-Away from home, the app tries your home address first and then the Tailscale one. `remote off` blocks Tailscale again straight away, including connections that are already open.
+The app tries the PC's addresses in order, starting with the one that worked last:
+
+1. **Home IPv4** (the address you paired with).
+2. **Home IPv6.** Some routers stop passing IPv4 between two Wi-Fi devices after one reconnects (it can last 10+ minutes) while IPv6 keeps working. The PC tells the app its IPv6 home address, which can change when your provider changes its prefix, and the app falls back to it.
+3. **Tailscale**, if remote access is on.
+
+Addresses the phone can't reach right now are skipped at once (home ones without Wi-Fi, Tailscale while it's off), and the error says why. If the router gives the PC a new home address, the app finds it again over mDNS (the PC announces its certificate's fingerprint, so only your own PC is accepted) and keeps it. None of this needs pairing again.
 
 ### 6. Optional: the control panel
 
@@ -193,6 +206,8 @@ How it behaves:
 - **More controls when you want them.** Folded away under **More controls** in the Create sheet: a fixed **seed** (same seed and prompt give the same result, so you can change a few words and vary just that; "Use the last picture's seed" picks up the previous result's), and for Qwen Image 2.1, Illustrious and Wan 5B, **steps**, **CFG** and **Avoid** (negative prompt). They start at each workflow's own values; **Reset** goes back. The distilled models (Z-Image, Flux Klein) don't offer steps or CFG, since other values mostly spoil their results.
 - **Chat and create share one GPU.** A chat sent while something is being made is slower (the PC says so); afterwards the chat model is reloaded fully onto the GPU. A second creation waits for the first. If ComfyUI crashes (out of memory, say), the reply says so and Retry starts it again.
 
+Using it: tap **Create**, pick a generator (and shape, length or language where it applies), tap **Done**, then type what you want and send. Attach a photo for Edit and for photo-to-video, or a short voice recording for Chatterbox to copy. The result arrives in the chat with **Save**, **Share** and **Regenerate**.
+
 Setup (paths in the unit files assume ComfyUI at `/mnt/storage/games/AI_local/ComfyUI`; edit them if yours is elsewhere):
 
 ```sh
@@ -202,7 +217,9 @@ systemctl --user daemon-reload
 systemctl --user restart cubicai-server
 ```
 
-The workflows are the ones saved in ComfyUI's `user/default/workflows`; `server/cubicai_media.py` lists which file each generator uses and which inputs it sets.
+`cubicai-comfyui.service` starts ComfyUI with a launcher script (`ExecStart`); point it at your own start command. The gateway's unit may only write to the folders above, so change its `ReadWritePaths` too if yours differ.
+
+The workflows are the ones saved in ComfyUI's `user/default/workflows`; `server/cubicai_media.py` lists which file each generator uses and which inputs it sets. A generator shows up in the app only when its workflow file and all its models are present.
 
 ### Context length
 
@@ -224,21 +241,31 @@ The app is a single `:app` module (`dev.martin.cubicai`):
 |---|---|
 | `data/` | Settings and providers, encrypted secrets, chats (one JSON file each), attachments, behaviours |
 | `net/LlmClient.kt` | Streaming over Server-Sent Events, web search, image creation, PC certificate pinning and address fallback |
-| `ChatViewModel.kt` | App state, sending, streaming, editing, regenerating, read aloud |
-| `ui/` | Compose screens, the cut-corner theme, Markdown rendering with the word fade, the context meter |
-| `server/` | The PC gateway, its control panel and the systemd unit |
+| `net/MediaClient.kt`, `net/LanFinder.kt` | Jobs on the PC (submit, follow, download, save); finding the PC again over mDNS |
+| `ChatViewModel.kt` | App state, sending, streaming, editing, regenerating, creating, reconnecting, read aloud |
+| `ui/` | Compose screens, the cut-corner theme, Markdown rendering with the word fade, the context meter, the Create sheet and media players |
+| `server/cubicai_server.py` | The gateway: pairing, address checks, Ollama, web search |
+| `server/cubicai_media.py`, `server/comfy_workflow.py` | ComfyUI jobs: generators, starting and stopping ComfyUI, sharing the GPU, turning saved workflows into API prompts |
+| `server/cubicai_control.py`, `server/*.service` | The control panel and the systemd units |
 
 ## Troubleshooting
 
 | Message or symptom | What to do |
 |---|---|
 | **Can't reach your PC** | Check the server is running (`systemctl --user status cubicai-server`), the phone is on home Wi-Fi or Tailscale, and port 8443 is open in the firewall. |
+| **Your PC is there but CubicAI Server isn't answering** | The PC is reachable but the server is stopped. Start it from the panel or with `systemctl --user start cubicai-server`. |
+| **You're not on your home Wi-Fi and Tailscale is off** | Turn Tailscale on in its app (and remote access on the PC), or get back on home Wi-Fi. |
+| **Can't reach your PC through Tailscale** | Right after leaving Wi-Fi Tailscale needs about a minute; try again. If it keeps happening, check the PC is online in the Tailscale app. |
 | **Your PC turned the connection away** | You're connecting over Tailscale with remote access off. Turn it on in the panel or with `remote on`. |
 | **Your PC no longer accepts this phone's pairing** | The token was rotated. Pair again with a new link. |
 | **The certificate doesn't match** | The server identity was recreated. Unpair in Settings and pair again. |
 | **The connection to your PC dropped before the reply finished** | The server restarted or the network dropped mid-reply. Tap **Retry**. |
 | Replies pause for a few seconds and then catch up | Usually a weak Wi-Fi signal (the 2.4 GHz band is the usual culprit). Nothing is lost; the text arrives once the link recovers. |
 | Gemini image creation says quota exceeded | Google's free tier has no image quota. Turn on billing for the key's project. |
+| A creation says **Reconnecting to your PC** | The phone lost the PC (Wi-Fi dropped, PC asleep). The job keeps running there and is picked up as soon as the phone is back on a network. |
+| **ComfyUI stopped while making this** | ComfyUI crashed, usually out of GPU memory (a long video, say). Tap **Retry**; it starts ComfyUI again. |
+| **Your PC lost track of this one** | The server restarted, or the result waited more than an hour without being downloaded. Tap **Retry** to make it again. |
+| A chat is slow while something is being made | Chat and ComfyUI share the GPU. The reply says the PC is busy; chat is back to full speed once the creation is done. |
 | **Create** shows nothing to make | ComfyUI isn't installed where the unit file expects it, or none of the listed models are present. Check `journalctl --user -u cubicai-comfyui`. |
 | A creation fails with "ComfyUI rejected the workflow" | A model or custom node the workflow uses is missing or was renamed. Open the workflow in ComfyUI to see which. |
 | Search returns nothing on Local PC | Check the SearXNG container is running: `docker ps --filter name=cubicai-searxng`. |
