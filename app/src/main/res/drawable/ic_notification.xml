@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The cube from the launcher icon, cropped to the notification icon's 24dp. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp"
+    android:viewportWidth="54" android:viewportHeight="54">
+    <group android:translateX="-27" android:translateY="-28">
+        <path android:fillColor="#FFFFFF" android:pathData="M54,31 L74.78,43 L54,55 L33.22,43 Z" />
+        <path android:fillColor="#FFFFFF" android:fillAlpha="0.7" android:pathData="M33.22,43 L54,55 L54,79 L33.22,67 Z" />
+        <path android:fillColor="#FFFFFF" android:fillAlpha="0.45" android:pathData="M54,55 L74.78,43 L74.78,67 L54,79 Z" />
+    </group>
+</vector>

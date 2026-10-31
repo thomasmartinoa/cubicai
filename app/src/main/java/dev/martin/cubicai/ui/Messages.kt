@@ -214,6 +214,11 @@ fun AssistantMessage(
     onUseAsFace: (() -> Unit)? = null,
     /** Makes what the model asked for again, with the prompt the user changed. */
     onEditPrompt: ((String) -> Unit)? = null,
+    /** The user's yes or no to a video the model wants to make. */
+    onAnswerVideo: ((Boolean) -> Unit)? = null,
+    /** Thinking shown open or folded, as the user last left it (null: open only while the model thinks). */
+    thoughtsOpen: Boolean? = null,
+    onThoughtsToggle: (Boolean) -> Unit = {},
 ) {
     val context = LocalContext.current
     val images = message.attachments.filter { it.isImage }
@@ -224,6 +229,9 @@ fun AssistantMessage(
     val waiting = streaming && !hasText && message.reasoning.isBlank() && images.isEmpty() && !making
     val writing = streaming && hasText
     val request = remember(message.media?.params) { message.media?.params?.let { runCatching { JSONObject(it) }.getOrNull() } }
+    // A video waits for the picture it's made from, which is its own reply just above.
+    val awaitingPicture = making && request?.has("picture") == true && !request.has("source")
+    val declined = request?.optBoolean("declined") == true
 
     // Seconds spent thinking, ticking only while the model is.
     val seconds by produceState(0, thinking) {
@@ -235,6 +243,7 @@ fun AssistantMessage(
     }
     val phase = when {
         making && !message.stopped -> when {
+            awaitingPicture -> "Waiting for its picture"
             progress == null -> if (streaming) "Sending to your PC" else "Waiting for your PC"
             progress.steps > 0 -> "${progress.phase} · ${progress.step}/${progress.steps}"
             else -> progress.phase.ifBlank { "Working" }
@@ -252,8 +261,9 @@ fun AssistantMessage(
             phase = phase,
             spinning = streaming || (making && !message.stopped),
         )
-        if (making && !message.stopped) MediaProgressCard(progress, request?.optString("kind").orEmpty(), request?.optString("aspect")?.ifEmpty { request.optString("frame") })
-        if (message.reasoning.isNotBlank()) ReasoningBlock(message.reasoning, active = thinking)
+        if (message.media?.ask == true) VideoQuestion(request, onAnswerVideo.takeIf { !streaming })
+        if (making && !message.stopped && !awaitingPicture) MediaProgressCard(progress, request?.optString("kind").orEmpty(), request?.optString("aspect")?.ifEmpty { request.optString("frame") })
+        if (message.reasoning.isNotBlank()) ReasoningBlock(message.reasoning, active = thinking, preferred = thoughtsOpen, onToggle = onThoughtsToggle)
         // The height eases open as lines arrive, so the reply above glides up instead of jumping a line at a time.
         if (hasText) MarkdownText(message.content, Modifier.animateContentSize(tween(180)), streaming = streaming)
         if (images.isNotEmpty()) CreatedImages(images)
@@ -264,7 +274,12 @@ fun AssistantMessage(
         message.media?.call?.let { call ->
             val asked = remember(call.arguments) { runCatching { JSONObject(call.arguments) }.getOrDefault(JSONObject()) }
             var editing by remember { mutableStateOf(false) }
-            ModelPrompt(asked, voice = request?.optString("kind") == "audio", onEdit = { editing = true }.takeIf { onEditPrompt != null && !streaming && !making })
+            val kind = when {
+                message.media.generator == "chatterbox" -> "voice"
+                request?.optString("kind") == "audio" -> "music"
+                else -> asked.optString("kind").ifEmpty { "picture" }
+            }
+            ModelPrompt(asked, kind, onEdit = { editing = true }.takeIf { onEditPrompt != null && !streaming && !making && !message.media.ask })
             if (editing) EditDialog(
                 asked.optString("prompt"),
                 onDismiss = { editing = false },
@@ -276,7 +291,7 @@ fun AssistantMessage(
         }
         if (message.stopped) Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
-                "Stopped",
+                if (declined) "Not made" else "Stopped",
                 Modifier.padding(top = 4.dp),
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -284,7 +299,7 @@ fun AssistantMessage(
             // A stopped creation left nothing behind, so offer to run it again rather than make you retype it.
             if (message.media != null && media.isEmpty() && isLast && !streaming) {
                 TextButton(onClick = onRegenerate, shape = MaterialTheme.shapes.small, modifier = Modifier.padding(start = 8.dp)) {
-                    Text("Try again")
+                    Text(if (declined) "Make it now" else "Try again")
                 }
             }
         }
@@ -308,12 +323,31 @@ fun AssistantMessage(
             }
             if (isLast) SmallAction(Icons.Rounded.Refresh, "Regenerate", onRegenerate)
             }
-            Spacer(Modifier.weight(1f))
-            // The header already names the model unless a behaviour's name is shown there.
-            if (message.persona != null) message.model?.let {
-                Text(displayModelName(it), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            // The header already names the model unless a behaviour's name is shown there; then how long it took.
+            Row(Modifier.weight(1f), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
+                val muted = MaterialTheme.colorScheme.onSurfaceVariant
+                val model = message.model?.takeIf { message.persona != null }?.let(::displayModelName)
+                if (model != null) Text(
+                    model, Modifier.weight(1f, fill = false),
+                    style = MaterialTheme.typography.labelSmall, color = muted, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                )
+                if (message.took > 0) Text(
+                    (if (model != null) " · " else "") + duration(message.took),
+                    style = MaterialTheme.typography.labelSmall, color = muted, maxLines = 1,
+                )
             }
         }
+    }
+}
+
+/** "2.4 s", "41 s", "4 min 9 s". */
+private fun duration(ms: Long): String {
+    val s = ms / 1000
+    return when {
+        ms < 10_000 -> "%.1f s".format(ms / 1000.0)
+        s < 60 -> "$s s"
+        s % 60 == 0L -> "${s / 60} min"
+        else -> "${s / 60} min ${s % 60} s"
     }
 }
 
@@ -342,9 +376,40 @@ private fun CreatedImages(images: List<Attachment>) {
     viewing?.let { ImageViewer(it) { viewing = null } }
 }
 
+/** A video the chat model wants to make: it takes minutes on the PC, so it starts only on the user's yes. */
+@Composable
+private fun VideoQuestion(request: JSONObject?, onAnswer: ((Boolean) -> Unit)?) {
+    val seconds = request?.optInt("seconds")?.takeIf { it > 0 } ?: 4
+    val fromLast = remember(request) {
+        runCatching { JSONObject(request?.optString("picture").orEmpty()).optString("start_from") == "last_picture" }.getOrDefault(false)
+    }
+    // Wan takes about a minute per second of video, and the picture it starts from about another.
+    val minutes = seconds + if (fromLast) 0 else 1
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceContainer,
+        shape = MaterialTheme.shapes.medium,
+        modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+    ) {
+        Column(Modifier.padding(start = 16.dp, top = 16.dp, end = 8.dp, bottom = 4.dp)) {
+            Text("Make a $seconds s video?", style = MaterialTheme.typography.titleSmall)
+            Text(
+                (if (fromLast) "Brings the last picture to life. " else "A picture first, then brought to life. ") +
+                    "About $minutes min on your PC; the chat waits meanwhile.",
+                Modifier.padding(top = 4.dp, end = 8.dp),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Row(Modifier.fillMaxWidth().padding(top = 4.dp), horizontalArrangement = Arrangement.End) {
+                TextButton(onClick = { onAnswer?.invoke(false) }, enabled = onAnswer != null, shape = MaterialTheme.shapes.small) { Text("Not now") }
+                TextButton(onClick = { onAnswer?.invoke(true) }, enabled = onAnswer != null, shape = MaterialTheme.shapes.small) { Text("Make it") }
+            }
+        }
+    }
+}
+
 /** The prompt the chat model wrote for something it made, folded away like its thoughts. */
 @Composable
-private fun ModelPrompt(asked: JSONObject, voice: Boolean, onEdit: (() -> Unit)?) {
+private fun ModelPrompt(asked: JSONObject, kind: String, onEdit: (() -> Unit)?) {
     var expanded by remember { mutableStateOf(false) }
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
     val arrow by animateFloatAsState(if (expanded) 180f else 0f, tween(180), label = "arrow")
@@ -355,13 +420,19 @@ private fun ModelPrompt(asked: JSONObject, voice: Boolean, onEdit: (() -> Unit)?
         ) {
             Icon(Icons.Rounded.Notes, null, Modifier.size(16.dp), tint = muted)
             Spacer(Modifier.width(8.dp))
-            Text(if (voice) "What it says" else "Prompt", style = MaterialTheme.typography.labelLarge, color = muted)
+            Text(if (kind == "voice") "What it says" else "Prompt", style = MaterialTheme.typography.labelLarge, color = muted)
             Icon(Icons.Rounded.ExpandMore, null, Modifier.size(18.dp).graphicsLayer { rotationZ = arrow }, tint = muted)
         }
         AnimatedVisibility(expanded, enter = expandVertically(tween(200)) + fadeIn(tween(200)), exit = shrinkVertically(tween(160)) + fadeOut(tween(120))) {
             Surface(color = MaterialTheme.colorScheme.surfaceContainer, shape = MaterialTheme.shapes.medium, modifier = Modifier.padding(top = 4.dp)) {
                 Column(Modifier.fillMaxWidth().padding(start = 12.dp, top = 12.dp, end = 12.dp, bottom = if (onEdit != null) 0.dp else 12.dp)) {
                     Text(asked.optString("prompt").trim(), style = MaterialTheme.typography.bodySmall, color = muted)
+                    asked.optString("motion").takeIf { kind == "video" && it.isNotBlank() }?.let {
+                        Text("Motion: ${it.trim()}", Modifier.padding(top = 8.dp), style = MaterialTheme.typography.bodySmall, color = muted)
+                    }
+                    asked.optString("lyrics").takeIf { kind == "music" && it.isNotBlank() }?.let {
+                        Text(it.trim(), Modifier.padding(top = 8.dp), style = MaterialTheme.typography.bodySmall, color = muted)
+                    }
                     asked.optString("negative").takeIf { it.isNotBlank() }?.let {
                         Text("Avoid: $it", Modifier.padding(top = 8.dp), style = MaterialTheme.typography.bodySmall, color = muted, maxLines = 4, overflow = TextOverflow.Ellipsis)
                     }
@@ -376,19 +447,21 @@ private fun ModelPrompt(asked: JSONObject, voice: Boolean, onEdit: (() -> Unit)?
 }
 
 @Composable
-private fun ReasoningBlock(reasoning: String, active: Boolean) {
-    // Opens by itself while the model thinks, so you can watch it work, and folds away when it answers.
-    var expanded by remember { mutableStateOf(active) }
+private fun ReasoningBlock(reasoning: String, active: Boolean, preferred: Boolean?, onToggle: (Boolean) -> Unit) {
+    // Until the user opens or folds one, it opens by itself while the model thinks and folds away when it answers.
+    // After that every reply follows their choice.
+    var expanded by remember { mutableStateOf(preferred ?: active) }
     var wasActive by remember { mutableStateOf(active) }
-    LaunchedEffect(active) {
-        if (active) expanded = true else if (wasActive) expanded = false
+    LaunchedEffect(active, preferred) {
+        if (preferred != null) expanded = preferred else if (active) expanded = true else if (wasActive) expanded = false
         wasActive = active
     }
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
     val arrow by animateFloatAsState(if (expanded) 180f else 0f, tween(180), label = "arrow")
     Column(Modifier.padding(bottom = 8.dp)) {
         Row(
-            Modifier.clip(MaterialTheme.shapes.extraSmall).clickable { expanded = !expanded }.padding(end = 4.dp).heightIn(min = 40.dp),
+            Modifier.clip(MaterialTheme.shapes.extraSmall).clickable { expanded = !expanded; onToggle(expanded) }
+                .padding(end = 4.dp).heightIn(min = 40.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             // Same 16dp mark + 8dp gap as the reply header, so both labels start on one line.

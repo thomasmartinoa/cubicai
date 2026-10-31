@@ -11,12 +11,13 @@ A personal Android AI chat app built with Kotlin and Jetpack Compose. It talks t
 
 ## Features
 
-- **Streaming replies that fade in word by word**, with a "Thinking / Searching / Writing" status and the model's reasoning in a collapsible box.
+- **Streaming replies that fade in word by word**, with a "Thinking / Searching / Writing" status and the model's reasoning in a collapsible box that stays open or folded the way you last left it. Each reply shows how long it took.
 - **Many providers in one place**: Local PC (Ollama), Google Gemini, xAI (Grok), OpenRouter, or any OpenAI-compatible endpoint. Each chat remembers its own model and behaviour.
 - **Web search** with source chips: on your PC through a private SearXNG, on Grok through xAI's web and X search, on OpenRouter through its web plugin.
 - **Photos, camera, files and PDFs**: images are downscaled before sending; PDFs are sent as page images, other files as text.
 - **Create images, video, music and speech on your own PC** through ComfyUI: live preview while it renders, photo edits that build on each other, a fixed seed, steps and CFG when you want them, and nothing kept on the PC unless you tap Save.
-- **Chat models that send pictures and voice messages**: ask in any chat ("send me a photo of that", "say it as a voice message") and the model writes the prompt from the conversation, makes it on your PC, looks at the result and carries on. Characters keep the same face and voice, and can send things on their own.
+- **Chat models that send pictures, voice messages, videos and music**: ask in any chat ("send me a photo of that", "say it as a voice message", "make a short video of it") and the model writes the prompt from the conversation, makes it on your PC, looks at the result and carries on. Characters keep the same face and voice, and can send things on their own.
+- **Keeps working in the background**: switch to another app while a reply is written or a video is made; a notification shows it's working and tells you when it's done.
 - **Image creation** with Gemini (needs a Google account with billing; the free tier has no image quota).
 - **Context meter** beside the send button: how much of the model's context window the chat fills, plus the tokens read and written so far. Tap it for details.
 - **Behaviours** (system prompts): built-in ones, your own, and an "About you" note added to all of them except None.
@@ -237,7 +238,9 @@ With the PC paired, chat models that can call tools (all current Ollama chat mod
 - **Characters stay the same person.** A behaviour can have **Looks**, a **face** picture and a **voice** sample (5-10 s). Pictures of the character start from its face (with Qwen Image Edit), so it looks the same each time; voice messages copy its voice, or use a woman's or a man's voice to fit the character. Without a face, the first picture of the character becomes it. Each chat keeps its own copy: **Use as face** on any picture changes it for that chat, and **Save to** the behaviour makes it the default.
 - **Sends on its own.** Turn this on for a behaviour and the character may send a picture or voice message without being asked, when the moment calls for it.
 - **"Make that night"** changes the latest picture in the chat instead of starting over.
-- Up to two creations per message you send. Video and music from the chat come next; use the Create sheet for them for now.
+- **Videos ask first.** A video takes a few minutes, so the chat shows "Make a 4 s video?" with **Make it** and **Not now**. Make it creates the picture (or uses the latest one), then brings it to life with Wan 2.2 14B.
+- **Music** comes from ACE-Step: the model writes the style and, for a song, the lyrics.
+- Up to two creations per message you send. Each reply shows how long it took.
 
 Setup (paths in the unit files assume ComfyUI at `/mnt/storage/games/AI_local/ComfyUI`; edit them if yours is elsewhere):
 

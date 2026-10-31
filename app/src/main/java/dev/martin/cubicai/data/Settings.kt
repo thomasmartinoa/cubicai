@@ -115,6 +115,8 @@ data class Settings(
     val theme: String = "system",
     /** Last thing made on the PC ("generator|aspect|seconds|language"), preselected when the Create sheet opens. */
     val lastCreate: String = "",
+    /** Whether a reply's thinking is shown open: the user's last choice, or null to open it only while the model thinks. */
+    val thoughtsOpen: Boolean? = null,
 ) {
     val provider get() = Providers.get(providerId)
 
@@ -178,6 +180,7 @@ class SettingsStore(context: Context) {
         webSearch = prefs.getBoolean("web_search", false),
         privacyScreen = prefs.getBoolean("privacy_screen", false),
         theme = prefs.getString("theme", null) ?: "system",
+        thoughtsOpen = if (prefs.contains("thoughts_open")) prefs.getBoolean("thoughts_open", false) else null,
     )
 
     fun save(s: Settings) = prefs.edit {
@@ -197,6 +200,7 @@ class SettingsStore(context: Context) {
         putBoolean("web_search", s.webSearch)
         putBoolean("privacy_screen", s.privacyScreen)
         putString("theme", s.theme)
+        s.thoughtsOpen?.let { putBoolean("thoughts_open", it) } ?: remove("thoughts_open")
     }
 
     private fun personasToJson(list: List<Persona>) = JSONArray(list.map {

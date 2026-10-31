@@ -44,6 +44,10 @@ data class MediaRequest(
     val jobId: String? = null,
     val seed: Long? = null,
     val call: ToolCall? = null,
+    /** Waiting for the user's yes before it starts (a video asked for by the chat model). */
+    val ask: Boolean = false,
+    /** When it was sent to the PC, for how long it took. */
+    val startedAt: Long = 0,
 )
 
 /** A tool call from the chat model; [arguments] is its JSON object as text. */
@@ -64,10 +68,12 @@ data class Message(
     val promptTokens: Int = 0,
     val outputTokens: Int = 0,
     val media: MediaRequest? = null,
+    /** How long the reply took to write or make, in milliseconds (0 when unknown). */
+    val took: Long = 0,
     val id: String = newId(),
 ) {
-    /** A PC generation that hasn't produced its files yet (and hasn't failed or been stopped). */
-    val mediaPending get() = media != null && attachments.isEmpty() && error == null && !stopped
+    /** A PC generation that hasn't produced its files yet (and hasn't failed, been stopped, or is still waiting for a yes). */
+    val mediaPending get() = media != null && !media.ask && attachments.isEmpty() && error == null && !stopped
 }
 
 data class Chat(
@@ -139,8 +145,11 @@ private fun Message.toJson(): JSONObject = JSONObject().apply {
     media?.let {
         put("media", JSONObject().put("generator", it.generator).put("params", it.params).put("jobId", it.jobId).put("seed", it.seed).apply {
             it.call?.let { c -> put("call", JSONObject().put("id", c.id).put("name", c.name).put("arguments", c.arguments)) }
+            if (it.ask) put("ask", true)
+            if (it.startedAt > 0) put("startedAt", it.startedAt)
         })
     }
+    if (took > 0) put("took", took)
 }
 
 private fun messageFromJson(o: JSONObject) = Message(
@@ -165,6 +174,9 @@ private fun messageFromJson(o: JSONObject) = Message(
             it.str("jobId"),
             if (it.has("seed")) it.optLong("seed") else null,
             it.optJSONObject("call")?.let { c -> ToolCall(c.optString("id"), c.optString("name"), c.optString("arguments", "{}")) },
+            it.optBoolean("ask"),
+            it.optLong("startedAt"),
         )
     },
+    took = o.optLong("took"),
 )

@@ -51,6 +51,9 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -186,6 +189,58 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             _state.update { it.copy(chats = chats) }
         }
         refreshContextLimit()
+        // While a reply is written or something is made, a foreground service keeps the app alive in the background.
+        WorkService.onStopTapped = { viewModelScope.launch { stop() } }
+        viewModelScope.launch {
+            var working = false
+            _state.map(::workText).distinctUntilChanged().collectLatest { text ->
+                if (text != null) {
+                    working = true
+                    WorkService.update(app, text)
+                } else if (working) {
+                    // A picture and the model's look at it run back to back: wait a moment so the notice doesn't flicker.
+                    delay(2500)
+                    working = false
+                    WorkService.update(app, null)
+                    if (!visible) notifyDone()
+                }
+            }
+        }
+    }
+
+    /** Whether the app is on screen; work that finishes while it isn't is announced with a notification. */
+    @Volatile private var visible = true
+
+    fun setVisible(shown: Boolean) {
+        visible = shown
+        if (shown) WorkService.clearDone(getApplication())
+    }
+
+    private fun workText(s: UiState): String? {
+        if (!s.streaming) return null
+        val making = s.current.messages.lastOrNull { it.mediaPending }?.media ?: return "Writing a reply"
+        val kind = runCatching { JSONObject(making.params).optString("kind") }.getOrDefault("")
+        return when {
+            kind == "video" -> "Making a video on your PC"
+            making.generator == "chatterbox" -> "Recording a voice message on your PC"
+            kind == "audio" -> "Making music on your PC"
+            else -> "Making a picture on your PC"
+        }
+    }
+
+    private fun notifyDone() {
+        val chat = _state.value.current
+        val last = chat.messages.lastOrNull { it.role == Role.ASSISTANT }?.takeIf { !it.stopped } ?: return
+        val text = when {
+            last.error != null -> last.error
+            last.media?.ask == true -> "Wants to make a video. Open the chat to say yes or no."
+            last.content.isNotBlank() -> last.content.take(300)
+            last.attachments.any { it.isVideo } -> "Sent a video"
+            last.attachments.any { it.isAudio } -> if (last.media?.generator == "chatterbox") "Sent a voice message" else "Sent music"
+            last.attachments.any { it.isImage } -> "Sent a picture"
+            else -> return
+        }
+        WorkService.done(getApplication(), last.persona ?: chat.title.ifBlank { "CubicAI" }, text)
     }
 
     // --- Settings -------------------------------------------------------------------------------
@@ -297,28 +352,51 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     /**
      * Starts a PC generation for the last user message, as a new reply. [call] is the chat model's request when it
-     * asked for this itself, and [persona] the character it's from (for the label).
+     * asked for this itself, and [persona] the character it's from (for the label). With [ask] it waits for the
+     * user's yes (see [answerVideo]).
      */
-    private fun createMedia(generatorName: String, params: JSONObject, call: ToolCall? = null, persona: String? = null) {
+    private fun createMedia(
+        generatorName: String,
+        params: JSONObject,
+        call: ToolCall? = null,
+        persona: String? = null,
+        ask: Boolean = false,
+    ): Message {
         val snapshot = _state.value
         // Shapes the progress card like the photo being worked on (the app's own field; the PC ignores it).
         val source = if (params.optBoolean("auto")) params.optString("source").takeIf { it.isNotEmpty() }
         else sourceImage(snapshot.current.messages, params.getString("generator"))?.path
-        source?.let { path ->
-            val o = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            android.graphics.BitmapFactory.decodeFile(path, o)
-            if (o.outWidth > 0 && o.outHeight > 0) params.put("frame", "${o.outWidth}:${o.outHeight}")
-        }
+        source?.let { path -> sizeOf(path)?.let { (w, h) -> params.put("frame", "$w:$h") } }
         val reply = Message(
             role = Role.ASSISTANT,
             model = generatorName,
             persona = persona,
-            media = MediaRequest(params.getString("generator"), params.toString(), call = call),
+            media = MediaRequest(params.getString("generator"), params.toString(), call = call, ask = ask),
         )
         val chat = snapshot.current.copy(messages = snapshot.current.messages + reply, updatedAt = System.currentTimeMillis())
         _state.update { s -> s.copy(current = chat, chats = listOf(chat) + s.chats.filter { it.id != chat.id }) }
         persist(chat.id)
-        watchMedia(chat.id, reply)
+        if (!ask) watchMedia(chat.id, reply)
+        return reply
+    }
+
+    private fun sizeOf(path: String): Pair<Int, Int>? {
+        val o = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        android.graphics.BitmapFactory.decodeFile(path, o)
+        return if (o.outWidth > 0 && o.outHeight > 0) o.outWidth to o.outHeight else null
+    }
+
+    /** A video made from [path]: the picture, and the shape of the generator's closest to it. */
+    private fun withSource(params: JSONObject, path: String, aspects: List<String>): JSONObject {
+        params.put("source", path)
+        sizeOf(path)?.let { (w, h) ->
+            params.put("frame", "$w:$h")
+            aspects.minByOrNull { a ->
+                val (aw, ah) = a.split(":").map { it.toDouble() }
+                kotlin.math.abs(kotlin.math.ln(aw / ah) - kotlin.math.ln(w.toDouble() / h))
+            }?.let { params.put("aspect", it) }
+        }
+        return params
     }
 
     /**
@@ -333,6 +411,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val pin = settings.localFingerprint
         _state.update { it.copy(streaming = true, status = null) }
         val run = ++runId
+        val watchedAt = System.currentTimeMillis()
         job = viewModelScope.launch {
             var cancelled = false
             var made = false
@@ -351,10 +430,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     else sourceImage(history, request.generator)?.let { File(it.path) }
                     val audio = if (auto) params.optString("voice").takeIf { it.isNotEmpty() }?.let(::File)?.takeIf { it.isFile }
                     else source?.attachments?.firstOrNull { it.isAudio }?.let { File(it.path) }
-                    listOf("auto", "source", "voice", "frame").forEach(params::remove)
+                    listOf("auto", "source", "voice", "frame", "picture", "for_video", "declined").forEach(params::remove)
                     val id = client.submitMedia(baseUrls, token, pin, params, image, audio)
                     jobId = id
-                    updateMessage(chatId, reply.id) { it.copy(media = request.copy(jobId = id)) }
+                    updateMessage(chatId, reply.id) { it.copy(media = request.copy(jobId = id, startedAt = System.currentTimeMillis())) }
                     persist(chatId)
                 }
                 // Following the job and fetching its files both ride out a dropped or slow connection.
@@ -386,7 +465,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                             Attachment(f.kind, f.name, dest.path)
                         }
                         updateMessage(chatId, reply.id) {
-                            it.copy(attachments = files, error = null, media = it.media?.copy(seed = final.seed))
+                            // From sending it to the PC until it's here; a job picked up again counts from its start.
+                            val began = it.media?.startedAt?.takeIf { t -> t > 0 } ?: watchedAt
+                            it.copy(attachments = files, error = null, media = it.media?.copy(seed = final.seed), took = System.currentTimeMillis() - began)
                         }
                         made = true
                     }
@@ -408,6 +489,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 persist(chatId)
                 // Something the chat model asked for: it gets the result back and carries on the conversation.
                 if (made && request.call != null && runId == run) afterCreation(chatId, reply.id, request.call)
+                // The picture a video starts from: once it's here, the video is made from it.
+                val forVideo = runCatching { JSONObject(request.params).optString("for_video") }.getOrDefault("")
+                if (forVideo.isNotEmpty() && !cancelled) videoAfterPicture(chatId, reply.id, forVideo, made)
             }
         }
     }
@@ -430,14 +514,89 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         ) complete()
     }
 
+    /** The picture a video starts from is here (or failed): the video is made from it now. */
+    private fun videoAfterPicture(chatId: String, pictureId: String, videoId: String, made: Boolean) {
+        val chat = current(chatId) ?: return
+        val video = chat.messages.firstOrNull { it.id == videoId }?.takeIf { it.mediaPending } ?: return
+        val request = video.media ?: return
+        val picture = chat.messages.firstOrNull { it.id == pictureId }?.attachments?.firstOrNull { it.isImage }
+        if (!made || picture == null) {
+            updateMessage(chatId, videoId) { it.copy(error = "The picture for this video couldn't be made.") }
+            persist(chatId)
+            return
+        }
+        // Like any picture of the character, the first one becomes its face.
+        val showsYou = runCatching { JSONObject(JSONObject(request.params).optString("picture")).optBoolean("shows_you") }.getOrDefault(false)
+        if (showsYou && faceOf(chat, personaOf(chat)) == null) setChatFace(chatId, copyCharacterFile(File(picture.path), "chat-$chatId-face"))
+        val aspects = _state.value.generators.firstOrNull { it.id == request.generator }?.aspects.orEmpty()
+        val ready = request.copy(params = withSource(JSONObject(request.params), picture.path, aspects).toString())
+        updateMessage(chatId, videoId) { it.copy(media = ready) }
+        persist(chatId)
+        if (_state.value.current.id == chatId) watchMedia(chatId, video.copy(media = ready))
+    }
+
+    /**
+     * The user's answer to a video the chat model wants to make. Yes makes the picture it starts from (or takes the
+     * latest one), then the video; no leaves it unmade, and the model is told.
+     */
+    fun answerVideo(message: Message, yes: Boolean) {
+        val chatId = _state.value.current.id
+        val media = message.media?.takeIf { it.ask } ?: return
+        if (!yes) {
+            updateMessage(chatId, message.id, ::declined)
+            persist(chatId)
+            return
+        }
+        if (_state.value.streaming) return
+        val chat = current(chatId) ?: return
+        val params = JSONObject(media.params)
+        val args = runCatching { JSONObject(params.optString("picture")) }.getOrDefault(JSONObject())
+        val aspects = _state.value.generators.firstOrNull { it.id == media.generator }?.aspects.orEmpty()
+        val lastPicture = chat.messages.takeWhile { it.id != message.id }
+            .lastOrNull { m -> m.attachments.any { it.isImage } }?.attachments?.lastOrNull { it.isImage }?.path
+        if (args.optString("start_from") == "last_picture" && lastPicture != null) {
+            val ready = media.copy(ask = false, params = withSource(params, lastPicture, aspects).toString())
+            updateMessage(chatId, message.id) { it.copy(media = ready) }
+            persist(chatId)
+            watchMedia(chatId, message.copy(media = ready))
+            return
+        }
+        val plan = pictureJob(chat, personaOf(chat) ?: Personas.builtIn.first(), args)
+        if (plan == null) {
+            updateMessage(chatId, message.id) { it.copy(media = media.copy(ask = false), error = "Your PC has no picture model to start the video from.") }
+            persist(chatId)
+            return
+        }
+        val (gen, pictureParams) = plan
+        pictureParams.put("auto", true).put("for_video", message.id)
+        pictureParams.optString("source").takeIf { it.isNotEmpty() }?.let { path -> sizeOf(path)?.let { (w, h) -> pictureParams.put("frame", "$w:$h") } }
+        val picture = Message(role = Role.ASSISTANT, model = gen.name, persona = message.persona, media = MediaRequest(gen.id, pictureParams.toString()))
+        // The picture goes just before the video, which waits for it.
+        mutateChat(chatId) { c ->
+            c.copy(messages = c.messages.flatMap { m -> if (m.id == message.id) listOf(picture, m.copy(media = media.copy(ask = false))) else listOf(m) })
+        }
+        persist(chatId)
+        watchMedia(chatId, picture)
+    }
+
+    private fun declined(m: Message) = m.copy(
+        stopped = true,
+        media = m.media?.copy(ask = false, params = JSONObject(m.media.params).put("declined", true).toString()),
+    )
+
     private fun setProgress(messageId: String, progress: MediaProgress?) = _state.update {
         it.copy(mediaProgress = if (progress == null) it.mediaProgress - messageId else it.mediaProgress + (messageId to progress))
     }
 
     /** Picks a PC job back up when its chat is opened again (after switching chats or restarting the app). */
     private fun resumeMedia(chat: Chat) {
-        val last = chat.messages.lastOrNull() ?: return
-        if (last.mediaPending && last.media?.jobId != null && !_state.value.streaming) watchMedia(chat.id, last)
+        if (_state.value.streaming) return
+        // A video waits behind the picture it's made from, so that may be the one still on the PC.
+        val pending = chat.messages.takeLastWhile { it.role == Role.ASSISTANT }.filter { it.mediaPending }
+        val next = pending.firstOrNull { it.media?.jobId != null } ?: pending.firstOrNull { m ->
+            m.media?.call != null && runCatching { JSONObject(m.media.params).has("source") }.getOrDefault(false)
+        } ?: return
+        watchMedia(chat.id, next)
     }
 
     /** Saves a result to the phone's gallery and, if it was made on the PC, keeps a copy there too. */
@@ -542,6 +701,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun setAboutMe(text: String) = updateSettings { it.copy(aboutMe = text) }
+
+    /** Thinking shown open or folded from now on, as the user last left it. */
+    fun setThoughtsOpen(open: Boolean) = updateSettings { it.copy(thoughtsOpen = open) }
 
     /** Pairs with the PC gateway from a scanned/pasted `cubicai://pair` link and switches to it. */
     fun pair(link: String): Boolean {
@@ -707,7 +869,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val chat = s.current.let { c ->
             c.copy(
                 title = if (c.messages.isEmpty()) titleFor(message) else c.title,
-                messages = c.messages + message,
+                // A video still waiting for a yes is a no once the user carries on without answering.
+                messages = c.messages.map { m -> if (m.media?.ask == true) declined(m) else m } + message,
             )
         }
         _state.update { it.copy(current = chat, pending = emptyList(), draft = "") }
@@ -749,7 +912,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             discard(lastReply.attachments)
             _state.update { it.copy(current = c.copy(messages = c.messages.dropLast(1))) }
             val params = JSONObject(media.params).apply { remove("seed") }
-            createMedia(lastReply.model ?: media.generator, params, media.call, lastReply.persona)
+            // Try again on a video that never got its picture is the user's yes; one that has it animates it again.
+            val needsPicture = params.has("picture") && !params.has("source")
+            val again = createMedia(lastReply.model ?: media.generator, params, media.call, lastReply.persona, ask = needsPicture)
+            if (needsPicture) answerVideo(again, yes = true)
             return
         }
         // The words after something the model made are written again; what it made stays.
@@ -771,14 +937,18 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun stop() {
         job?.cancel()
         val c = _state.value.current
-        val pending = c.messages.lastOrNull()?.takeIf { it.mediaPending } ?: return
-        setProgress(pending.id, null)
-        updateMessage(c.id, pending.id) { it.copy(stopped = true, media = it.media?.copy(jobId = null)) }
-        persist(c.id)
-        pending.media?.jobId?.let { id ->
-            val s = _state.value.settings
-            viewModelScope.launch { client.cancelMedia(s.baseUrls(Providers.LOCAL), s.key(Providers.LOCAL), s.localFingerprint, id) }
+        // A video's picture and the video waiting for it go together.
+        val pending = c.messages.takeLastWhile { it.role == Role.ASSISTANT }.filter { it.mediaPending }
+        if (pending.isEmpty()) return
+        for (p in pending) {
+            setProgress(p.id, null)
+            updateMessage(c.id, p.id) { it.copy(stopped = true, media = it.media?.copy(jobId = null)) }
+            p.media?.jobId?.let { id ->
+                val s = _state.value.settings
+                viewModelScope.launch { client.cancelMedia(s.baseUrls(Providers.LOCAL), s.key(Providers.LOCAL), s.localFingerprint, id) }
+            }
         }
+        persist(c.id)
     }
 
     // --- Completion -----------------------------------------------------------------------------
@@ -810,6 +980,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val run = ++runId
         val buffer = TokenBuffer()
         var call: ToolCall? = null
+        val startedAt = System.currentTimeMillis()
         job = viewModelScope.launch {
             var cancelled = false
             try {
@@ -874,6 +1045,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     when {
                         cancelled -> m.copy(stopped = true)
                         m.content.isEmpty() && m.error == null && asked == null -> m.copy(error = "The model returned an empty response.")
+                        m.error == null -> m.copy(took = System.currentTimeMillis() - startedAt)
                         else -> m
                     }
                 }
@@ -923,29 +1095,63 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private fun createTool(gens: List<Generator>, persona: Persona): JSONArray? {
         val pictures = gens.filter { it.kind == "image" && it.mode == "create" }
         val voice = gens.firstOrNull { it.mode == "speech" }
-        if (pictures.isEmpty() && voice == null) return null
+        val music = gens.firstOrNull { it.mode == "music" }
         val canEdit = gens.any { it.kind == "image" && it.mode == "edit" }
-        val what = listOfNotNull("a picture".takeIf { pictures.isNotEmpty() }, "a voice message".takeIf { voice != null }).joinToString(" or ")
+        // A video starts from a picture, so it needs a way to make one.
+        val video = videoGenerator(gens)?.takeIf { pictures.isNotEmpty() || canEdit }
+        val kinds = listOfNotNull(
+            "picture".takeIf { pictures.isNotEmpty() },
+            "voice".takeIf { voice != null },
+            "video".takeIf { video != null },
+            "music".takeIf { music != null },
+        )
+        if (kinds.isEmpty()) return null
+        val names = mapOf("picture" to "a picture", "voice" to "a voice message", "video" to "a short video", "music" to "music")
+        val examples = mapOf(
+            "picture" to "a photo, selfie, picture, drawing, screenshot",
+            "voice" to "a voice message or voice note",
+            "video" to "a video or clip",
+            "music" to "a song or some music",
+        )
         val description = buildString {
-            append("Make $what on the user's own PC and send it into this chat. ")
-            append("Use it when the user asks for one (a photo, selfie, picture, drawing, screenshot")
-            if (voice != null) append(", voice message or voice note")
-            append(")")
+            append("Make ${kinds.map { names.getValue(it) }.joinToString(", ").replace(Regex(", ([^,]+)$"), " or $1")} ")
+            append("on the user's own PC and send it into this chat. ")
+            append("Use it when the user asks for one (${kinds.joinToString(", ") { examples.getValue(it) }})")
             if (persona.sendsOnItsOwn) append(", or on your own when it fits the moment")
             append(". You write the prompt yourself from the conversation, keeping what was said consistent: who and where, ")
             append("what they wear and do, the time of day and the light. You may write a short line before calling it. ")
             append("Saying you're sending something doesn't send it: call this to actually make and send it. ")
+            if (video != null) append("A video is a picture brought to life for a few seconds: describe the picture in prompt " +
+                "(or start from the last picture) and the movement in motion. The user is asked before it's made, since it takes minutes. ")
             append("Once it's sent you'll be told, and can carry on the conversation.")
         }
+        val kindNotes = mapOf(
+            "picture" to "picture",
+            "voice" to "voice: a voice message spoken in your voice",
+            "video" to "video: a few seconds of a picture coming to life",
+            "music" to "music: a piece of music or a song",
+        )
         val props = JSONObject()
-        if (pictures.isNotEmpty() && voice != null) props.put("kind", JSONObject().put("type", "string")
-            .put("enum", JSONArray(listOf("picture", "voice")))
-            .put("description", "picture, or voice: a voice message spoken in your voice"))
+        if (kinds.size > 1) props.put("kind", JSONObject().put("type", "string")
+            .put("enum", JSONArray(kinds))
+            .put("description", kinds.joinToString("; ") { kindNotes.getValue(it) }))
         props.put("prompt", JSONObject().put("type", "string").put("description",
             "For a picture: a detailed description of what is visible (subject, appearance, clothing, pose, setting, " +
                 "framing such as 'selfie, phone at arm's length', lighting, style), written for the picture model. " +
                 "Any text that should be readable in it (a screen, a message, a sign) is spelled out in double quotes, in the chat's language. " +
-                (if (voice != null) "For a voice message: exactly the words to say, nothing else, one to three sentences." else "")))
+                (if (video != null) "For a video: the picture it starts from, written the same way. " else "") +
+                (if (voice != null) "For a voice message: exactly the words to say, nothing else, one to three sentences. " else "") +
+                (if (music != null) "For music: the style (genre, instruments, mood, tempo, kind of voice), not the lyrics." else "")))
+        if (video != null) props.put("motion", JSONObject().put("type", "string").put("description",
+            "Video only: what moves and how, in one or two sentences (she turns to the camera and laughs, waves roll in, " +
+                "the camera slowly pushes in)."))
+        if (video != null || music != null) props.put("seconds", JSONObject().put("type", "integer").put("description",
+            listOfNotNull(
+                video?.let { "Video: 1-${it.maxSeconds} seconds (default ${it.defaultSeconds})." },
+                music?.let { "Music: 10-${it.maxSeconds} seconds (default 60)." },
+            ).joinToString(" ")))
+        if (music != null && music.lyrics) props.put("lyrics", JSONObject().put("type", "string").put("description",
+            "Music only: the song's lyrics with [verse] and [chorus] lines, in the song's language. Leave out for instrumental music."))
         if (pictures.isNotEmpty()) {
             props.put("generator", JSONObject().put("type", "string").put("enum", JSONArray(pictures.map { it.id }))
                 .put("description", "Picture model:\n" + pictures.joinToString("\n") { g -> "${g.id}: ${PROMPT_GUIDES[g.id] ?: g.note}" }))
@@ -1004,49 +1210,87 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val prompt = args.optString("prompt").trim()
         val voiceGen = gens.firstOrNull { it.mode == "speech" }
         val pictures = gens.filter { it.kind == "image" && it.mode == "create" }
-        val wantsVoice = args.optString("kind") == "voice" || (pictures.isEmpty() && voiceGen != null)
+        val kind = args.optString("kind").ifEmpty { if (pictures.isEmpty() && voiceGen != null) "voice" else "picture" }
         val label = persona.name.takeIf { persona.id != Personas.NONE }
+        fun missing(what: String) = _state.update { it.copy(notice = "Your PC has no $what model to make this with.") }
         val gen: Generator
         val params: JSONObject
-        if (wantsVoice && voiceGen != null) {
-            gen = voiceGen
-            val asked = args.optString("language")
-            val language = gen.languages.firstOrNull { asked.isNotBlank() && it.startsWith(asked, ignoreCase = true) }
-            val speaker = args.optString("speaker").takeIf { it in gen.voices } ?: speakerOf(persona, gen.voices)
-            val base = CreateOptions(gen, speaker = speaker)
-            params = createParams(if (language != null) base.copy(language = language) else base, spoken(prompt))
-            voiceOf(chat, persona)?.let { params.put("voice", it) }
-        } else {
-            val face = faceOf(chat, persona)
-            val editGen = gens.firstOrNull { it.id == "qwen-edit" } ?: gens.firstOrNull { it.kind == "image" && it.mode == "edit" }
-            val lastPicture = chat.messages.lastOrNull { m -> m.attachments.any { it.isImage } }?.attachments?.lastOrNull { it.isImage }?.path
-            // A picture of the character starts from its face, so it looks like the same person every time.
-            val source = when {
-                editGen == null -> null
-                args.optString("start_from") == "last_picture" && lastPicture != null -> lastPicture
-                args.optBoolean("shows_you") && face != null -> face
-                else -> null
+        var ask = false
+        when (kind) {
+            "voice" -> {
+                gen = voiceGen ?: return missing("voice")
+                val asked = args.optString("language")
+                val language = gen.languages.firstOrNull { asked.isNotBlank() && it.startsWith(asked, ignoreCase = true) }
+                val speaker = args.optString("speaker").takeIf { it in gen.voices } ?: speakerOf(persona, gen.voices)
+                val base = CreateOptions(gen, speaker = speaker)
+                params = createParams(if (language != null) base.copy(language = language) else base, spoken(prompt))
+                voiceOf(chat, persona)?.let { params.put("voice", it) }
             }
-            if (source != null && editGen != null) {
-                gen = editGen
-                val text = if (source == face) "A new photo of the same person as in the picture, with exactly the same face, hair, " +
-                    "skin tone and build. $prompt" else prompt
-                params = createParams(CreateOptions(gen), text).put("source", source)
-            } else {
-                gen = pictures.firstOrNull { it.id == args.optString("generator") } ?: pictures.firstOrNull { it.id == "z-image" }
-                    ?: pictures.firstOrNull() ?: run {
-                        _state.update { it.copy(notice = "Your PC has no picture model to make this with.") }
-                        return
-                    }
-                val aspect = args.optString("aspect").takeIf { it in gen.aspects } ?: gen.aspects.firstOrNull { it == "3:4" } ?: gen.aspects.firstOrNull().orEmpty()
-                // The workflow's own "avoid" list stays; the model's additions go after it.
-                val negative = args.optString("negative").trim().takeIf { it.isNotEmpty() && gen.negativeDefault != null }
-                    ?.let { listOf(gen.negativeDefault.orEmpty(), it).filter(String::isNotBlank).joinToString(", ") }
-                params = createParams(CreateOptions(gen, aspect = aspect, negative = negative), prompt)
+            "music" -> {
+                gen = gens.firstOrNull { it.mode == "music" } ?: return missing("music")
+                val seconds = args.optInt("seconds").takeIf { it > 0 }?.coerceIn(10, gen.maxSeconds) ?: minOf(60, gen.maxSeconds)
+                params = createParams(CreateOptions(gen, seconds = seconds, lyrics = songLyrics(args.optString("lyrics"))), prompt)
+            }
+            // A picture brought to life: made only after the user says yes, since it takes minutes (see answerVideo).
+            "video" -> {
+                gen = videoGenerator(gens) ?: return missing("video")
+                val seconds = args.optInt("seconds").takeIf { it > 0 }?.coerceIn(1, gen.maxSeconds) ?: gen.defaultSeconds
+                val motion = args.optString("motion").trim().ifEmpty { prompt }
+                params = createParams(CreateOptions(gen, seconds = seconds), motion).put("picture", args.toString())
+                ask = true
+            }
+            else -> {
+                val (picture, pictureParams) = pictureJob(chat, persona, args) ?: return missing("picture")
+                gen = picture
+                params = pictureParams
             }
         }
         params.put("auto", true)
-        createMedia(gen.name, params, call, label)
+        createMedia(gen.name, params, call, label, ask = ask)
+    }
+
+    /**
+     * ACE-Step reads section labels only as [verse], [chorus] and so on; models often write "(Verse 1)" or
+     * "Chorus:", which would be sung as words.
+     */
+    private fun songLyrics(text: String): String {
+        val label = Regex("""^\s*[\[(]?\s*(verse|chorus|pre-chorus|bridge|intro|outro|hook|interlude)\s*\d*\s*[\])]?\s*:?\s*$""", RegexOption.IGNORE_CASE)
+        return text.lines().joinToString("\n") { line ->
+            label.find(line)?.let { "[${it.groupValues[1].lowercase()}]" } ?: line
+        }.trim()
+    }
+
+    /** Videos from the chat bring a picture to life: Wan 14B, or another video model that takes a picture. */
+    private fun videoGenerator(gens: List<Generator>) =
+        gens.firstOrNull { it.id == "wan-14b" } ?: gens.firstOrNull { it.kind == "video" && it.image != "none" }
+
+    /** The picture job for the model's request: an edit of the character's face or the last picture, or a new one. */
+    private fun pictureJob(chat: Chat, persona: Persona, args: JSONObject): Pair<Generator, JSONObject>? {
+        val gens = _state.value.generators
+        val prompt = args.optString("prompt").trim()
+        val pictures = gens.filter { it.kind == "image" && it.mode == "create" }
+        val face = faceOf(chat, persona)
+        val editGen = gens.firstOrNull { it.id == "qwen-edit" } ?: gens.firstOrNull { it.kind == "image" && it.mode == "edit" }
+        val lastPicture = chat.messages.lastOrNull { m -> m.attachments.any { it.isImage } }?.attachments?.lastOrNull { it.isImage }?.path
+        // A picture of the character starts from its face, so it looks like the same person every time.
+        val source = when {
+            editGen == null -> null
+            args.optString("start_from") == "last_picture" && lastPicture != null -> lastPicture
+            args.optBoolean("shows_you") && face != null -> face
+            else -> null
+        }
+        if (source != null && editGen != null) {
+            val text = if (source == face) "A new photo of the same person as in the picture, with exactly the same face, hair, " +
+                "skin tone and build. $prompt" else prompt
+            return editGen to createParams(CreateOptions(editGen), text).put("source", source)
+        }
+        val gen = pictures.firstOrNull { it.id == args.optString("generator") } ?: pictures.firstOrNull { it.id == "z-image" }
+            ?: pictures.firstOrNull() ?: return null
+        val aspect = args.optString("aspect").takeIf { it in gen.aspects } ?: gen.aspects.firstOrNull { it == "3:4" } ?: gen.aspects.firstOrNull().orEmpty()
+        // The workflow's own "avoid" list stays; the model's additions go after it.
+        val negative = args.optString("negative").trim().takeIf { it.isNotEmpty() && gen.negativeDefault != null }
+            ?.let { listOf(gen.negativeDefault.orEmpty(), it).filter(String::isNotBlank).joinToString(", ") }
+        return gen to createParams(CreateOptions(gen, aspect = aspect, negative = negative), prompt)
     }
 
     /** "Edit and make again": the model's request is made again with the prompt the user changed, as a new reply. */
@@ -1056,6 +1300,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val args = runCatching { JSONObject(call.arguments) }.getOrDefault(JSONObject()).put("prompt", prompt.trim())
         val chat = _state.value.current
         createFromTool(chat.id, ToolCall("call_${newId().take(8)}", call.name, args.toString()), personaOf(chat) ?: Personas.builtIn.first())
+        // Asking for it again is the yes a video would otherwise wait for.
+        _state.value.current.messages.lastOrNull()?.takeIf { it.media?.ask == true }?.let { answerVideo(it, yes = true) }
     }
 
     /** "Use as face": this picture becomes the character's face in this chat. */
@@ -1239,6 +1485,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val kept = history.mapNotNull { m ->
             when {
                 byModel(m) -> m
+                tools && m.media?.params?.contains("\"for_video\"") == true -> null
                 m.role == Role.USER || m.content.isNotEmpty() -> m
                 m.media != null && m.attachments.isNotEmpty() -> {
                     val what = m.attachments.first().let { if (it.isVideo) "a video" else if (it.isAudio) "a sound clip" else "an image" }
@@ -1289,14 +1536,23 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     /** What the model is told about something it asked for. */
     private fun creationResult(m: Message, shown: Boolean): String {
-        val what = m.attachments.firstOrNull()?.let { if (it.isAudio) "voice message" else if (it.isVideo) "video" else "picture" }
+        val speech = _state.value.generators.firstOrNull { it.id == m.media?.generator }?.mode == "speech" || m.media?.generator == "chatterbox"
+        val what = m.attachments.firstOrNull()?.let {
+            if (it.isAudio) (if (speech) "voice message" else "music") else if (it.isVideo) "video" else "picture"
+        }
+        val declined = m.media?.params?.let { p -> runCatching { JSONObject(p).optBoolean("declined") }.getOrDefault(false) } == true
         return when {
+            m.media?.ask == true -> "The user is being asked whether to make this video now (it takes a few minutes on their PC). " +
+                "Don't ask for it again; carry on the conversation."
+            declined -> "The user said not now to the video, so it wasn't made. Don't make it again unless they ask; carry on."
             what == null && m.stopped -> "The user stopped it before it was made."
             what == null -> "It couldn't be made: ${m.error ?: "unknown error"}"
             what == "picture" && shown -> "Sent the picture to the user (made with ${m.model}); they're looking at it now. " +
                 "If it clearly doesn't show what you meant, you may call create once more with a better prompt. " +
                 "Otherwise carry on the conversation naturally, consistent with what the picture shows; don't describe it at length."
             what == "picture" -> "Sent the picture to the user (made with ${m.model} from your prompt). Carry on the conversation naturally."
+            what == "video" -> "Sent the video to the user: the picture from your prompt, brought to life. Carry on the conversation naturally."
+            what == "music" -> "Sent the music to the user. Carry on the conversation naturally."
             // Without this a model answers every later message with another voice message, copying its own last turns.
             else -> "Sent the $what to the user. Carry on the conversation naturally; your next messages are text again, " +
                 "unless the user asks for another $what or the moment really calls for one."
@@ -1387,6 +1643,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     override fun onCleared() {
         tts?.shutdown()
         runCatching { connectivity?.unregisterNetworkCallback(networkWatch) }
+        // The app was closed: its work stops with it (a job on the PC is picked up again when it's opened).
+        WorkService.update(getApplication(), null)
+        WorkService.onStopTapped = null
     }
 }
 

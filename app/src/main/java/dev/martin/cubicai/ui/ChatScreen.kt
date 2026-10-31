@@ -274,6 +274,9 @@ private fun MessageList(state: UiState, vm: ChatViewModel) {
                             // A face only means something for a character; a chat without a behaviour has none.
                             onUseAsFace = if (state.current.personaId == Personas.NONE) null else ({ vm.useAsFace(message) }),
                             onEditPrompt = { vm.remakeWithPrompt(message, it) },
+                            onAnswerVideo = { vm.answerVideo(message, it) },
+                            thoughtsOpen = state.settings.thoughtsOpen,
+                            onThoughtsToggle = vm::setThoughtsOpen,
                         )
                     }
                 }
