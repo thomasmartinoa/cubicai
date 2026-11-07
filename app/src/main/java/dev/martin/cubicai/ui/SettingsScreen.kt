@@ -144,7 +144,7 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
                 }
             }
 
-            if (s.isPaired) {
+            if (s.isPaired || s.key(Providers.XAI).isNotBlank()) {
                 SectionTitle("Voice calls")
                 SettingsCard {
                     var voices by remember { mutableStateOf(false) }

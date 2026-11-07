@@ -40,6 +40,7 @@ import dev.martin.cubicai.net.ModelInfo
 import dev.martin.cubicai.net.StreamEvent
 import dev.martin.cubicai.net.Tools
 import dev.martin.cubicai.net.VideoGoneException
+import dev.martin.cubicai.net.GROK_VOICE_MODEL
 import dev.martin.cubicai.net.cancelMedia
 import dev.martin.cubicai.net.downloadMedia
 import dev.martin.cubicai.net.followMedia
@@ -192,7 +193,21 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         override fun heard(text: String, frame: Bitmap?, cutTurn: Int?, heard: String) = heardInCall(text, frame, cutTurn, heard)
         override fun checkIn(quietSeconds: Int, frame: Bitmap?) = checkInFromCall(quietSeconds, frame)
         override val replying get() = textReplying
+        override fun pcReachable(): Boolean {
+            val s = _state.value.settings
+            val links = client.links?.invoke() ?: return true
+            return s.baseUrls(Providers.LOCAL).any(links::canReach)
+        }
+        override fun grokInstructions() = grokInstructionsFor(_state.value.current)
+        override fun grokHeard(text: String) = grokHeardInCall(text)
+        override fun grokReplyStart() = grokReplyStarted()
+        override fun grokReplyText(delta: String) = grokReplyDelta(delta)
+        override fun grokReplyEnd(cut: Boolean) = grokReplyEnded(cut)
     })
+
+    /** In a Grok call: the reply being said (still coming in, or said last), in the open chat. */
+    private var grokReplyId: String? = null
+    private var grokReplyOpen = false
 
     /** Full-size camera shots land here first; only the downscaled copy is kept. */
     private val cameraDir = File(app.cacheDir, "camera")
@@ -1027,11 +1042,19 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
      */
     fun startCall() {
         val s = _state.value.settings
-        if (!s.isPaired) {
-            showNotice("Calls need your PC to listen and speak: pair it in Settings → Local PC.")
+        val grok = call.wouldUseGrok(s)
+        if (grok && s.key(Providers.XAI).isBlank()) {
+            showNotice("Grok calls need your xAI API key: add it in Settings → Grok.")
             return
         }
-        if (s.model(s.provider).isBlank()) {
+        if (!grok && !s.isPaired) {
+            showNotice(
+                if (s.key(Providers.XAI).isBlank()) "Calls need your PC to listen and speak (pair it in Settings → Local PC), or an xAI key to call Grok."
+                else "Calls need your PC to listen and speak: pair it in Settings → Local PC, or switch calls to Grok in Settings → Voice calls.",
+            )
+            return
+        }
+        if (!grok && s.model(s.provider).isBlank()) {
             showNotice("Pick a model first (tap the model name at the top).")
             return
         }
@@ -1088,6 +1111,83 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 toldStillMaking = true
             } else complete()
         }
+    }
+
+    // --- Grok calls: Grok listens, answers and speaks; the chat keeps what was said ---
+
+    /** The behaviour, how to talk on a call, and the chat so far (Grok's session starts without it). */
+    private fun grokInstructionsFor(chat: Chat): String {
+        val settings = _state.value.settings
+        val persona = settings.personas.firstOrNull { it.id == chat.personaId } ?: Personas.builtIn.first()
+        val system = buildApiMessages(settings, persona, emptyList(), tools = false, sees = false, call = "")
+            .firstOrNull { it.role == "system" }?.text.orEmpty()
+        val lines = chat.messages.filter { it.content.isNotBlank() && it.media == null }.map { m ->
+            val who = if (m.role == Role.USER) "User" else "You"
+            "$who: ${m.content.trim().let { if (it.length > 600) it.take(600) + "…" else it }}"
+        }
+        // The latest of it, within about 8000 characters.
+        val recent = ArrayDeque<String>()
+        var size = 0
+        for (line in lines.asReversed()) {
+            if (size + line.length > 8000) break
+            recent.addFirst(line)
+            size += line.length
+        }
+        return buildString {
+            append(system)
+            if (recent.isNotEmpty()) {
+                append("\n\nThe conversation so far in this chat (typed or said), oldest first. Carry on from it:\n")
+                append(recent.joinToString("\n"))
+            }
+        }
+    }
+
+    private fun grokHeardInCall(text: String) {
+        val chatId = _state.value.current.id
+        val message = Message(role = Role.USER, content = text, spoken = true)
+        mutateChat(chatId) { c ->
+            // Grok may start answering before its transcript of the question is done: the question goes first.
+            val open = grokReplyId?.takeIf { grokReplyOpen }
+            val at = c.messages.indexOfFirst { it.id == open }
+            c.copy(
+                title = if (c.messages.isEmpty()) titleFor(message) else c.title,
+                messages = if (at >= 0) c.messages.take(at) + message + c.messages.drop(at) else c.messages + message,
+                updatedAt = System.currentTimeMillis(),
+            )
+        }
+        _state.update { s -> if (s.chats.any { it.id == chatId }) s else s.copy(chats = listOf(s.current) + s.chats) }
+        persist(chatId)
+    }
+
+    private fun grokReplyStarted() {
+        val chatId = _state.value.current.id
+        val persona = personaOf(_state.value.current) ?: Personas.builtIn.first()
+        val reply = Message(role = Role.ASSISTANT, model = GROK_VOICE_MODEL, persona = persona.name.takeIf { persona.id != Personas.NONE }, spoken = true)
+        grokReplyId = reply.id
+        grokReplyOpen = true
+        mutateChat(chatId) { c -> c.copy(messages = c.messages + reply, updatedAt = System.currentTimeMillis()) }
+        _state.update { s -> if (s.chats.any { it.id == chatId }) s else s.copy(chats = listOf(s.current) + s.chats) }
+    }
+
+    private fun grokReplyDelta(delta: String) {
+        val id = grokReplyId?.takeIf { grokReplyOpen } ?: return
+        updateMessage(_state.value.current.id, id) { it.copy(content = it.content + delta) }
+    }
+
+    private fun grokReplyEnded(cut: Boolean) {
+        val id = grokReplyId ?: return
+        grokReplyOpen = false
+        val chatId = _state.value.current.id
+        mutateChat(chatId) { c ->
+            val reply = c.messages.firstOrNull { it.id == id } ?: return@mutateChat c
+            when {
+                reply.content.isBlank() -> c.copy(messages = c.messages.filter { it.id != id })
+                // Talked over: marked the way the model's own replies are, so Grok sees where it was cut.
+                cut && !reply.content.endsWith("—") -> c.copy(messages = c.messages.map { if (it.id == id) it.copy(content = it.content.trimEnd() + " —") else it })
+                else -> c
+            }
+        }
+        persist(chatId)
     }
 
     /** The user has been quiet: the model may say something (with what the camera or screen shows now). */

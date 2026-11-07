@@ -423,6 +423,7 @@ private fun Suggestions(prompts: List<String>, onClick: (String) -> Unit) {
 
 @Composable
 private fun Composer(state: UiState, vm: ChatViewModel, onCreate: () -> Unit) {
+    val inCall = vm.call.state.collectAsStateWithLifecycle().value.active
     val context = LocalContext.current
     var attachMenu by remember { mutableStateOf(false) }
     var cameraUri by rememberSaveable { mutableStateOf<Uri?>(null) }
@@ -570,8 +571,8 @@ private fun Composer(state: UiState, vm: ChatViewModel, onCreate: () -> Unit) {
                         1 -> FilledIconButton(onClick = { vm.send() }, shape = MaterialTheme.shapes.small) { Icon(Icons.Rounded.ArrowUpward, "Send") }
                         else -> Row {
                             IconButton(onClick = ::launchSpeech) { Icon(Icons.Rounded.Mic, "Voice input") }
-                            // A live voice call with the model, through the PC.
-                            if (state.settings.isPaired && !vm.call.active) CallStartButton(vm)
+                            // A live voice call: through the PC, or with Grok's own voice.
+                            if ((state.settings.isPaired || state.settings.key(Providers.XAI).isNotBlank()) && !inCall) CallStartButton(vm)
                         }
                     }
                 }

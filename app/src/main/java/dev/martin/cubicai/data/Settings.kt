@@ -137,7 +137,10 @@ data class Settings(
     val lastCreate: String = "",
     /** Whether a reply's thinking is shown open: the user's last choice, or null to open it only while the model thinks. */
     val thoughtsOpen: Boolean? = null,
-    /** Voice calls: the voice each behaviour speaks with (behaviour id → PC voice id), when not its own suggestion. */
+    /**
+     * Voice calls: the voice each behaviour speaks with, when not its own suggestion (behaviour id → PC voice id,
+     * and "grok:" + behaviour id → Grok voice id).
+     */
     val callVoices: Map<String, String> = emptyMap(),
     val callSpeed: Float = 1.0f,
     /** The voice speaks up after a quiet spell, after [callCheckInSeconds]. */
@@ -149,6 +152,8 @@ data class Settings(
     /** How long a pause ends what you're saying, in ms. */
     val callPatience: Int = 600,
     val callSpeaker: Boolean = true,
+    /** Who listens and speaks in calls: [CALL_AUTO] (the PC when it can be reached, else Grok), [CALL_PC] or [CALL_GROK]. */
+    val callEngine: String = CALL_AUTO,
 ) {
     val provider get() = Providers.get(providerId)
 
@@ -158,6 +163,10 @@ data class Settings(
 
     /** The voice a behaviour speaks with in a call: the user's pick, else its own, else the first one. */
     fun callVoice(persona: Persona) = callVoices[persona.id]?.takeIf { it.isNotBlank() } ?: persona.voice.ifBlank { DEFAULT_VOICE }
+
+    /** The Grok voice a behaviour speaks with: the user's pick, else one of the same gender as its PC voice. */
+    fun grokVoice(persona: Persona) = callVoices["grok:" + persona.id]?.takeIf { it.isNotBlank() }
+        ?: dev.martin.cubicai.net.grokDefaultVoice(persona.voice.ifBlank { DEFAULT_VOICE })
 
     fun key(p: Provider) = apiKeys[p.id].orEmpty()
 
@@ -182,6 +191,9 @@ data class Settings(
 }
 
 const val DEFAULT_VOICE = "af_heart"
+const val CALL_AUTO = "auto"
+const val CALL_PC = "pc"
+const val CALL_GROK = "grok"
 
 /** Contents of the QR code / link shown by CubicAI Server → Pair. */
 data class Pairing(val url: String, val remoteUrl: String, val token: String, val fingerprint: String) {
@@ -236,6 +248,7 @@ class SettingsStore(context: Context) {
         callCaptions = prefs.getBoolean("call_captions", true),
         callPatience = prefs.getInt("call_patience", 600),
         callSpeaker = prefs.getBoolean("call_speaker", true),
+        callEngine = prefs.getString("call_engine", CALL_AUTO) ?: CALL_AUTO,
     )
 
     fun save(s: Settings) = prefs.edit {
@@ -265,6 +278,7 @@ class SettingsStore(context: Context) {
         putBoolean("call_captions", s.callCaptions)
         putInt("call_patience", s.callPatience)
         putBoolean("call_speaker", s.callSpeaker)
+        putString("call_engine", s.callEngine)
     }
 
     private fun personasToJson(list: List<Persona>) = JSONArray(list.map {

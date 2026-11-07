@@ -3,13 +3,20 @@ package dev.martin.cubicai.call
 import android.app.Application
 import android.content.Intent
 import android.graphics.Bitmap
+import android.util.Base64
+import dev.martin.cubicai.data.CALL_AUTO
+import dev.martin.cubicai.data.CALL_GROK
+import dev.martin.cubicai.data.CALL_PC
 import dev.martin.cubicai.data.Persona
 import dev.martin.cubicai.data.Providers
 import dev.martin.cubicai.data.Settings
 import dev.martin.cubicai.net.CallRefused
+import dev.martin.cubicai.net.GrokVoice
 import dev.martin.cubicai.net.LlmClient
 import dev.martin.cubicai.net.VoiceInfo
 import dev.martin.cubicai.net.VoiceLink
+import dev.martin.cubicai.net.grokSession
+import dev.martin.cubicai.net.grokTurnUpdate
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -53,6 +60,8 @@ data class CallState(
     val voices: List<VoiceInfo> = emptyList(),
     /** The chat is shown, with the call in a bar on top. */
     val minimized: Boolean = false,
+    /** Grok's realtime voice is on the other end (listening, answering and speaking itself), not the PC. */
+    val grok: Boolean = false,
 )
 
 /** What a call needs from the chat. */
@@ -72,11 +81,30 @@ interface CallHost {
 
     /** A reply is being written. */
     val replying: Boolean
+
+    /** The PC can be reached on this network now (home Wi-Fi, or Tailscale with remote access). */
+    fun pcReachable(): Boolean
+
+    // A Grok call: Grok answers by itself; the chat only keeps what was said.
+
+    /** What Grok is told: the behaviour, how to talk on a call, and the chat so far. */
+    fun grokInstructions(): String
+
+    /** The user said [text] (Grok's transcript of it). */
+    fun grokHeard(text: String)
+
+    /** Grok starts a reply; its words follow in [grokReplyText]. */
+    fun grokReplyStart()
+    fun grokReplyText(delta: String)
+
+    /** The reply is over; [cut] when the user talked over it. */
+    fun grokReplyEnd(cut: Boolean)
 }
 
 /**
  * A live voice call. The PC listens and speaks (VoiceLink); the reply itself is written by the chat (CallHost),
- * which hands its words to [onReplyText] as they stream in. Everything said lands in the chat.
+ * which hands its words to [onReplyText] as they stream in. Or Grok's realtime voice does all three (GrokVoice),
+ * away from home too. Everything said lands in the chat.
  */
 class CallController(
     private val app: Application,
@@ -90,6 +118,14 @@ class CallController(
 
     private val audio = CallAudio(app)
     private val link = VoiceLink(client)
+    private val grok = GrokVoice(client)
+    private var grokVoicesCache: List<VoiceInfo> = emptyList()
+    /** Grok's reply being said: its turn (for the audio queue), and whether it's still coming in. */
+    @Volatile private var grokTurn = 0
+    @Volatile private var grokResponding = false
+    /** The reply was talked over (its rest is dropped). */
+    private var grokCut = false
+    private var grokTurnSent = false
     val micLevel get() = audio.micLevel
     val voiceLevel get() = audio.voiceLevel
 
@@ -119,15 +155,58 @@ class CallController(
         }
     }
 
+    private val grokListener = object : GrokVoice.Listener {
+        // The audio queue is fed on the socket's thread, in order; the rest goes to the main thread.
+        override fun onEvent(event: JSONObject) {
+            when (event.optString("type")) {
+                "response.created" -> {
+                    grokTurn = ++turn
+                    grokResponding = true
+                    audio.sentence(grokTurn, "")
+                }
+                "response.output_audio.delta", "response.audio.delta" -> {
+                    val pcm = runCatching { Base64.decode(event.optString("delta"), Base64.DEFAULT) }.getOrNull()
+                    if (pcm != null && pcm.isNotEmpty()) audio.pcm(pcm)
+                    return
+                }
+                "response.done" -> {
+                    grokResponding = false
+                    audio.turnEnd(grokTurn)
+                }
+            }
+            scope.launch(Dispatchers.Main) { handleGrok(event) }
+        }
+
+        override fun onClosed(error: String?) {
+            scope.launch(Dispatchers.Main) { if (active && error != null) reconnect(error) }
+        }
+    }
+
+    private val isGrok get() = _state.value.grok
+
+    /** Whether a call started now goes to Grok: by the setting, and for Auto, whether the PC can be reached. */
+    fun wouldUseGrok(s: Settings = host.callSettings()): Boolean = when (s.callEngine) {
+        CALL_GROK -> true
+        CALL_PC -> false
+        else -> s.key(Providers.XAI).isNotBlank() && (!s.isPaired || !host.pcReachable())
+    }
     fun start() {
         if (active) return
         val s = host.callSettings()
-        if (!s.isPaired) {
+        val useGrok = wouldUseGrok(s)
+        if (useGrok && s.key(Providers.XAI).isBlank()) {
+            _state.value = CallState(error = "Add your xAI API key in Settings → Grok to call Grok.")
+            return
+        }
+        if (!useGrok && !s.isPaired) {
             _state.value = CallState(error = "Pair with your PC first: Settings → Local PC.")
             return
         }
         val speaker = s.callSpeaker && !audio.headsetConnected()
-        _state.value = CallState(active = true, startedAt = System.currentTimeMillis(), speaker = speaker, status = "Calling your PC…")
+        _state.value = CallState(
+            active = true, startedAt = System.currentTimeMillis(), speaker = speaker, grok = useGrok,
+            status = if (useGrok) "Calling Grok…" else "Calling your PC…",
+        )
         ready = false
         checkIns = 0
         CallService.onAction = { action ->
@@ -140,7 +219,7 @@ class CallController(
         }
         CallService.onScreenEnded = { scope.launch(Dispatchers.Main) { _state.update { it.copy(screen = false) } } }
         CallService.start(app, title(), CallPhase.CONNECTING.label)
-        audio.onMic = { pcm, n -> if (ready) link.sendAudio(pcm, n) }
+        audio.onMic = { pcm, n -> if (ready) if (isGrok) grok.sendAudio(pcm, n) else link.sendAudio(pcm, n) }
         audio.onSentence = { t, text -> scope.launch(Dispatchers.Main) { if (t == turn) setPhase(CallPhase.SPEAKING, them = text) } }
         audio.onTurnPlayed = { t ->
             scope.launch(Dispatchers.Main) {
@@ -150,10 +229,10 @@ class CallController(
                 }
             }
         }
-        audio.onPlaying = { on -> link.send(JSONObject().put("type", "playing").put("on", on)) }
+        audio.onPlaying = { on -> if (!isGrok) link.send(JSONObject().put("type", "playing").put("on", on)) }
         audio.start(speaker)
         connect(first = true)
-        loadVoices()
+        if (!useGrok) loadVoices()
     }
 
     fun end() {
@@ -161,6 +240,8 @@ class CallController(
         checkInJob?.cancel()
         connectJob?.cancel()
         link.close()
+        grok.close()
+        grokResponding = false
         audio.stop()
         CallService.stopSharing(app)
         CallService.stop(app)
@@ -179,16 +260,28 @@ class CallController(
             while (active) {
                 try {
                     val s = host.callSettings()
-                    link.connect(s.baseUrls(Providers.LOCAL), s.key(Providers.LOCAL), s.localFingerprint, listener)
-                    sendConfig("start")
+                    if (isGrok) {
+                        grokTurnSent = false
+                        grok.connect(s.key(Providers.XAI), grokListener)
+                        grok.send(grokConfig())
+                    } else {
+                        link.connect(s.baseUrls(Providers.LOCAL), s.key(Providers.LOCAL), s.localFingerprint, listener)
+                        sendConfig("start")
+                    }
                     return@launch
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
+                    // Auto: the PC isn't answering, so Grok takes the call instead.
+                    val s = host.callSettings()
+                    if (!isGrok && first && s.callEngine == CALL_AUTO && s.key(Providers.XAI).isNotBlank()) {
+                        _state.update { it.copy(grok = true, status = "Your PC didn't answer. Calling Grok…") }
+                        continue
+                    }
                     attempt++
                     // The PC said no (not set up for calls): no point trying again. A network failure is retried.
                     if (e is CallRefused || (first && attempt >= 3) || attempt > 12) {
-                        fail(e.message ?: "Couldn't reach your PC.")
+                        fail(e.message ?: if (isGrok) "Couldn't reach Grok." else "Couldn't reach your PC.")
                         return@launch
                     }
                     _state.update { it.copy(status = "${e.message} Trying again…", phase = CallPhase.CONNECTING) }
@@ -200,7 +293,11 @@ class CallController(
 
     private fun reconnect(why: String) {
         ready = false
-        _state.update { it.copy(phase = CallPhase.CONNECTING, status = "Lost your PC, reconnecting… ($why)") }
+        if (isGrok) {
+            grokResponding = false
+            audio.flush(turn, turn)
+        }
+        _state.update { it.copy(phase = CallPhase.CONNECTING, status = if (it.grok) "Lost Grok, reconnecting… ($why)" else "Lost your PC, reconnecting… ($why)") }
         connect(first = false)
     }
 
@@ -220,7 +317,111 @@ class CallController(
             .onSuccess { (voices, _) -> _state.update { it.copy(voices = voices) } }
     }
 
+    /** Grok's session: who it is (and the chat so far), its voice, and when it speaks up by itself. */
+    private fun grokConfig(): JSONObject {
+        val s = host.callSettings()
+        return grokSession(host.grokInstructions(), s.grokVoice(host.callPersona()), s.callSpeed, s.webSearch, grokCheckIn(s))
+    }
+
+    /** Check-ins: Grok speaks up after this long a silence (it re-arms after each reply by itself). */
+    private fun grokCheckIn(s: Settings): Int? = if (s.callCheckIns && !_state.value.muted) s.callCheckInSeconds * 1000 else null
+
+    private fun handleGrok(event: JSONObject) {
+        if (!active || !isGrok) return
+        when (val type = event.optString("type")) {
+            "session.updated" -> if (!ready) {
+                ready = true
+                _state.update { it.copy(status = null) }
+                if (_state.value.phase == CallPhase.CONNECTING) setPhase(CallPhase.LISTENING)
+                if (!grokTurnSent) {
+                    grokTurnSent = true
+                    grok.send(grokTurnUpdate(host.callSettings().callPatience, grokCheckIn(host.callSettings())))
+                }
+            }
+            "error" -> {
+                val e = event.optJSONObject("error")
+                val message = e?.optString("message").orEmpty().ifBlank { event.optString("message") }
+                // The pause length is OpenAI's field name; if xAI doesn't take it, its own default stays.
+                if ("silence_duration" in message || "no active response" in message.lowercase() || "cancel" in message.lowercase()) return
+                android.util.Log.w("CubicAI", "Grok call: ${e?.optString("code")} $message")
+                if (!ready) fail("Grok couldn't start the call: $message")
+                else showStatus("Grok: $message")
+            }
+            "input_audio_buffer.speech_started" -> {
+                if (_state.value.phase != CallPhase.HEARING && (grokResponding || audio.busy)) {
+                    // Talked over: the rest of the reply isn't said.
+                    grokCut = true
+                    audio.flush(grokTurn, grokTurn)
+                    if (grokResponding) grok.send(JSONObject().put("type", "response.cancel"))
+                    if (!grokResponding) host.grokReplyEnd(cut = true)
+                }
+                setPhase(CallPhase.HEARING, you = "")
+            }
+            "input_audio_buffer.speech_stopped" -> if (_state.value.phase == CallPhase.HEARING) {
+                setPhase(CallPhase.THINKING)
+                // A noise xAI first took for speech gets no reply: back to listening when none comes.
+                scope.launch {
+                    delay(6000)
+                    if (active && isGrok && !grokResponding && !audio.busy && _state.value.phase == CallPhase.THINKING) setPhase(CallPhase.LISTENING)
+                }
+            }
+            "conversation.item.input_audio_transcription.updated", "conversation.item.input_audio_transcription.delta" -> {
+                val text = event.optString("transcript").ifBlank { event.optString("delta") }
+                if (text.isNotBlank() && _state.value.phase == CallPhase.HEARING) _state.update { it.copy(you = text) }
+            }
+            "conversation.item.input_audio_transcription.completed" -> {
+                val text = event.optString("transcript").trim()
+                if (text.isNotEmpty()) {
+                    _state.update { it.copy(you = text) }
+                    host.grokHeard(text)
+                }
+            }
+            "response.created" -> {
+                grokCut = false
+                host.grokReplyStart()
+                _state.update { it.copy(them = "", working = null) }
+                if (_state.value.phase != CallPhase.HEARING) setPhase(CallPhase.THINKING)
+            }
+            "response.output_audio_transcript.delta", "response.audio_transcript.delta", "response.output_text.delta", "response.text.delta" -> {
+                val delta = event.optString("delta")
+                if (delta.isEmpty() || grokCut) return
+                host.grokReplyText(delta)
+                _state.update { it.copy(them = it.them + delta, working = null) }
+                if (_state.value.phase == CallPhase.THINKING) setPhase(CallPhase.SPEAKING)
+            }
+            "response.done" -> {
+                val status = event.optJSONObject("response")?.optString("status").orEmpty()
+                host.grokReplyEnd(cut = grokCut || status == "cancelled")
+                grokCut = false
+                _state.update { it.copy(working = null) }
+                // Nothing was said (or it was all cut): back to listening when it's quiet.
+                scope.launch {
+                    delay(1200)
+                    if (active && !grokResponding && !audio.busy && _state.value.phase in listOf(CallPhase.THINKING, CallPhase.SPEAKING)) setPhase(CallPhase.LISTENING)
+                }
+            }
+            else -> if ("search" in type && ("progress" in type || "searching" in type || "added" in type)) {
+                _state.update { it.copy(working = if ("x_search" in type) "Searching X" else "Searching the web") }
+            } else if (type == "response.output_item.added") {
+                val item = event.optJSONObject("item")?.optString("type").orEmpty()
+                if ("search" in item) _state.update { it.copy(working = if ("x_search" in item) "Searching X" else "Searching the web") }
+            }
+        }
+    }
+
+    private fun showStatus(text: String) {
+        _state.update { it.copy(status = text) }
+        scope.launch {
+            delay(5000)
+            if (_state.value.status == text) _state.update { it.copy(status = null) }
+        }
+    }
+
     private fun sendConfig(type: String) {
+        if (isGrok) {
+            if (type == "config") grok.send(grokConfig())
+            return
+        }
         val s = host.callSettings()
         link.send(
             JSONObject().put("type", type)
@@ -298,6 +499,7 @@ class CallController(
 
     private fun armCheckIn() {
         checkInJob?.cancel()
+        if (isGrok) return // Grok speaks up by itself (idle_timeout_ms)
         val s = host.callSettings()
         if (!s.callCheckIns || checkIns >= MAX_CHECK_INS || _state.value.muted) return
         val seconds = s.callCheckInSeconds
@@ -371,6 +573,7 @@ class CallController(
         val muted = !_state.value.muted
         audio.muted = muted
         _state.update { it.copy(muted = muted) }
+        if (isGrok && ready) grok.send(grokTurnUpdate(host.callSettings().callPatience, grokCheckIn(host.callSettings())))
         if (muted) checkInJob?.cancel() else if (_state.value.phase == CallPhase.LISTENING) armCheckIn()
         notifyPhase()
     }
@@ -404,7 +607,8 @@ class CallController(
 
     fun setVoice(voice: String) {
         val persona = host.callPersona()
-        host.updateCallSettings { it.copy(callVoices = it.callVoices + (persona.id to voice)) }
+        val key = if (voicesAreGrok()) "grok:" + persona.id else persona.id
+        host.updateCallSettings { it.copy(callVoices = it.callVoices + (key to voice)) }
         sendConfig("config")
     }
 
@@ -415,7 +619,7 @@ class CallController(
 
     fun setPatience(ms: Int) {
         host.updateCallSettings { it.copy(callPatience = ms) }
-        sendConfig("config")
+        if (isGrok && active) grok.send(grokTurnUpdate(ms, grokCheckIn(host.callSettings()))) else sendConfig("config")
     }
 
     /** The behaviour changed: its voice speaks from now on. */
@@ -425,12 +629,26 @@ class CallController(
         notifyPhase()
     }
 
+    /** The voice sheet lists Grok's voices: in a Grok call, or (outside one) when the next call would be Grok's. */
+    fun voicesAreGrok(): Boolean = if (active) isGrok else wouldUseGrok()
+
+    /** The chosen voice for the open behaviour, among the voices the sheet lists. */
+    fun chosenVoice(): String {
+        val s = host.callSettings()
+        return if (voicesAreGrok()) s.grokVoice(host.callPersona()) else s.callVoice(host.callPersona())
+    }
+
     suspend fun preview(voice: String): ByteArray {
         val s = host.callSettings()
+        if (voicesAreGrok()) return grok.preview(s.key(Providers.XAI), voice, s.callSpeed)
         return link.preview(s.baseUrls(Providers.LOCAL), s.key(Providers.LOCAL), s.localFingerprint, voice, s.callSpeed)
     }
 
     suspend fun voices(): List<VoiceInfo> {
+        if (voicesAreGrok()) {
+            grokVoicesCache.takeIf { it.isNotEmpty() }?.let { return it }
+            return grok.voices(host.callSettings().key(Providers.XAI)).also { grokVoicesCache = it }
+        }
         _state.value.voices.takeIf { it.isNotEmpty() }?.let { return it }
         val s = host.callSettings()
         val (voices, missing) = link.voices(s.baseUrls(Providers.LOCAL), s.key(Providers.LOCAL), s.localFingerprint)
@@ -445,7 +663,10 @@ class CallController(
         if (phase.label != before.label) notifyPhase()
     }
 
-    private fun title() = host.callPersona().let { if (it.id == "none") "On a call" else "On a call with ${it.name}" }
+    private fun title() = host.callPersona().let {
+        val who = if (it.id == "none") "On a call" else "On a call with ${it.name}"
+        if (_state.value.grok) "$who (Grok)" else who
+    }
 
     private fun notifyPhase() {
         if (!active) return

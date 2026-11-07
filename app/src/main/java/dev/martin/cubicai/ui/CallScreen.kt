@@ -111,6 +111,9 @@ import dev.martin.cubicai.ChatViewModel
 import dev.martin.cubicai.call.CallPhase
 import dev.martin.cubicai.call.CallState
 import dev.martin.cubicai.call.CameraFrames
+import dev.martin.cubicai.data.CALL_AUTO
+import dev.martin.cubicai.data.CALL_GROK
+import dev.martin.cubicai.data.CALL_PC
 import dev.martin.cubicai.data.Personas
 import dev.martin.cubicai.net.VoiceInfo
 import kotlinx.coroutines.Dispatchers
@@ -175,7 +178,8 @@ fun CallScreen(vm: ChatViewModel) {
                         style = MaterialTheme.typography.titleMedium, color = ink, maxLines = 1, overflow = TextOverflow.Ellipsis,
                     )
                     Text(
-                        listOfNotNull(
+                        if (call.grok) listOf(elapsed(call.startedAt), "Grok voice", "about \$0.08 a minute").joinToString(" · ")
+                        else listOfNotNull(
                             elapsed(call.startedAt),
                             displayModelName(state.settings.model(state.settings.provider)),
                             "free on your PC".takeIf { state.settings.provider == dev.martin.cubicai.data.Providers.LOCAL },
@@ -206,8 +210,9 @@ fun CallScreen(vm: ChatViewModel) {
                 horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
             ) {
                 CallChip(Icons.Rounded.Face, persona.name, onPicture, adult = persona.adult) { showBehaviour = true }
-                val voiceId = state.settings.callVoice(persona)
-                CallChip(Icons.Rounded.RecordVoiceOver, call.voices.firstOrNull { it.id == voiceId }?.name ?: "Voice", onPicture) { showVoices = true }
+                val voiceName = if (call.grok) state.settings.grokVoice(persona).replaceFirstChar { it.uppercase() }
+                else state.settings.callVoice(persona).let { id -> call.voices.firstOrNull { it.id == id }?.name ?: "Voice" }
+                CallChip(Icons.Rounded.RecordVoiceOver, voiceName, onPicture) { showVoices = true }
             }
 
             Row(
@@ -216,14 +221,15 @@ fun CallScreen(vm: ChatViewModel) {
                 verticalAlignment = Alignment.Top,
             ) {
                 CallButton(if (call.muted) Icons.Rounded.MicOff else Icons.Rounded.Mic, if (call.muted) "Unmute" else "Mute", on = call.muted, ink, onClick = vm.call::toggleMute)
-                CallButton(if (call.camera) Icons.Rounded.Videocam else Icons.Rounded.VideocamOff, "Video", on = call.camera, ink) {
+                // Grok's voice only hears: no camera or screen on its calls.
+                if (!call.grok) CallButton(if (call.camera) Icons.Rounded.Videocam else Icons.Rounded.VideocamOff, "Video", on = call.camera, ink) {
                     when {
                         call.camera -> vm.call.setCamera(false)
                         context.checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED -> vm.call.setCamera(true)
                         else -> cameraPermission.launch(Manifest.permission.CAMERA)
                     }
                 }
-                CallButton(
+                if (!call.grok) CallButton(
                     if (call.screen) Icons.AutoMirrored.Rounded.StopScreenShare else Icons.AutoMirrored.Rounded.ScreenShare,
                     "Screen", on = call.screen, ink,
                 ) {
@@ -452,18 +458,20 @@ private fun CameraPreview(back: Boolean, modifier: Modifier) {
 fun VoiceSheet(vm: ChatViewModel, onDismiss: () -> Unit) {
     val state by vm.state.collectAsStateWithLifecycle()
     val persona = state.settings.personas.firstOrNull { it.id == state.current.personaId } ?: Personas.builtIn.first()
-    val chosen = state.settings.callVoice(persona)
+    val grok = vm.call.voicesAreGrok()
+    val chosen = if (grok) state.settings.grokVoice(persona) else state.settings.callVoice(persona)
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var playing by remember { mutableStateOf<String?>(null) }
-    val voices by produceState<Result<List<VoiceInfo>>?>(null) { value = runCatching { vm.call.voices() } }
+    val voices by produceState<Result<List<VoiceInfo>>?>(null, grok) { value = runCatching { vm.call.voices() } }
 
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
         val edge = Modifier.padding(horizontal = 20.dp)
         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).navigationBarsPadding()) {
             Text("Voice", style = MaterialTheme.typography.titleLarge, modifier = edge)
             Text(
-                "How ${if (persona.id == Personas.NONE) "the assistant" else persona.name} sounds in calls. Each behaviour keeps its own. Tap ▶ to hear one.",
+                "How ${if (persona.id == Personas.NONE) "the assistant" else persona.name} sounds in ${if (grok) "Grok calls" else "calls with your PC"}. " +
+                    "Each behaviour keeps its own. Tap ▶ to hear one.",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = edge,
             )
             Spacer(Modifier.height(12.dp))
@@ -472,10 +480,10 @@ fun VoiceSheet(vm: ChatViewModel, onDismiss: () -> Unit) {
                 result == null -> Row(edge.padding(vertical = 16.dp), verticalAlignment = Alignment.CenterVertically) {
                     Cube(18.dp, spinning = true)
                     Spacer(Modifier.width(10.dp))
-                    Text("Asking your PC…", style = MaterialTheme.typography.bodyMedium)
+                    Text(if (grok) "Asking xAI…" else "Asking your PC…", style = MaterialTheme.typography.bodyMedium)
                 }
                 result.isFailure -> Text(
-                    result.exceptionOrNull()?.message ?: "Couldn't reach your PC.",
+                    result.exceptionOrNull()?.message ?: if (grok) "Couldn't reach xAI." else "Couldn't reach your PC.",
                     style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error, modifier = edge.padding(vertical = 16.dp),
                 )
                 else -> result.getOrThrow().groupBy { it.accent }.forEach { (accent, list) ->
@@ -496,7 +504,7 @@ fun VoiceSheet(vm: ChatViewModel, onDismiss: () -> Unit) {
                             )
                             Column(Modifier.weight(1f)) {
                                 Text(v.name, style = MaterialTheme.typography.titleSmall)
-                                Text("${v.about} · ${v.gender}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Text(listOf(v.about, v.gender).filter { it.isNotBlank() }.joinToString(" · "), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
                             IconButton(onClick = {
                                 playing = v.id
@@ -540,6 +548,19 @@ fun CallOptions(vm: ChatViewModel) {
     val shape = MaterialTheme.shapes.small
     fun toggle(value: Boolean, set: (Boolean) -> Unit) = Modifier.clip(shape).toggleable(value, role = Role.Switch) { set(it) }
 
+    Text("Calls go through", style = MaterialTheme.typography.bodyLarge)
+    Choice(listOf(CALL_AUTO to "Auto", CALL_PC to "Your PC", CALL_GROK to "Grok"), s.callEngine) { v ->
+        vm.updateSettings { it.copy(callEngine = v) }
+    }
+    Text(
+        when (s.callEngine) {
+            CALL_PC -> "Your PC listens and speaks, and the chat's model answers. Free; needs home Wi-Fi or Tailscale."
+            CALL_GROK -> "Grok's own voice listens, answers and speaks, anywhere. About \$0.08 a minute on your xAI key; it can't see your camera or screen."
+            else -> "Your PC when it can be reached, otherwise Grok's own voice (about \$0.08 a minute on your xAI key)."
+        },
+        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+
     SettingRow(
         "Check-ins",
         "When you go quiet, it speaks up with a question or a thought (twice at most, then it waits for you).",
@@ -552,7 +573,7 @@ fun CallOptions(vm: ChatViewModel) {
     }
     SettingRow(
         "Make things",
-        "Ask for a picture, a song or a video while you talk, and it's made on your PC.",
+        "Ask for a picture, a song or a video while you talk, and it's made on your PC (calls with your PC).",
         toggle(s.callMakesThings) { v -> vm.updateSettings { it.copy(callMakesThings = v) } },
     ) { CutSwitch(s.callMakesThings) }
     SettingRow(
