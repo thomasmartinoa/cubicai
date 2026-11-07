@@ -9,6 +9,13 @@ A personal Android AI chat app built with Kotlin and Jetpack Compose. It talks t
   <img src="docs/screenshots/models-light.png" width="200" alt="The model picker">
 </p>
 
+**Contents**
+- [Features](#features)
+- [Install the app](#install-the-app) · [Set up providers](#set-up-providers) · [Using the app](#using-the-app)
+- [Run your own models: the PC server](#run-your-own-models-the-pc-server): [install](#1-install-the-gateway) · [pair](#2-pair-your-phone) · [web search](#3-optional-web-search) · [away from home](#4-optional-use-your-pc-away-from-home-tailscale) · [create with ComfyUI](#5-optional-create-images-video-music-and-speech-comfyui) · [voice calls](#6-optional-voice-calls-on-your-pc) · [context length](#context-length)
+- [CubicAI Lab, the desktop app](#cubicai-lab-the-desktop-app)
+- [Build from source](#build-from-source) · [Troubleshooting](#troubleshooting)
+
 ## Features
 
 - **Streaming replies that fade in word by word**, with a "Thinking / Searching / Writing" status and the model's reasoning in a collapsible box that stays open or folded the way you last left it. Each reply shows how long it took.
@@ -63,6 +70,42 @@ Open **Settings** and fill in the providers you want. You can then switch betwee
 
 Keys are stored on the phone only, encrypted. They are never written to this repository.
 
+## Using the app
+
+**Chats and models**
+- **☰** opens your chats (search appears once you have a few); **New chat** starts one.
+- Tap the **model name** at the top to switch provider and model. Each chat keeps its own model and behaviour.
+- Long-press your message for **Copy** and **Edit & resend**. Under a reply: **Read aloud**, **Share**, copy and regenerate. Each reply shows its model and how long it took.
+- The **context meter** beside send shows how full the model's memory is; tap it for the numbers.
+- The model's **reasoning** sits in a fold above its reply. It opens by itself while the model thinks; once you open or fold one, every reply follows your choice.
+
+**Behaviours and characters**
+- Tap **Behaviour** in a chat to pick how the model acts: built-in ones (assistant styles and voice characters such as Friend, Therapist, Language tutor, Trivia host; the 18+ ones are marked), or **New behaviour** with your own **Instructions**.
+- **About you** (in the same sheet) is added to every behaviour except **None**, which sends no instructions at all.
+- A behaviour can be a **character**: **Looks** (what it looks like), a **face** picture and a **voice** sample (5–10 s), and **Sends on its own** (it may send pictures or voice messages unasked). **Character in this chat** shows the chat's own face and voice; **Save to <behaviour>** makes them the default.
+- Settings → **Behaviour** sets which one new chats start with.
+
+**Attachments**: the **+** button adds **Photos**, **Camera** shots or **Files**. Photos are downscaled; PDFs go as page images; other files as text.
+
+**Web search**: tap the **Search** chip under the message box. Answers show numbered **Sources** you can open. Works with Local PC (SearXNG on your PC), Grok and OpenRouter.
+
+**Making pictures, videos, music and voice**
+- **Create** chip (Local PC): pick a generator on your PC, then describe what you want ([details](#5-optional-create-images-video-music-and-speech-comfyui)).
+- **Image** / **Video** chips (Grok; Image also on Gemini with billing): made in the cloud, from your words or from attached photos.
+- Or just ask in the chat ("send me a photo of that", "say it as a voice message", "make a short video"): the model makes it itself ([details](#pictures-and-voice-messages-from-the-chat)).
+- Results have **Save** (to the phone's Pictures/Movies/Music `/CubicAI`), **Share** and **Regenerate**; **Use as face** sets a character's face.
+
+**Voice**
+- The **microphone** dictates a message; **Read aloud** under a reply speaks it with the phone's voice.
+- The **voice call** button (beside the microphone) starts a live call in the open chat with its behaviour. Talk naturally; talk over it to cut in. Everything said lands in the chat as messages.
+  - **Calls go through**: **Auto** (your PC when it can be reached, otherwise Grok), **Your PC** (free; home Wi-Fi or Tailscale; needs [voice setup](#6-optional-voice-calls-on-your-pc)) or **Grok** (works anywhere, about $0.08 a minute on your xAI key).
+  - During a call: **Mute**, **Camera** or **Screen** (the model sees what you show it; PC calls only), captions, **End**. Minimise it to keep chatting while it runs.
+  - **Call settings** (also in Settings → Voice calls): the voice for each behaviour, **Speaking speed**, how long a pause ends your turn, **Check-ins** (it speaks up when you go quiet), **Make things** (ask for pictures, songs or videos during a call), **Captions**.
+
+**Privacy and data** (Settings): **Privacy screen** blanks the app in recents and blocks screenshots; **Delete all chats** removes every conversation and attachment. API keys and the PC token never leave the phone except to the service they're for.
+
+The app keeps working in the background: a notification shows what's going on (with **Stop**) and tells you when it's done.
+
 ## Run your own models: the PC server
 
 A small gateway on your PC lets the phone use Ollama there without exposing Ollama itself. It is `cubicai-gateway`, part of [CubicAI Lab](https://github.com/thomasmartinoa/cubicai-lab) (the desktop companion app, a private repository):
@@ -87,7 +130,7 @@ phone ──TLS 1.3, pinned certificate, bearer token──► cubicai-gateway :
   - **Tailscale**, to use your PC away from home
   - **Avahi** (`avahi-daemon` running, plus `avahi-publish-service`, in `avahi` or `avahi-utils`), so the phone finds the PC again when the router gives it a new address
   - **ComfyUI** and an NVIDIA GPU (tested with 8 GB), for creating images, video, music and speech
-  - **espeak-ng**, for voice calls
+  - **espeak-ng** and `cubicai-gateway voice-setup`, for voice calls through your PC (step 6)
 
 ### 1. Install the gateway
 
@@ -230,9 +273,25 @@ cubicai-gateway install    # again, if ComfyUI came later: it also writes cubica
 
 The workflows are the ones saved in ComfyUI's `user/default/workflows`; the gateway's `crates/gateway/src/media.rs` lists which file each generator uses and which inputs it sets. A generator shows up in the app only when its workflow file and all its models are present.
 
+### 6. Optional: voice calls on your PC
+
+Calls through your PC run speech recognition and the voice on its CPU (Silero VAD, Parakeet, Kokoro), so Ollama keeps the GPU for the reply. Once:
+
+```sh
+sudo pacman -S espeak-ng            # or: sudo apt install espeak-ng / sudo dnf install espeak-ng
+cubicai-gateway voice-setup         # downloads the speech models and ONNX Runtime (~1 GB) to ~/.local/share/cubicai-server/voice
+systemctl --user restart cubicai-server
+```
+
+The models load on the first call (about 2 s) and unload after 15 minutes without one. The phone then lists the PC's voices under **Call settings → Voice**, with a preview.
+
 ### Context length
 
 Ollama defaults to a 4K context. The gateway asks for **16K** unless the model's Modelfile sets `num_ctx`, never more than the model supports. Change it in CubicAI Lab's Phone tab or with `"num_ctx"` in `~/.config/cubicai-server/settings.json`. The app reads the value and shows it in the context meter.
+
+## CubicAI Lab, the desktop app
+
+[CubicAI Lab](https://github.com/thomasmartinoa/cubicai-lab) (private) is the PC side: it builds and installs the gateway above and its **Phone** tab is the gateway's control panel (status, pairing QR, remote access, activity). It is also a desktop AI workbench: chat with the same behaviours, compare models in an Arena, run llama.cpp, look inside models, steer them, and fine-tune them on data you build. Its README has the setup and a guide to every tab.
 
 ## Build from source
 
