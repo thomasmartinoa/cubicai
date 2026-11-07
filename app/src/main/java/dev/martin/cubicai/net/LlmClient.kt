@@ -48,6 +48,12 @@ sealed interface StreamEvent {
 
 open class ApiException(message: String) : Exception(message)
 
+/** xAI answered with an error status. */
+class XaiHttpException(val code: Int, message: String) : ApiException(message)
+
+/** A cloud video that will never arrive (failed, held back, expired or gone): making it again is the only way. */
+class VideoGoneException(message: String) : ApiException(message)
+
 private val NOT_CHAT = listOf("tts", "live", "image", "audio", "transcribe", "robotics", "computer-use", "customtools", "omni", "nano-banana", "argon")
 
 /**
@@ -409,7 +415,7 @@ class LlmClient {
         try {
             call.execute().use { response ->
                 val text = response.body.string()
-                if (!response.isSuccessful) throw ApiException(errorMessage(response.code, text))
+                if (!response.isSuccessful) throw XaiHttpException(response.code, errorMessage(response.code, text))
                 runCatching { JSONObject(text) }.getOrElse { throw ApiException("xAI sent something unexpected. Try again.") }
             }
         } catch (e: IOException) {
@@ -438,44 +444,38 @@ class LlmClient {
     }
 
     /**
-     * A video from Grok Imagine, from the prompt or bringing [image] (a data URL) to life. xAI makes it in the
-     * background: we poll until it's done, reporting progress (0-100), then download it. Returns the MP4's bytes.
+     * Starts a video from Grok Imagine, from the prompt or bringing [image] (a data URL) to life, and returns xAI's
+     * request id. xAI makes it in the background; [awaitXaiVideo] collects it, now or after the app was closed.
      */
-    suspend fun xaiVideo(
-        apiKey: String,
-        model: String,
-        prompt: String,
-        image: String?,
-        seconds: Int,
-        aspect: String?,
-        onProgress: (Int) -> Unit,
-    ): ByteArray {
+    suspend fun startXaiVideo(apiKey: String, model: String, prompt: String, image: String?, seconds: Int, aspect: String?): String {
         val start = xaiJson(xaiPost(apiKey, "/videos/generations", xaiVideoBody(model, prompt, image, seconds, aspect)))
-        val id = start.str("request_id") ?: throw ApiException("xAI didn't start the video. Try again.")
+        return start.str("request_id") ?: throw ApiException("xAI didn't start the video. Try again.")
+    }
+
+    /**
+     * Polls video [id] until it's done, reporting progress (0-99), then downloads it and returns the MP4's bytes.
+     * A video that can never arrive throws [VideoGoneException]; anything else (network, xAI busy) leaves it
+     * collectable later.
+     */
+    suspend fun awaitXaiVideo(apiKey: String, id: String, onProgress: (Int) -> Unit): ByteArray {
         val poll = Request.Builder().url("${Providers.XAI.baseUrl}/videos/$id").header("Authorization", "Bearer $apiKey").build()
         var misses = 0
+        var first = true
         while (true) {
-            delay(4000)
+            if (!first) delay(4000)
+            first = false
             val json = try {
                 xaiJson(poll).also { misses = 0 }
+            } catch (e: XaiHttpException) {
+                if (e.code == 404) throw VideoGoneException("xAI no longer has this video. Retry to make it again.")
+                if (e.code != 429 && e.code < 500) throw e
+                if (++misses >= 8) throw e else continue
             } catch (e: ApiException) {
                 // The video keeps being made while the phone's network hiccups: only give up after a while.
                 if (++misses >= 8) throw e else continue
             }
-            when (json.optString("status")) {
-                "done" -> {
-                    val video = json.optJSONObject("video")
-                    if (video?.optBoolean("respect_moderation", true) == false) {
-                        throw ApiException("xAI's moderation held this video back. Try a different prompt.")
-                    }
-                    val url = video?.str("url") ?: throw ApiException("xAI finished but sent no video. Try again.")
-                    return download(url)
-                }
-                "failed", "expired" -> throw ApiException(
-                    json.optJSONObject("error")?.str("message") ?: "xAI couldn't make this video (${json.optString("status")})."
-                )
-                else -> onProgress(json.optInt("progress", 0).coerceIn(0, 99))
-            }
+            videoResult(json)?.let { return download(it) }
+            onProgress(json.optInt("progress", 0).coerceIn(0, 99))
         }
     }
 
@@ -753,6 +753,21 @@ internal fun xaiImageBody(model: String, prompt: String, reference: List<String>
         1 -> put("image", JSONObject().put("url", reference[0]).put("type", "image_url"))
         else -> put("images", JSONArray(reference.take(5).map { JSONObject().put("url", it).put("type", "image_url") }))
     }
+}
+
+/** The video's download address once xAI is done; null while it's still being made; throws when it never will be. */
+internal fun videoResult(status: JSONObject): String? = when (status.optString("status")) {
+    "done" -> {
+        val video = status.optJSONObject("video")
+        if (video?.optBoolean("respect_moderation", true) == false) {
+            throw VideoGoneException("xAI's moderation held this video back. Try a different prompt.")
+        }
+        video?.str("url") ?: throw VideoGoneException("xAI finished but sent no video. Try again.")
+    }
+    "failed", "expired" -> throw VideoGoneException(
+        status.optJSONObject("error")?.str("message") ?: "xAI couldn't make this video (${status.optString("status")})."
+    )
+    else -> null
 }
 
 internal fun xaiVideoBody(model: String, prompt: String, image: String?, seconds: Int, aspect: String?) = JSONObject().apply {

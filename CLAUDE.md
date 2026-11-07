@@ -30,7 +30,7 @@ Native Kotlin + Jetpack Compose, single `:app` module, package `dev.martin.cubic
 - Chat on /chat/completions; with Search on, /responses with `web_search` + `x_search`. `grok-4.20-multi-agent*` (`Provider.isMultiAgent`) always goes to /responses: no function tools (the create tool is left out), search tools only with Search on.
 - Grok Imagine: the Image chip posts `/images/generations` (`/images/edits` with the message's photos, up to 5) with `response_format: b64_json`; the Video chip posts `/videos/generations` (6 s, `VIDEO_SECONDS`; 9:16 unless a photo sets the shape), polls `/videos/{request_id}` every 4 s (progress in the status line, 8 misses tolerated) and downloads `video.url` into an MP4 attachment. Request bodies are `xaiImageBody`/`xaiVideoBody`.
 - Imagine models show in the picker tagged "makes pictures/videos"; picking one sets `Settings.mediaModels["xai:image|video"]` and turns that mode on instead of becoming the chat model (`Settings.model` ignores a media model stored before this). The Image/Video chips show only their icon until chosen.
-- Videos aren't resumed after the app is killed mid-poll (the request id isn't stored).
+- A video's request id is saved on the reply (`Message.cloudJob`) as soon as xAI accepts it (`startXaiVideo`), so leaving the chat or closing the app only stops watching: opening the chat collects it (`followVideo`, `awaitXaiVideo`), Retry after a network error collects instead of paying again, and only xAI's own end (failed, expired, held back, 404: `VideoGoneException`) or Stop drops the id. xAI has no cancel, so Stop just gives the video up.
 
 ## Design rules
 - Shapes come from `MaterialTheme.shapes` (all `CutCornerShape`); buttons pass `shape = MaterialTheme.shapes.small`. No rounded/circle shapes.

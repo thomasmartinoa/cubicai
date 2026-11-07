@@ -50,6 +50,9 @@ data class MediaRequest(
     val startedAt: Long = 0,
 )
 
+/** A video Grok Imagine is making on xAI's side: its request id, kept so a closed app can collect it later. */
+data class CloudJob(val id: String, val startedAt: Long)
+
 /** A tool call from the chat model; [arguments] is its JSON object as text. */
 data class ToolCall(val id: String, val name: String, val arguments: String)
 
@@ -72,10 +75,14 @@ data class Message(
     val took: Long = 0,
     /** Said aloud in a voice call (the user's words were transcribed, the reply was spoken). */
     val spoken: Boolean = false,
+    val cloudJob: CloudJob? = null,
     val id: String = newId(),
 ) {
     /** A PC generation that hasn't produced its files yet (and hasn't failed, been stopped, or is still waiting for a yes). */
     val mediaPending get() = media != null && !media.ask && attachments.isEmpty() && error == null && !stopped
+
+    /** A Grok video still being made (or made but not downloaded yet). */
+    val cloudPending get() = cloudJob != null && attachments.isEmpty() && error == null && !stopped
 }
 
 data class Chat(
@@ -153,6 +160,7 @@ private fun Message.toJson(): JSONObject = JSONObject().apply {
     }
     if (took > 0) put("took", took)
     if (spoken) put("spoken", true)
+    cloudJob?.let { put("cloudJob", JSONObject().put("id", it.id).put("startedAt", it.startedAt)) }
 }
 
 private fun messageFromJson(o: JSONObject) = Message(
@@ -183,4 +191,5 @@ private fun messageFromJson(o: JSONObject) = Message(
     },
     took = o.optLong("took"),
     spoken = o.optBoolean("spoken"),
+    cloudJob = o.optJSONObject("cloudJob")?.let { j -> j.str("id")?.let { CloudJob(it, j.optLong("startedAt")) } },
 )

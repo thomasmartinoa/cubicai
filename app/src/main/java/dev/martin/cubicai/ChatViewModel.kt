@@ -14,6 +14,7 @@ import dev.martin.cubicai.call.CallHost
 import dev.martin.cubicai.data.Attachment
 import dev.martin.cubicai.data.AttachmentProcessor
 import dev.martin.cubicai.data.Chat
+import dev.martin.cubicai.data.CloudJob
 import dev.martin.cubicai.data.ChatStore
 import dev.martin.cubicai.data.MediaRequest
 import dev.martin.cubicai.data.Message
@@ -38,6 +39,7 @@ import dev.martin.cubicai.net.MediaProgress
 import dev.martin.cubicai.net.ModelInfo
 import dev.martin.cubicai.net.StreamEvent
 import dev.martin.cubicai.net.Tools
+import dev.martin.cubicai.net.VideoGoneException
 import dev.martin.cubicai.net.cancelMedia
 import dev.martin.cubicai.net.downloadMedia
 import dev.martin.cubicai.net.followMedia
@@ -635,6 +637,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     /** Picks a PC job back up when its chat is opened again (after switching chats or restarting the app). */
     private fun resumeMedia(chat: Chat) {
         if (_state.value.streaming) return
+        chat.messages.lastOrNull { it.role == Role.ASSISTANT }?.takeIf { it.cloudPending }?.let { return followVideo(chat.id, it) }
         // A video waits behind the picture it's made from, so that may be the one still on the PC.
         val pending = chat.messages.takeLastWhile { it.role == Role.ASSISTANT }.filter { it.mediaPending }
         val next = pending.firstOrNull { it.media?.jobId != null } ?: pending.firstOrNull { m ->
@@ -947,6 +950,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val c = _state.value.current
         if (_state.value.streaming) return
         val lastReply = c.messages.lastOrNull()?.takeIf { it.role == Role.ASSISTANT }
+        // A Grok video we lost touch with is collected, not paid for again.
+        if (lastReply?.cloudJob != null && lastReply.attachments.isEmpty() && lastReply.error != null) {
+            updateMessage(c.id, lastReply.id) { it.copy(error = null) }
+            followVideo(c.id, lastReply.copy(error = null))
+            return
+        }
         lastReply?.media?.let { media ->
             // The job is still on the PC (lost touch with it, or its download failed): collect it before making
             // it anew. A job that failed, was stopped or is gone has no jobId any more.
@@ -990,6 +999,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun stop() {
         job?.cancel()
         val c = _state.value.current
+        c.messages.lastOrNull { it.role == Role.ASSISTANT }?.takeIf { it.cloudPending }?.let { v ->
+            // xAI can't be told to stop; the video is just given up.
+            updateMessage(c.id, v.id) { it.copy(stopped = true, cloudJob = null) }
+            _state.update { it.copy(streaming = false, status = null) }
+            persist(c.id)
+        }
         // A video's picture and the video waiting for it go together.
         val pending = c.messages.takeLastWhile { it.role == Role.ASSISTANT }.filter { it.mediaPending }
         if (pending.isEmpty()) return
@@ -1640,30 +1655,63 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         persist(chat.id)
 
         val run = ++runId
-        val started = System.currentTimeMillis()
         job = viewModelScope.launch {
-            var cancelled = false
             try {
-                val key = settings.key(provider)
+                val key = settings.key(Providers.XAI)
                 if (key.isBlank()) throw ApiException("Add your ${provider.name} API key in Settings to make videos.")
                 val photo = withContext(Dispatchers.IO) { last.attachments.firstOrNull { it.isImage }?.let(AttachmentProcessor::dataUrl) }
-                val bytes = client.xaiVideo(key, model, last.content, photo, seconds = VIDEO_SECONDS, aspect = if (photo == null) "9:16" else null) { pct ->
+                val id = client.startXaiVideo(key, model, last.content, photo, seconds = VIDEO_SECONDS, aspect = if (photo == null) "9:16" else null)
+                // Saved straight away: from here on the video is xAI's to finish, whatever happens to the app.
+                val started = CloudJob(id, System.currentTimeMillis())
+                updateMessage(chat.id, reply.id) { it.copy(cloudJob = started) }
+                persist(chat.id)
+                if (runId == run) followVideo(chat.id, reply.copy(cloudJob = started))
+            } catch (e: CancellationException) {
+                updateMessage(chat.id, reply.id) { it.copy(stopped = true) }
+                persist(chat.id)
+                if (runId == run) _state.update { it.copy(streaming = false, status = null) }
+                throw e
+            } catch (e: Exception) {
+                updateMessage(chat.id, reply.id) { it.copy(error = e.message ?: "Couldn't make the video") }
+                persist(chat.id)
+                if (runId == run) _state.update { it.copy(streaming = false, status = null) }
+            }
+        }
+    }
+
+    /**
+     * Collects a Grok video xAI is making (or has made). Leaving the chat only stops watching, so reopening it, or
+     * Retry after an error that wasn't xAI's last word, picks it up again; Stop gives it up.
+     */
+    private fun followVideo(chatId: String, reply: Message) {
+        val cloud = reply.cloudJob ?: return
+        val key = _state.value.settings.key(Providers.XAI)
+        _state.update { it.copy(streaming = true, status = "Making your video…") }
+        val run = ++runId
+        job = viewModelScope.launch {
+            try {
+                if (key.isBlank()) throw ApiException("Add your xAI API key in Settings to collect this video.")
+                val bytes = client.awaitXaiVideo(key, cloud.id) { pct ->
                     if (runId == run) _state.update { it.copy(status = "Making your video… $pct%") }
                 }
                 val file = File(store.attachmentDir, "${newId()}.mp4")
                 withContext(Dispatchers.IO) { file.writeBytes(bytes) }
-                updateMessage(chat.id, reply.id) {
-                    it.copy(attachments = listOf(Attachment(Attachment.KIND_VIDEO, "Created video", file.path)), took = System.currentTimeMillis() - started)
+                updateMessage(chatId, reply.id) {
+                    it.copy(
+                        attachments = listOf(Attachment(Attachment.KIND_VIDEO, "Created video", file.path)),
+                        took = System.currentTimeMillis() - cloud.startedAt,
+                        cloudJob = null,
+                    )
                 }
             } catch (e: CancellationException) {
-                cancelled = true
-                throw e
+                throw e // still on xAI's side: followed again when the chat is opened
+            } catch (e: VideoGoneException) {
+                updateMessage(chatId, reply.id) { it.copy(error = e.message, cloudJob = null) }
             } catch (e: Exception) {
-                updateMessage(chat.id, reply.id) { it.copy(error = e.message ?: "Couldn't make the video") }
+                updateMessage(chatId, reply.id) { it.copy(error = e.message ?: "Couldn't collect the video. Retry to try again.") }
             } finally {
-                if (cancelled) updateMessage(chat.id, reply.id) { it.copy(stopped = true) }
                 if (runId == run) _state.update { it.copy(streaming = false, status = null) }
-                persist(chat.id)
+                persist(chatId)
             }
         }
     }
@@ -1858,6 +1906,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val last = chat.messages.lastOrNull() ?: return chat
         if (last.role != Role.ASSISTANT || last.content.isNotEmpty() || last.error != null || last.stopped || last.attachments.isNotEmpty()) return chat
         if (last.media?.jobId != null) return chat // still on the PC: followed again when the chat is opened
+        if (last.cloudJob != null) return chat // still on xAI's side, likewise
         return chat.copy(messages = chat.messages.dropLast(1) + last.copy(error = "The reply was interrupted before it finished."))
     }
 
