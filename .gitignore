@@ -9,7 +9,6 @@ local.properties
 *.keystore
 *.pem
 *.key
-server/__pycache__/
 __pycache__/
 settings.json
 token

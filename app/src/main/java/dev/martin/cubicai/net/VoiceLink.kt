@@ -23,7 +23,7 @@ data class VoiceInfo(val id: String, val name: String, val about: String, val ge
 
 /**
  * The live connection of a voice call: the microphone goes to the PC as 16 kHz PCM, and what the PC hears
- * (`speech`, `partial`, `final`) and says (`seg` followed by 24 kHz PCM) comes back. See server/cubicai_voice.py.
+ * (`speech`, `partial`, `final`) and says (`seg` followed by 24 kHz PCM) comes back. The PC side is the voice module of cubicai-gateway (CubicAI Lab).
  */
 class VoiceLink(private val client: LlmClient) {
     interface Listener {

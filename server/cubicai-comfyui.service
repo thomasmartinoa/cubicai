@@ -1,8 +1,0 @@
-[Unit]
-Description=ComfyUI for CubicAI (started on demand by cubicai-server, stopped when idle)
-
-[Service]
-# Only reachable from this PC; the phone goes through cubicai-server. No metadata in files, so prompts
-# don't travel inside the images, and only warnings and errors reach the journal.
-ExecStart=/mnt/storage/games/AI_local/tools/start-comfyui.sh --listen 127.0.0.1 --port 8188 --preview-method auto --disable-metadata --disable-auto-launch --verbose WARNING
-TimeoutStopSec=20

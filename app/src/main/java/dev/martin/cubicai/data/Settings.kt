@@ -39,7 +39,7 @@ data class Provider(
 }
 
 object Providers {
-    /** Ollama on the user's PC, reached through server/cubicai_server.py (home Wi-Fi, optionally Tailscale). */
+    /** Ollama on the user's PC, reached through cubicai-gateway from CubicAI Lab (home Wi-Fi, optionally Tailscale). */
     val LOCAL = Provider(
         id = "local",
         name = "Local PC (Ollama)",
