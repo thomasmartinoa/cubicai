@@ -1,6 +1,7 @@
 package dev.martin.cubicai
 
 import android.app.Application
+import android.graphics.Bitmap
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -8,6 +9,8 @@ import android.net.Uri
 import android.speech.tts.TextToSpeech
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import dev.martin.cubicai.call.CallController
+import dev.martin.cubicai.call.CallHost
 import dev.martin.cubicai.data.Attachment
 import dev.martin.cubicai.data.AttachmentProcessor
 import dev.martin.cubicai.data.Chat
@@ -45,6 +48,7 @@ import dev.martin.cubicai.ui.saveToGallery
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -166,6 +170,23 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private var ttsReady = false
     private var pendingSpeech: List<String>? = null
 
+    /** A text reply is being written (not something being made on the PC). */
+    @Volatile private var textReplying = false
+    /** Call turns and the replies they speak, so one the user talked over can be cut where they did. */
+    private val callReplies = mutableMapOf<Int, String>()
+    /** In a call, the user was told once that something is still being made. */
+    private var toldStillMaking = false
+
+    /** A live voice call in the open chat (see call/CallController). */
+    val call = CallController(app, client, viewModelScope, object : CallHost {
+        override fun callSettings() = _state.value.settings
+        override fun updateCallSettings(transform: (Settings) -> Settings) = updateSettings(transform)
+        override fun callPersona() = personaOf(_state.value.current) ?: Personas.builtIn.first()
+        override fun heard(text: String, frame: Bitmap?, cutTurn: Int?, heard: String) = heardInCall(text, frame, cutTurn, heard)
+        override fun checkIn(quietSeconds: Int, frame: Bitmap?) = checkInFromCall(quietSeconds, frame)
+        override val replying get() = textReplying
+    })
+
     /** Full-size camera shots land here first; only the downscaled copy is kept. */
     private val cameraDir = File(app.cacheDir, "camera")
 
@@ -189,6 +210,14 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             _state.update { it.copy(chats = chats) }
         }
         refreshContextLimit()
+        viewModelScope.launch { networkBack.collect { call.networkBack() } }
+        // In a call: whether something is being made (it's said so), and an answer owed once it's done.
+        viewModelScope.launch {
+            _state.map { s -> s.current.messages.any { it.mediaPending } }.distinctUntilChanged().collect { call.setMaking(it) }
+        }
+        viewModelScope.launch {
+            _state.map { it.streaming }.distinctUntilChanged().collect { streaming -> if (!streaming) answerWaitingCall() }
+        }
         // While a reply is written or something is made, a foreground service keeps the app alive in the background.
         WorkService.onStopTapped = { viewModelScope.launch { stop() } }
         viewModelScope.launch {
@@ -217,7 +246,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun workText(s: UiState): String? {
-        if (!s.streaming) return null
+        if (!s.streaming || call.active) return null // a call has its own notification
         val making = s.current.messages.lastOrNull { it.mediaPending }?.media ?: return "Writing a reply"
         val kind = runCatching { JSONObject(making.params).optString("kind") }.getOrDefault("")
         return when {
@@ -675,6 +704,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         mutateChat(chatId) { it.copy(personaId = id) }
         _state.update { s -> if (s.current.id == chatId) s.copy(current = s.current.copy(personaId = id)) else s }
         persist(chatId)
+        call.personaChanged()
     }
 
     fun savePersona(persona: Persona) {
@@ -951,16 +981,152 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         persist(c.id)
     }
 
+    // --- Voice calls ----------------------------------------------------------------------------
+
+    /**
+     * Starts a call in the open chat. The PC listens and speaks; the chat's own model answers (the PC's, or a cloud
+     * one if that's what the chat uses).
+     */
+    fun startCall() {
+        val s = _state.value.settings
+        if (!s.isPaired) {
+            showNotice("Calls need your PC to listen and speak: pair it in Settings → Local PC.")
+            return
+        }
+        if (s.model(s.provider).isBlank()) {
+            showNotice("Pick a model first (tap the model name at the top).")
+            return
+        }
+        stopSpeaking()
+        _state.update { it.copy(create = null, imageMode = false) }
+        call.start()
+    }
+
+    fun endCall() = call.end()
+
+    /** What the user said in the call: it goes into the chat and is answered (after cutting the reply they talked over). */
+    private fun heardInCall(text: String, frame: Bitmap?, cutTurn: Int?, heard: String) {
+        val chatId = _state.value.current.id
+        viewModelScope.launch {
+            val cutId = cutTurn?.let { callReplies[it] }
+            if (cutId != null) {
+                if (textReplying) job?.cancelAndJoin()
+                mutateChat(chatId) { c ->
+                    val reply = c.messages.firstOrNull { it.id == cutId }
+                    when {
+                        reply == null || reply.media != null -> c
+                        heard.isBlank() && reply.attachments.isEmpty() -> c.copy(messages = c.messages.filter { it.id != cutId })
+                        // Only what was heard stays: the model then knows where it was interrupted.
+                        else -> c.copy(messages = c.messages.map { if (it.id == cutId) it.copy(content = "$heard —", stopped = false, error = null) else it })
+                    }
+                }
+            }
+            val shot = frame?.let { bitmap ->
+                withContext(Dispatchers.IO) {
+                    runCatching { AttachmentProcessor.frame(bitmap, if (call.state.value.screen) "Screen" else "Camera", store.attachmentDir) }.getOrNull()
+                }
+            }
+            if (_state.value.current.id != chatId || !call.active) return@launch
+            val message = Message(role = Role.USER, content = text, attachments = listOfNotNull(shot), spoken = true)
+            // A video waiting for a yes: a spoken yes makes it, anything else is a no (as when typing).
+            val ask = current(chatId)?.messages?.lastOrNull { it.media?.ask == true }
+            val yes = ask != null && SPOKEN_YES.containsMatchIn(text)
+            mutateChat(chatId) { c ->
+                c.copy(
+                    title = if (c.messages.isEmpty()) titleFor(message) else c.title,
+                    messages = c.messages.map { m -> if (m.media?.ask == true && !yes) declined(m) else m } + message,
+                    updatedAt = System.currentTimeMillis(),
+                )
+            }
+            _state.update { s -> if (s.chats.any { it.id == chatId }) s else s.copy(chats = listOf(s.current) + s.chats) }
+            persist(chatId)
+            if (yes && ask != null) {
+                answerVideo(ask, yes = true)
+                call.say("Okay, making the video now. It takes a few minutes.")
+                toldStillMaking = true
+            } else if (_state.value.streaming) {
+                // Something is being made on the PC: the answer comes when it's done (answerWaitingCall).
+                if (!toldStillMaking) call.say("One moment, I'm still making that.")
+                toldStillMaking = true
+            } else complete()
+        }
+    }
+
+    /** The user has been quiet: the model may say something (with what the camera or screen shows now). */
+    private fun checkInFromCall(quietSeconds: Int, frame: Bitmap?) {
+        if (_state.value.streaming) return
+        viewModelScope.launch {
+            val image = frame?.let { withContext(Dispatchers.IO) { jpegDataUrl(it) } }
+            if (!_state.value.streaming && call.active) complete(CheckIn(quietSeconds, image))
+        }
+    }
+
+    /** In a call, what was said while something was being made is answered once it's done. */
+    private fun answerWaitingCall() {
+        if (!call.active) return
+        viewModelScope.launch {
+            delay(300) // a look at the new picture may be starting instead (afterCreation)
+            val s = _state.value
+            val last = s.current.messages.lastOrNull()
+            if (!s.streaming) toldStillMaking = false
+            if (call.active && !s.streaming && last?.role == Role.USER && last.spoken) complete()
+        }
+    }
+
+    private fun jpegDataUrl(bitmap: Bitmap): String? = runCatching {
+        val scale = minOf(1f, 1024f / maxOf(bitmap.width, bitmap.height))
+        val sized = if (scale < 1f) Bitmap.createScaledBitmap(bitmap, (bitmap.width * scale).toInt(), (bitmap.height * scale).toInt(), true) else bitmap
+        val out = java.io.ByteArrayOutputStream()
+        sized.compress(Bitmap.CompressFormat.JPEG, 85, out)
+        "data:image/jpeg;base64," + android.util.Base64.encodeToString(out.toByteArray(), android.util.Base64.NO_WRAP)
+    }.getOrNull()
+
+    /** A check-in: the user said nothing for [seconds]; [image] is what their camera or screen shows. */
+    private data class CheckIn(val seconds: Int, val image: String?)
+
+    private fun checkInMessages(c: CheckIn?): List<ApiMessage> = if (c == null) emptyList() else listOf(
+        ApiMessage(
+            Role.USER,
+            "(Note from the app, not said by the user: they've been quiet for ${c.seconds} seconds. Say something short " +
+                "to pick the conversation back up, in character: a question, a thought, a little nudge. Don't remark on the silence." +
+                (if (c.image != null) " Below is what their camera or screen shows right now; it may be what's on their mind." else "") + ")",
+            listOfNotNull(c.image),
+        ),
+    )
+
+    /** What the model is told about being in a call; [sees] is "camera" or "screen" when one is shared. */
+    private fun callGuidance(sees: String?): String = buildString {
+        append("You're in a live voice call with the user. What you write is spoken aloud by a voice, and what they say ")
+        append("reaches you transcribed from speech (it can have small mistakes: go with the most likely meaning). ")
+        append("Talk the way people talk on a call: natural and warm, usually one to three sentences, longer only when they ")
+        append("ask for detail or a story. No Markdown, lists, headings, emoji, code or links, and no actions in asterisks. ")
+        append("Write numbers, dates and symbols the way they're said. Ask one question at a time. ")
+        append("A reply of yours that ends in \"—\" was cut off there because the user started talking.")
+        when (sees) {
+            "camera" -> append(" Their camera is on: the photo with each of their messages is what it sees right now. " +
+                "Talk about what you see when it's relevant, like someone on a video call would.")
+            "screen" -> append(" They're sharing their screen: the picture with each of their messages is their screen right now.")
+        }
+    }
+
     // --- Completion -----------------------------------------------------------------------------
 
-    private fun complete() {
+    private fun complete(checkIn: CheckIn? = null) {
         val snapshot = _state.value
         val settings = snapshot.settings
         val provider = settings.provider
         val model = settings.model(provider)
         val history = snapshot.current.messages
         val persona = settings.personas.firstOrNull { it.id == snapshot.current.personaId } ?: Personas.builtIn.first()
-        val reply = Message(role = Role.ASSISTANT, model = model, persona = persona.name.takeIf { persona.id != Personas.NONE })
+        val inCall = call.active
+        val reply = Message(role = Role.ASSISTANT, model = model, persona = persona.name.takeIf { persona.id != Personas.NONE }, spoken = inCall)
+        val turn = if (inCall) call.beginTurn() else 0
+        if (inCall) {
+            callReplies[turn] = reply.id
+            callReplies.keys.filter { it < turn - 20 }.forEach(callReplies::remove)
+        }
+        val voiceContext = if (inCall) call.state.value.let { if (it.screen) "screen" else if (it.camera) "camera" else "" } else null
+        textReplying = true
         val chat = snapshot.current.copy(
             messages = history + reply,
             updatedAt = System.currentTimeMillis(),
@@ -983,6 +1149,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val startedAt = System.currentTimeMillis()
         job = viewModelScope.launch {
             var cancelled = false
+            var failure: String? = null
             try {
                 val baseUrls = settings.baseUrls(provider)
                 val key = settings.key(provider)
@@ -993,17 +1160,24 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     model.isBlank() -> throw ApiException("Pick a model first (tap the model name at the top).")
                 }
                 // The model can make pictures and voice messages on the PC itself, when it's paired and the model takes tools.
-                val gens = if (settings.isPaired && modelTakesTools(provider, model)) creationGenerators() else emptyList()
-                val tools = createTool(gens, persona)?.let { Tools(it, allowed = creationsThisTurn(history) < MAX_CREATIONS_PER_TURN) }
+                // In a call the model makes things only when the user allows it there, and no voice messages (it's talking).
+                val makes = !inCall || settings.callMakesThings
+                val gens = if (settings.isPaired && modelTakesTools(provider, model) && makes) creationGenerators() else emptyList()
+                val tools = createTool(gens, persona, voiceMessages = !inCall)?.let { Tools(it, allowed = creationsThisTurn(history) < MAX_CREATIONS_PER_TURN) }
                 val sees = seesCreations(provider, model)
-                val messages = withContext(Dispatchers.IO) { buildApiMessages(settings, persona, history, tools != null, sees) }
+                val extra = checkInMessages(checkIn)
+                val messages = withContext(Dispatchers.IO) { buildApiMessages(settings, persona, history, tools != null, sees, voiceContext) } + extra
                 client.stream(
                     baseUrls, key, model, messages, provider.search, settings.webSearch, settings.pin(provider), tools,
-                    withoutTools = { buildApiMessages(settings, persona, history, tools = false, sees = sees) },
+                    withoutTools = { buildApiMessages(settings, persona, history, tools = false, sees = sees, call = voiceContext) + extra },
+                    think = !inCall,
                 ) { event ->
                     if (event is StreamEvent.Call) {
                         if (event.call.name == CREATE_TOOL && call == null) call = event.call
-                    } else onStreamEvent(chat.id, reply.id, event, buffer)
+                    } else {
+                        onStreamEvent(chat.id, reply.id, event, buffer)
+                        if (inCall && event is StreamEvent.Text) this@ChatViewModel.call.onReplyText(turn, event.text)
+                    }
                 }
                 // Small models sometimes only say they're sending a picture ("sending a selfie now!") without calling
                 // the tool. Then they're asked once, briefly, to actually send it; only the call is kept from that.
@@ -1029,7 +1203,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 throw e
             } catch (e: Exception) {
                 call = null
-                updateMessage(chat.id, reply.id) { it.copy(error = e.message ?: "Something went wrong") }
+                failure = e.message ?: "Something went wrong"
+                updateMessage(chat.id, reply.id) { it.copy(error = failure) }
             } finally {
                 flush(chat.id, reply.id, buffer)
                 val asked = call.takeIf { !cancelled }
@@ -1049,8 +1224,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                         else -> m
                     }
                 }
-                if (runId == run) _state.update { it.copy(streaming = false, status = null) }
+                if (runId == run) {
+                    textReplying = false
+                    _state.update { it.copy(streaming = false, status = null) }
+                }
                 persist(chat.id)
+                if (inCall) this@ChatViewModel.call.endTurn(turn, failure)
                 if (asked != null && runId == run) createFromTool(chat.id, asked, persona)
             }
         }
@@ -1092,9 +1271,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         history.takeLastWhile { it.role != Role.USER }.count { it.media?.call != null }
 
     /** The `create` tool: what the PC can make, and how to prompt each picture model. Null when it can make nothing. */
-    private fun createTool(gens: List<Generator>, persona: Persona): JSONArray? {
+    private fun createTool(gens: List<Generator>, persona: Persona, voiceMessages: Boolean = true): JSONArray? {
         val pictures = gens.filter { it.kind == "image" && it.mode == "create" }
-        val voice = gens.firstOrNull { it.mode == "speech" }
+        val voice = gens.firstOrNull { it.mode == "speech" }?.takeIf { voiceMessages }
         val music = gens.firstOrNull { it.mode == "music" }
         val canEdit = gens.any { it.kind == "image" && it.mode == "edit" }
         // A video starts from a picture, so it needs a way to make one.
@@ -1427,6 +1606,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             is StreamEvent.Status -> {
                 flush(chatId, messageId, buffer)
                 _state.update { it.copy(status = event.text) }
+                this@ChatViewModel.call.replyStatus(event.text)
             }
             is StreamEvent.Usage -> updateMessage(chatId, messageId) { it.copy(promptTokens = event.prompt, outputTokens = event.output) }
             is StreamEvent.Call -> Unit // handled where the reply is streamed
@@ -1467,7 +1647,15 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
      * calls and their results, and when it [sees] pictures, the latest of them are shown to it; without, they're
      * short notes like anything made from the Create sheet.
      */
-    private fun buildApiMessages(settings: Settings, persona: Persona, history: List<Message>, tools: Boolean, sees: Boolean): List<ApiMessage> {
+    private fun buildApiMessages(
+        settings: Settings,
+        persona: Persona,
+        history: List<Message>,
+        tools: Boolean,
+        sees: Boolean,
+        /** In a call: "" or what's shared ("camera", "screen"); null outside calls. */
+        call: String? = null,
+    ): List<ApiMessage> {
         val now = ZonedDateTime.now().format(DateTimeFormatter.ofPattern("EEEE, d MMMM yyyy, HH:mm z"))
         // The "None" persona sends no system prompt at all: the model's own default behaviour.
         val system = if (persona.id == Personas.NONE) null else buildString {
@@ -1531,7 +1719,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 ApiMessage(m.role, m.content + files + "\n\n[${photos.size} earlier photo(s) not resent]", emptyList())
             }
         }
-        return listOfNotNull(system?.let { ApiMessage("system", it) }) + turns
+        // A call adds how to talk on it, even with "None" (the voice can't read Markdown out).
+        val prompt = listOfNotNull(system, call?.let { callGuidance(it.ifEmpty { null }) }).joinToString("\n\n").ifEmpty { null }
+        return listOfNotNull(prompt?.let { ApiMessage("system", it) }) + turns
     }
 
     /** What the model is told about something it asked for. */
@@ -1641,6 +1831,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         .replace(Regex("[*_`#>|~]"), "")
 
     override fun onCleared() {
+        call.end()
         tts?.shutdown()
         runCatching { connectivity?.unregisterNetworkCallback(networkWatch) }
         // The app was closed: its work stops with it (a job on the PC is picked up again when it's opened).
@@ -1656,6 +1847,9 @@ private val ANNOUNCED = Regex(
     """\b(send(ing)?|sent|here'?s|here is|snap(ping)?|tak(e|ing)|attach(ing)?)\b[^.!?\n]{0,40}\b(pics?|pictures?|photos?|selfies?|screenshots?|images?|voice (message|note)s?|vm|recording)\b""",
     RegexOption.IGNORE_CASE,
 )
+
+/** A spoken yes to the video the model offered. */
+private val SPOKEN_YES = Regex("""^\W*(yes|yeah|yep|yup|sure|ok(ay)?|do it|go ahead|make it|please)\b""", RegexOption.IGNORE_CASE)
 
 /** A reply that is nothing but "(…)" or "[…]", or nothing at all, after the model looked at its own picture. */
 private val STAGE_DIRECTION = Regex("""^(\s*|[(\[*][^)\]]*[)\]*]\s*)$""")

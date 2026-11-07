@@ -91,6 +91,13 @@ object AttachmentProcessor {
         return Attachment(Attachment.KIND_TEXT, name, file.absolutePath)
     }
 
+    /** A frame from the camera or the screen during a call, at most 1024 px on its longer side. */
+    fun frame(source: Bitmap, name: String, outDir: File): Attachment {
+        val scale = minOf(1f, 1024f / maxOf(source.width, source.height))
+        val sized = if (scale < 1f) Bitmap.createScaledBitmap(source, (source.width * scale).toInt(), (source.height * scale).toInt(), true) else source
+        return saveJpeg(sized, name, outDir)
+    }
+
     private fun saveJpeg(source: Bitmap, name: String, outDir: File): Attachment {
         val bitmap = if (source.hasAlpha()) {
             // JPEG has no alpha; flatten onto white so transparent PNGs don't turn black.

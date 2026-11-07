@@ -61,4 +61,8 @@ dependencies {
     implementation("io.noties.markwon:ext-tables:4.6.2")
     implementation("io.noties.markwon:ext-strikethrough:4.6.2")
     implementation("io.noties.markwon:linkify:4.6.2")
+    // Video in voice calls: the camera's live picture, whose frame goes to the model with what you say.
+    implementation("androidx.camera:camera-camera2:1.6.2")
+    implementation("androidx.camera:camera-lifecycle:1.6.2")
+    implementation("androidx.camera:camera-view:1.6.2")
 }

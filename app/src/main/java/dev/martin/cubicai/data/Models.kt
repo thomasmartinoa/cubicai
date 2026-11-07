@@ -70,6 +70,8 @@ data class Message(
     val media: MediaRequest? = null,
     /** How long the reply took to write or make, in milliseconds (0 when unknown). */
     val took: Long = 0,
+    /** Said aloud in a voice call (the user's words were transcribed, the reply was spoken). */
+    val spoken: Boolean = false,
     val id: String = newId(),
 ) {
     /** A PC generation that hasn't produced its files yet (and hasn't failed, been stopped, or is still waiting for a yes). */
@@ -150,6 +152,7 @@ private fun Message.toJson(): JSONObject = JSONObject().apply {
         })
     }
     if (took > 0) put("took", took)
+    if (spoken) put("spoken", true)
 }
 
 private fun messageFromJson(o: JSONObject) = Message(
@@ -179,4 +182,5 @@ private fun messageFromJson(o: JSONObject) = Message(
         )
     },
     took = o.optLong("took"),
+    spoken = o.optBoolean("spoken"),
 )

@@ -144,6 +144,18 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
                 }
             }
 
+            if (s.isPaired) {
+                SectionTitle("Voice calls")
+                SettingsCard {
+                    var voices by remember { mutableStateOf(false) }
+                    SettingRow("Voice for ${s.persona.name}", "Each behaviour has its own voice in calls.") {
+                        OutlinedButton(shape = MaterialTheme.shapes.small, onClick = { voices = true }) { Text("Change") }
+                    }
+                    CallOptions(vm)
+                    if (voices) VoiceSheet(vm, onDismiss = { voices = false })
+                }
+            }
+
             SectionTitle("Appearance")
             SettingsCard {
                 Text("Theme", style = MaterialTheme.typography.bodyLarge)
@@ -204,13 +216,13 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
 }
 
 @Composable
-private fun SectionTitle(text: String) {
+internal fun SectionTitle(text: String) {
     Text(text, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 12.dp))
 }
 
 /** The container every settings section uses, so all sections share one shape, tone and inset. */
 @Composable
-private fun SettingsCard(content: @Composable ColumnScope.() -> Unit) {
+internal fun SettingsCard(content: @Composable ColumnScope.() -> Unit) {
     Surface(shape = MaterialTheme.shapes.large, color = MaterialTheme.colorScheme.surfaceContainer) {
         Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp), content = content)
     }
@@ -218,7 +230,7 @@ private fun SettingsCard(content: @Composable ColumnScope.() -> Unit) {
 
 /** A setting's name and explanation, with its control on the right. */
 @Composable
-private fun SettingRow(title: String, description: String, modifier: Modifier = Modifier, control: @Composable () -> Unit) {
+internal fun SettingRow(title: String, description: String, modifier: Modifier = Modifier, control: @Composable () -> Unit) {
     Row(modifier, verticalAlignment = Alignment.CenterVertically) {
         Column(Modifier.weight(1f)) {
             Text(title, style = MaterialTheme.typography.bodyLarge)

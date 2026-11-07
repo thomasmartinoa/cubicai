@@ -33,6 +33,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -161,6 +162,14 @@ fun ChatScreen(vm: ChatViewModel, onOpenSettings: () -> Unit) {
             vm.clearNotice()
         }
     }
+    // A call that ended by itself says why.
+    val call by vm.call.state.collectAsStateWithLifecycle()
+    LaunchedEffect(call.error) {
+        call.error?.let {
+            vm.call.dismissError()
+            snackbar.showSnackbar(it)
+        }
+    }
 
     ModalNavigationDrawer(
         drawerState = drawerState,
@@ -178,7 +187,11 @@ fun ChatScreen(vm: ChatViewModel, onOpenSettings: () -> Unit) {
     ) {
         Scaffold(
             topBar = {
+                Column {
+                val onCall = call.active && call.minimized
+                if (onCall) CallBar(vm)
                 CenterAlignedTopAppBar(
+                    windowInsets = if (onCall) WindowInsets(0) else TopAppBarDefaults.windowInsets,
                     navigationIcon = {
                         IconButton(onClick = { scope.launch { drawerState.open() } }) { Icon(Icons.Rounded.Menu, "Chats") }
                     },
@@ -208,6 +221,7 @@ fun ChatScreen(vm: ChatViewModel, onOpenSettings: () -> Unit) {
                     },
                     colors = TopAppBarDefaults.centerAlignedTopAppBarColors(containerColor = MaterialTheme.colorScheme.background),
                 )
+                }
             },
             snackbarHost = { SnackbarHost(snackbar) },
         ) { padding ->
@@ -557,7 +571,11 @@ private fun Composer(state: UiState, vm: ChatViewModel, onCreate: () -> Unit) {
                     when (mode) {
                         2 -> FilledIconButton(onClick = vm::stop, shape = MaterialTheme.shapes.small) { Icon(Icons.Rounded.Stop, "Stop") }
                         1 -> FilledIconButton(onClick = { vm.send() }, shape = MaterialTheme.shapes.small) { Icon(Icons.Rounded.ArrowUpward, "Send") }
-                        else -> IconButton(onClick = ::launchSpeech) { Icon(Icons.Rounded.Mic, "Voice input") }
+                        else -> Row {
+                            IconButton(onClick = ::launchSpeech) { Icon(Icons.Rounded.Mic, "Voice input") }
+                            // A live voice call with the model, through the PC.
+                            if (state.settings.isPaired && !vm.call.active) CallStartButton(vm)
+                        }
                     }
                 }
             }

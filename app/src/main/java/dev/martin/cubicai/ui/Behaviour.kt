@@ -55,6 +55,17 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.martin.cubicai.ChatViewModel
 import dev.martin.cubicai.data.Persona
 
+/** Marks a behaviour made for adult conversations. */
+@Composable
+internal fun AdultTag(modifier: Modifier = Modifier) {
+    Text(
+        "18+",
+        modifier.border(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.7f), CutCornerShape(3.dp)).padding(horizontal = 4.dp),
+        style = MaterialTheme.typography.labelSmall,
+        color = MaterialTheme.colorScheme.error,
+    )
+}
+
 /** Picks how the assistant behaves in this chat (and new ones), and edits custom behaviours. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -99,7 +110,10 @@ fun BehaviourSheet(vm: ChatViewModel, onDismiss: () -> Unit) {
                             .background(if (on) tone else Color.Transparent, CutCornerShape(2.dp)),
                     )
                     Column(Modifier.weight(1f)) {
-                        Text(p.name, style = MaterialTheme.typography.titleSmall)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(p.name, style = MaterialTheme.typography.titleSmall)
+                            if (p.adult) AdultTag(Modifier.padding(start = 8.dp))
+                        }
                         val summary = p.summary.ifBlank { p.instructions.lineSequence().firstOrNull().orEmpty() }
                         if (summary.isNotBlank()) Text(
                             summary,

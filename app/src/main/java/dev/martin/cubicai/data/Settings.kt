@@ -117,12 +117,27 @@ data class Settings(
     val lastCreate: String = "",
     /** Whether a reply's thinking is shown open: the user's last choice, or null to open it only while the model thinks. */
     val thoughtsOpen: Boolean? = null,
+    /** Voice calls: the voice each behaviour speaks with (behaviour id → PC voice id), when not its own suggestion. */
+    val callVoices: Map<String, String> = emptyMap(),
+    val callSpeed: Float = 1.0f,
+    /** The voice speaks up after a quiet spell, after [callCheckInSeconds]. */
+    val callCheckIns: Boolean = true,
+    val callCheckInSeconds: Int = 30,
+    /** The model may make pictures, music and videos on the PC during a call. */
+    val callMakesThings: Boolean = true,
+    val callCaptions: Boolean = true,
+    /** How long a pause ends what you're saying, in ms. */
+    val callPatience: Int = 600,
+    val callSpeaker: Boolean = true,
 ) {
     val provider get() = Providers.get(providerId)
 
     val personas get() = Personas.builtIn + customPersonas
 
     val persona get() = personas.firstOrNull { it.id == personaId } ?: Personas.builtIn.first()
+
+    /** The voice a behaviour speaks with in a call: the user's pick, else its own, else the first one. */
+    fun callVoice(persona: Persona) = callVoices[persona.id]?.takeIf { it.isNotBlank() } ?: persona.voice.ifBlank { DEFAULT_VOICE }
 
     fun key(p: Provider) = apiKeys[p.id].orEmpty()
 
@@ -140,6 +155,8 @@ data class Settings(
     /** Certificate pin for a provider; only the paired PC uses one. */
     fun pin(p: Provider) = if (p.id == Providers.LOCAL.id) localFingerprint.ifBlank { null } else null
 }
+
+const val DEFAULT_VOICE = "af_heart"
 
 /** Contents of the QR code / link shown by CubicAI Server → Pair. */
 data class Pairing(val url: String, val remoteUrl: String, val token: String, val fingerprint: String) {
@@ -181,6 +198,16 @@ class SettingsStore(context: Context) {
         privacyScreen = prefs.getBoolean("privacy_screen", false),
         theme = prefs.getString("theme", null) ?: "system",
         thoughtsOpen = if (prefs.contains("thoughts_open")) prefs.getBoolean("thoughts_open", false) else null,
+        callVoices = runCatching {
+            JSONObject(prefs.getString("call_voices", "{}")!!).let { o -> o.keys().asSequence().associateWith { o.optString(it) } }
+        }.getOrDefault(emptyMap()),
+        callSpeed = prefs.getFloat("call_speed", 1.0f),
+        callCheckIns = prefs.getBoolean("call_check_ins", true),
+        callCheckInSeconds = prefs.getInt("call_check_in_seconds", 30),
+        callMakesThings = prefs.getBoolean("call_makes_things", true),
+        callCaptions = prefs.getBoolean("call_captions", true),
+        callPatience = prefs.getInt("call_patience", 600),
+        callSpeaker = prefs.getBoolean("call_speaker", true),
     )
 
     fun save(s: Settings) = prefs.edit {
@@ -201,11 +228,20 @@ class SettingsStore(context: Context) {
         putBoolean("privacy_screen", s.privacyScreen)
         putString("theme", s.theme)
         s.thoughtsOpen?.let { putBoolean("thoughts_open", it) } ?: remove("thoughts_open")
+        putString("call_voices", JSONObject(s.callVoices).toString())
+        putFloat("call_speed", s.callSpeed)
+        putBoolean("call_check_ins", s.callCheckIns)
+        putInt("call_check_in_seconds", s.callCheckInSeconds)
+        putBoolean("call_makes_things", s.callMakesThings)
+        putBoolean("call_captions", s.callCaptions)
+        putInt("call_patience", s.callPatience)
+        putBoolean("call_speaker", s.callSpeaker)
     }
 
     private fun personasToJson(list: List<Persona>) = JSONArray(list.map {
         JSONObject().put("id", it.id).put("name", it.name).put("instructions", it.instructions)
             .put("looks", it.looks).put("facePath", it.facePath).put("voicePath", it.voicePath).put("sendsOnItsOwn", it.sendsOnItsOwn)
+            .put("voice", it.voice).put("adult", it.adult)
     }).toString()
 
     private fun personasFromJson(json: String) = JSONArray(json).objects().map {
@@ -215,6 +251,8 @@ class SettingsStore(context: Context) {
             facePath = it.str("facePath"),
             voicePath = it.str("voicePath"),
             sendsOnItsOwn = it.optBoolean("sendsOnItsOwn"),
+            voice = it.optString("voice"),
+            adult = it.optBoolean("adult"),
         )
     }
 }

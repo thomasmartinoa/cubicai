@@ -13,3 +13,4 @@ server/__pycache__/
 __pycache__/
 settings.json
 token
+unsloth_compiled_cache/

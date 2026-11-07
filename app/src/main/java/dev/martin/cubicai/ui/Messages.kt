@@ -57,6 +57,7 @@ import androidx.compose.material.icons.automirrored.rounded.VolumeUp
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.Description
 import androidx.compose.material.icons.rounded.Edit
+import androidx.compose.material.icons.rounded.GraphicEq
 import androidx.compose.material.icons.rounded.ExpandLess
 import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.Link
@@ -102,6 +103,7 @@ fun UserMessage(message: Message, canEdit: Boolean, onEdit: (String) -> Unit) {
     var editing by remember { mutableStateOf(false) }
     Column(Modifier.fillMaxWidth().padding(start = 40.dp), horizontalAlignment = Alignment.End) {
         AttachmentStrip(message.attachments)
+        if (message.spoken) SpokenMark(Modifier.padding(bottom = 4.dp))
         if (message.content.isNotEmpty()) Box {
             // Two opposite bevels give the bubble a slant; the square corner points at the speaker.
             val shape = CutCornerShape(topStart = 14.dp, topEnd = 2.dp, bottomEnd = 14.dp, bottomStart = 2.dp)
@@ -335,9 +337,19 @@ fun AssistantMessage(
                     (if (model != null) " · " else "") + duration(message.took),
                     style = MaterialTheme.typography.labelSmall, color = muted, maxLines = 1,
                 )
+                if (message.spoken) SpokenMark(Modifier.padding(start = 6.dp))
             }
         }
     }
+}
+
+/** Said aloud in a voice call. */
+@Composable
+private fun SpokenMark(modifier: Modifier = Modifier) {
+    Icon(
+        Icons.Rounded.GraphicEq, "Said in a call",
+        modifier.size(14.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
 }
 
 /** "2.4 s", "41 s", "4 min 9 s". */
@@ -520,7 +532,7 @@ private fun ReplyHeader(name: String, phase: String?, spinning: Boolean) {
 
 /** Label with a band of light sweeping across it: "the model is busy". */
 @Composable
-private fun ShimmerText(text: String, modifier: Modifier = Modifier) {
+internal fun ShimmerText(text: String, modifier: Modifier = Modifier) {
     val base = MaterialTheme.colorScheme.onSurfaceVariant
     val glow = MaterialTheme.colorScheme.onSurface
     val sweep by rememberInfiniteTransition(label = "shimmer").animateFloat(

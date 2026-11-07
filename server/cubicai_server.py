@@ -13,6 +13,7 @@ Usage:
     cubicai_server.py pair [--url https://HOST:PORT]          show the pairing QR code / link
     cubicai_server.py remote on|off|status                    allow the paired phone in over Tailscale
     cubicai_server.py rotate                                  new token (un-pairs every phone)
+    cubicai_server.py voice-setup                             download the speech models for voice calls
 """
 
 import argparse
@@ -44,6 +45,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import cubicai_media as media
+import cubicai_voice as voice
 
 CONFIG_DIR = Path(os.environ.get("CUBICAI_CONFIG_DIR", "~/.config/cubicai-server")).expanduser()
 OLLAMA_URL = os.environ.get("CUBICAI_OLLAMA_URL", "http://127.0.0.1:11434")
@@ -665,6 +667,13 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0].rstrip("/")
         if path.startswith("/v1/media/"):
             self._media_get(path)
+        elif path == "/v1/voice/call":
+            self._voice_call()
+        elif path == "/v1/voice/voices":
+            gap = voice.missing()
+            self._json(200, {"ready": gap is None, "missing": gap, "voices": voice.voices()})
+        elif path == "/v1/voice/preview":
+            self._voice_preview()
         elif path in ("/health", "/v1/health"):
             self._json(200, {"ok": True})
         elif path == "/v1/cubicai/status":
@@ -673,7 +682,8 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 # The phone learns the Tailscale address from here, so remote on/off needs no re-pairing.
                 port = self.server.server_address[1]
-                self._json(200, {**list_models(), "cubic_remote": remote_url(port), "cubic_lan6": lan6_url(port)})
+                self._json(200, {**list_models(), "cubic_remote": remote_url(port), "cubic_lan6": lan6_url(port),
+                                 "cubic_voice": voice.missing() is None})
             except Exception as e:
                 self._json(502, {"error": {"message": f"Can't reach Ollama: {e}"}})
         else:
@@ -717,6 +727,54 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.connection.settimeout(900)  # authorized: allow long generations
         self._chat(body)
+
+    # --- Voice calls ---
+
+    def _voice_call(self):
+        """A live call: the WebSocket the phone streams its microphone over and gets the voice back on."""
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        if self.headers.get("Upgrade", "").lower() != "websocket" or not key:
+            self._json(400, {"error": {"message": "Expected a WebSocket"}})
+            return
+        gap = voice.missing()
+        if gap:
+            self._json(503, {"error": {"message": f"Voice calls need {gap} on your PC."}})
+            return
+        accept = base64.b64encode(hashlib.sha1((key + voice.WS_GUID).encode()).digest()).decode()
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept)
+        self.end_headers()
+        self.wfile.flush()
+        self.close_connection = True
+        self.connection.settimeout(90)  # the phone pings every 15 s, so a silent connection is a lost phone
+        log(f"call from {self.client_address[0]}")
+        rid = ACTIVITY.begin(self.client_address[0], "voice call", False)
+        started = time.time()
+        try:
+            voice.Call(voice.WebSocket(self.rfile, self.wfile), on_phase=lambda text: ACTIVITY.phase(rid, text)).run()
+        except Exception as e:
+            log(f"call ended with {e.__class__.__name__}")
+        finally:
+            ACTIVITY.end(rid, "ok")
+            log(f"call from {self.client_address[0]} ended after {int(time.time() - started)}s")
+
+    def _voice_preview(self):
+        query = urllib.parse.parse_qs(self.path.partition("?")[2])
+        try:
+            pcm = voice.preview(query.get("voice", [""])[0], float(query.get("speed", ["1.0"])[0]))
+        except ValueError as e:
+            self._json(400, {"error": {"message": str(e)}})
+            return
+        except Exception as e:
+            self._json(503, {"error": {"message": f"The voice isn't working on your PC: {e.__class__.__name__}"}})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", f"audio/L16; rate={voice.OUT_RATE}; channels=1")
+        self.send_header("Content-Length", str(len(pcm)))
+        self.end_headers()
+        self.wfile.write(pcm)
 
     # --- Media (ComfyUI) ---
 
@@ -872,7 +930,11 @@ class Handler(BaseHTTPRequestHandler):
             # Keep a model warm between chats; Ollama still evicts it early if another model needs the VRAM.
             payload = {"model": model, "messages": messages, "stream": True, "options": {},
                        "keep_alive": load_settings().get("keep_alive", "15m")}
-            if "thinking" in caps:
+            # A voice call turns thinking off (cubic_think: false): the reply should start right away. Some models
+            # think without listing the capability, so off is sent to every model (Ollama accepts it from all).
+            if body.get("cubic_think") is False:
+                payload["think"] = False
+            elif "thinking" in caps:
                 payload["think"] = True
             # Tools the app offers (making pictures and voice messages on this PC), for models that can call them.
             # Ollama has no tool_choice; "none" (nothing more to make this turn) leaves the tools out instead.
@@ -1076,6 +1138,7 @@ def main():
     pr.add_argument("--url", help="address the phone should use, e.g. https://192.168.1.20:8443")
     pr.add_argument("--port", type=int, default=DEFAULT_PORT)
     sub.add_parser("rotate")
+    sub.add_parser("voice-setup")
     rm = sub.add_parser("remote")
     rm.add_argument("state", choices=["on", "off", "status"])
     a = p.parse_args()
@@ -1088,6 +1151,8 @@ def main():
         print(f"Remote access: {'on' if remote_enabled() else 'off'}; Tailscale: {ip or 'not connected'}")
         if a.state == "on":
             print("The phone learns the Tailscale address the next time it connects at home (no re-pairing needed).")
+    elif a.cmd == "voice-setup":
+        voice.setup()
     elif a.cmd == "rotate":
         identity()
         rotate_token()

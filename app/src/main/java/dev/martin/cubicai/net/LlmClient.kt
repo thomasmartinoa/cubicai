@@ -108,7 +108,7 @@ class LlmClient {
     internal val jsonType = "application/json".toMediaType()
     private val pinnedClients = mutableMapOf<String, OkHttpClient>()
 
-    private fun clientFor(pin: String?): OkHttpClient = if (pin == null) http else synchronized(pinnedClients) {
+    internal fun clientFor(pin: String?): OkHttpClient = if (pin == null) http else synchronized(pinnedClients) {
         pinnedClients.getOrPut(pin) { pinnedClient(pin) }
     }
 
@@ -147,6 +147,22 @@ class LlmClient {
     @OptIn(InternalCoroutinesApi::class)
     internal fun CoroutineScope.cancelOnStop(cancel: () -> Unit) =
         coroutineContext[Job]?.invokeOnCompletion(onCancelling = true, invokeImmediately = true) { cancel() }
+
+    /**
+     * The PC's addresses in the order to try them, without those the phone can't reach now (for connections that
+     * aren't plain requests, like a call's WebSocket). Throws [OffNetworkException] when none is left.
+     */
+    internal fun candidates(baseUrls: List<String>): List<String> {
+        val now = links?.invoke()
+        val ordered = baseUrls.map { moved[it] ?: it }.distinct().sortedByDescending { it == preferredUrl }
+            .filter { now == null || now.canReach(it) }
+        if (ordered.isEmpty() && now != null) throw OffNetworkException(now)
+        return ordered
+    }
+
+    internal fun answered(url: String) {
+        preferredUrl = url
+    }
 
     /** The address that answered last, tried first next time (e.g. Tailscale while away from home). */
     @Volatile private var preferredUrl: String? = null
@@ -234,13 +250,15 @@ class LlmClient {
         tools: Tools? = null,
         /** Builds the messages again for a retry without tools (tool calls in the history become plain notes). */
         withoutTools: (() -> List<ApiMessage>)? = null,
+        /** False asks the PC to skip a model's thinking (a voice call wants the answer straight away). */
+        think: Boolean = true,
         onEvent: (StreamEvent) -> Unit,
     ) {
         try {
-            streamOnce(baseUrls, apiKey, model, messages, search, webSearch, pin, tools, onEvent)
+            streamOnce(baseUrls, apiKey, model, messages, search, webSearch, pin, tools, think, onEvent)
         } catch (e: ToolsRefused) {
             // Some models (or OpenRouter routes) don't take tools at all: answer without them rather than fail.
-            streamOnce(baseUrls, apiKey, model, withoutTools?.invoke() ?: messages, search, webSearch, pin, null, onEvent)
+            streamOnce(baseUrls, apiKey, model, withoutTools?.invoke() ?: messages, search, webSearch, pin, null, think, onEvent)
         }
     }
 
@@ -255,12 +273,14 @@ class LlmClient {
         webSearch: Boolean,
         pin: String?,
         tools: Tools?,
+        think: Boolean,
         onEvent: (StreamEvent) -> Unit,
     ) = withContext(Dispatchers.IO) {
         val useResponses = webSearch && search == SearchMode.XAI_TOOLS
         val body = if (useResponses) responsesBody(model, messages, tools)
         else chatBody(model, messages, webPlugin = webSearch && search == SearchMode.OPENROUTER_WEB, tools = tools)
             .apply { if (webSearch && search == SearchMode.LOCAL_PC) put("cubic_web_search", true) }
+            .apply { if (!think && search == SearchMode.LOCAL_PC) put("cubic_think", false) }
         val calls = sortedMapOf<Int, Array<String>>() // index → id, name, arguments (arguments arrive in pieces)
 
         val payload = body.toString().toRequestBody(jsonType)

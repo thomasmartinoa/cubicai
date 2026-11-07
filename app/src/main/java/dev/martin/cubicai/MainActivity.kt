@@ -15,6 +15,10 @@ import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.layout.Box
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -28,6 +32,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.core.content.IntentCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import dev.martin.cubicai.ui.CallScreen
 import dev.martin.cubicai.ui.ChatScreen
 import dev.martin.cubicai.ui.CubicTheme
 import dev.martin.cubicai.ui.isDark
@@ -56,6 +61,8 @@ class MainActivity : ComponentActivity() {
                 }
                 var showSettings by rememberSaveable { mutableStateOf(false) }
                 BackHandler(enabled = showSettings) { showSettings = false }
+                val call by vm.call.state.collectAsStateWithLifecycle()
+                Box {
                 AnimatedContent(
                     targetState = showSettings,
                     transitionSpec = {
@@ -67,6 +74,13 @@ class MainActivity : ComponentActivity() {
                 ) { settings ->
                     if (settings) SettingsScreen(vm, onBack = { showSettings = false })
                     else ChatScreen(vm, onOpenSettings = { showSettings = true })
+                }
+                // A call covers the app; pulled down, the chat shows with the call in a bar on top.
+                AnimatedVisibility(
+                    visible = call.active && !call.minimized,
+                    enter = slideInVertically(tween(240)) { it / 8 } + fadeIn(tween(200)),
+                    exit = slideOutVertically(tween(200)) { it / 8 } + fadeOut(tween(160)),
+                ) { CallScreen(vm) }
                 }
             }
         }
