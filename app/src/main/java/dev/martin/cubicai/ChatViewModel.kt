@@ -82,6 +82,8 @@ data class UiState(
     val notice: String? = null,
     /** Next message creates an image instead of a text reply (providers that support it). */
     val imageMode: Boolean = false,
+    /** Next message makes a video (Grok Imagine) instead of a text reply. */
+    val videoMode: Boolean = false,
     /** Context window of the selected model in tokens; 0 while unknown. */
     val contextLimit: Int = 0,
     /** What the PC's ComfyUI can make (loaded when the Create sheet opens). */
@@ -117,6 +119,9 @@ private const val MEDIA_RECONNECTS = 40
 
 /** How many recent messages keep their photos in the request; older ones are summarised as a note. */
 private const val MAX_IMAGE_MESSAGES = 6
+
+/** Length of a Grok Imagine video, in seconds (billed per second). */
+private const val VIDEO_SECONDS = 6
 
 /** Things the chat model may make by itself per message from the user: one, and one better attempt if it's off. */
 private const val MAX_CREATIONS_PER_TURN = 2
@@ -281,8 +286,16 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Picks the model for the open chat (it remembers it) and for new chats. */
     fun selectModel(provider: Provider, model: String) {
+        // A picture or video model isn't a chat model: it becomes the one the Image or Video chip uses, and that mode goes on.
+        val kind = provider.mediaKind(model)
+        if (kind != null) {
+            updateSettings { it.copy(providerId = provider.id, mediaModels = it.mediaModels + ("${provider.id}:$kind" to model)) }
+            _state.update { it.copy(imageMode = kind == "image", videoMode = kind == "video", create = null) }
+            return
+        }
         updateSettings { it.copy(providerId = provider.id, models = it.models + (provider.id to model)) }
         if (!provider.images) _state.update { it.copy(imageMode = false) }
+        if (!provider.videos) _state.update { it.copy(videoMode = false) }
         val chatId = _state.value.current.id
         mutateChat(chatId) { it.copy(providerId = provider.id, model = model) }
         _state.update { s -> if (s.current.id == chatId) s.copy(current = s.current.copy(providerId = provider.id, model = model)) else s }
@@ -307,7 +320,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     fun toggleWebSearch() = updateSettings { it.copy(webSearch = !it.webSearch) }
 
-    fun toggleImageMode() = _state.update { it.copy(imageMode = !it.imageMode) }
+    fun toggleImageMode() = _state.update { it.copy(imageMode = !it.imageMode, videoMode = false) }
+
+    fun toggleVideoMode() = _state.update { it.copy(videoMode = !it.videoMode, imageMode = false) }
 
     // --- Create on the PC (ComfyUI) ------------------------------------------------------------
 
@@ -330,7 +345,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun setCreate(options: CreateOptions?) {
-        _state.update { it.copy(create = options, imageMode = false) }
+        _state.update { it.copy(create = options, imageMode = false, videoMode = false) }
         if (options != null) updateSettings {
             it.copy(lastCreate = listOf(options.generator.id, options.aspect, options.seconds, options.language, options.speaker).joinToString("|"))
         }
@@ -908,6 +923,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         when {
             create != null && s.settings.provider == Providers.LOCAL -> createMedia(create.generator.name, createParams(create, text.trim()))
             s.imageMode && s.settings.provider.images -> createImage()
+            s.videoMode && s.settings.provider.videos -> createVideo()
             else -> complete()
         }
     }
@@ -956,12 +972,19 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
         val provider = _state.value.settings.provider
         // A failed or unwanted picture is redone as a picture, not as text.
-        val wasImage = provider.images && c.messages.lastOrNull { it.role == Role.ASSISTANT }?.model == provider.imageModel
+        val lastModel = c.messages.lastOrNull { it.role == Role.ASSISTANT }?.model.orEmpty()
+        val settings = _state.value.settings
+        val wasImage = provider.images && (lastModel == settings.imageModel(provider) || provider.mediaKind(lastModel) == "image")
+        val wasVideo = provider.videos && (lastModel == settings.videoModel(provider) || provider.mediaKind(lastModel) == "video")
         val trimmed = c.messages.dropLastWhile { it.role == Role.ASSISTANT }
         if (trimmed.isEmpty()) return
         discard(c.messages.drop(trimmed.size).flatMap { it.attachments }) // e.g. a created image being redone
         _state.update { it.copy(current = c.copy(messages = trimmed)) }
-        if (wasImage) createImage() else complete()
+        when {
+            wasImage -> createImage()
+            wasVideo -> createVideo()
+            else -> complete()
+        }
     }
 
     fun stop() {
@@ -1168,7 +1191,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 val extra = checkInMessages(checkIn)
                 val messages = withContext(Dispatchers.IO) { buildApiMessages(settings, persona, history, tools != null, sees, voiceContext) } + extra
                 client.stream(
-                    baseUrls, key, model, messages, provider.search, settings.webSearch, settings.pin(provider), tools,
+                    // A check-in only keeps the call going: searching the web for it would just make the voice late.
+                    baseUrls, key, model, messages, provider.search, settings.webSearch && checkIn == null, settings.pin(provider), tools,
                     withoutTools = { buildApiMessages(settings, persona, history, tools = false, sees = sees, call = voiceContext) + extra },
                     think = !inCall,
                 ) { event ->
@@ -1559,7 +1583,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val provider = settings.provider
         val history = snapshot.current.messages
         val last = history.last()
-        val reply = Message(role = Role.ASSISTANT, model = provider.imageModel)
+        val reply = Message(role = Role.ASSISTANT, model = settings.imageModel(provider))
         val chat = snapshot.current.copy(
             messages = history + reply,
             updatedAt = System.currentTimeMillis(),
@@ -1578,8 +1602,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 val key = settings.key(provider)
                 if (key.isBlank()) throw ApiException("Add your ${provider.name} API key in Settings to create images.")
                 val refs = withContext(Dispatchers.IO) { last.attachments.filter { it.isImage }.mapNotNull(AttachmentProcessor::dataUrl) }
-                val (bytes, mime) = client.generateImage(key, provider.imageModel, last.content.ifBlank { "Create an image" }, refs)
-                val file = File(store.attachmentDir, "${newId()}.${if ("jpeg" in mime) "jpg" else "png"}")
+                val (bytes, mime) = client.generateImage(provider, key, settings.imageModel(provider), last.content.ifBlank { "Create an image" }, refs)
+                val file = File(store.attachmentDir, "${newId()}.${when { "jpeg" in mime -> "jpg"; "webp" in mime -> "webp"; else -> "png" }}")
                 withContext(Dispatchers.IO) { file.writeBytes(bytes) }
                 updateMessage(chat.id, reply.id) { it.copy(attachments = listOf(Attachment(Attachment.KIND_IMAGE, "Created image", file.path))) }
             } catch (e: CancellationException) {
@@ -1587,6 +1611,55 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 throw e
             } catch (e: Exception) {
                 updateMessage(chat.id, reply.id) { it.copy(error = e.message ?: "Couldn't create the image") }
+            } finally {
+                if (cancelled) updateMessage(chat.id, reply.id) { it.copy(stopped = true) }
+                if (runId == run) _state.update { it.copy(streaming = false, status = null) }
+                persist(chat.id)
+            }
+        }
+    }
+
+    /** Makes a video from the last message (bringing its photo to life, if it has one) and adds it as the reply. */
+    private fun createVideo() {
+        val snapshot = _state.value
+        val settings = snapshot.settings
+        val provider = settings.provider
+        val history = snapshot.current.messages
+        val last = history.last()
+        val model = settings.videoModel(provider)
+        val reply = Message(role = Role.ASSISTANT, model = model)
+        val chat = snapshot.current.copy(
+            messages = history + reply,
+            updatedAt = System.currentTimeMillis(),
+            providerId = provider.id,
+            model = settings.model(provider),
+        )
+        _state.update { s ->
+            s.copy(current = chat, chats = listOf(chat) + s.chats.filter { it.id != chat.id }, streaming = true, status = "Making your video…")
+        }
+        persist(chat.id)
+
+        val run = ++runId
+        val started = System.currentTimeMillis()
+        job = viewModelScope.launch {
+            var cancelled = false
+            try {
+                val key = settings.key(provider)
+                if (key.isBlank()) throw ApiException("Add your ${provider.name} API key in Settings to make videos.")
+                val photo = withContext(Dispatchers.IO) { last.attachments.firstOrNull { it.isImage }?.let(AttachmentProcessor::dataUrl) }
+                val bytes = client.xaiVideo(key, model, last.content, photo, seconds = VIDEO_SECONDS, aspect = if (photo == null) "9:16" else null) { pct ->
+                    if (runId == run) _state.update { it.copy(status = "Making your video… $pct%") }
+                }
+                val file = File(store.attachmentDir, "${newId()}.mp4")
+                withContext(Dispatchers.IO) { file.writeBytes(bytes) }
+                updateMessage(chat.id, reply.id) {
+                    it.copy(attachments = listOf(Attachment(Attachment.KIND_VIDEO, "Created video", file.path)), took = System.currentTimeMillis() - started)
+                }
+            } catch (e: CancellationException) {
+                cancelled = true
+                throw e
+            } catch (e: Exception) {
+                updateMessage(chat.id, reply.id) { it.copy(error = e.message ?: "Couldn't make the video") }
             } finally {
                 if (cancelled) updateMessage(chat.id, reply.id) { it.copy(stopped = true) }
                 if (runId == run) _state.update { it.copy(streaming = false, status = null) }

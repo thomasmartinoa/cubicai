@@ -19,10 +19,24 @@ data class Provider(
     val search: SearchMode,
     /** Shown in the model picker when the live model list can't be fetched. */
     val suggestedModels: List<String>,
-    /** Can create images from a prompt (Gemini's native image models). */
+    /** Can create images from a prompt (Gemini's native image models, Grok Imagine). */
     val images: Boolean = false,
     val imageModel: String = "",
-)
+    /** Can make videos from a prompt or a photo (Grok Imagine video). */
+    val videos: Boolean = false,
+    val videoModel: String = "",
+) {
+    /** "image" or "video" when [model] makes pictures or videos rather than chatting (it goes to its own endpoint). */
+    fun mediaKind(model: String): String? = when {
+        id == "xai" && model.startsWith("grok-imagine-image") -> "image"
+        id == "xai" && model.startsWith("grok-imagine-video") -> "video"
+        id == "gemini" && model.startsWith("gemini") && "-image" in model -> "image"
+        else -> null
+    }
+
+    /** Models that only work through xAI's Responses API (a team of agents; no Chat Completions, no own tools). */
+    fun isMultiAgent(model: String) = id == "xai" && "multi-agent" in model
+}
 
 object Providers {
     /** Ollama on the user's PC, reached through server/cubicai_server.py (home Wi-Fi, optionally Tailscale). */
@@ -56,7 +70,11 @@ object Providers {
         defaultModel = "grok-4.7",
         keyUrl = "https://console.x.ai",
         search = SearchMode.XAI_TOOLS,
-        suggestedModels = listOf("grok-4.7", "grok-4.6", "grok-4.3", "grok-build-0.1"),
+        suggestedModels = listOf("grok-4.7", "grok-4.6", "grok-4.3", "grok-build-0.1", "grok-4.20-multi-agent"),
+        images = true,
+        imageModel = "grok-imagine-image-2.0",
+        videos = true,
+        videoModel = "grok-imagine-video-1.5",
     )
     val OPENROUTER = Provider(
         id = "openrouter",
@@ -95,6 +113,8 @@ data class Settings(
     val providerId: String = Providers.LOCAL.id,
     val apiKeys: Map<String, String> = emptyMap(),
     val models: Map<String, String> = emptyMap(),
+    /** The picture and video models picked per provider ("xai:image" → model id), when not the provider's default. */
+    val mediaModels: Map<String, String> = emptyMap(),
     val customBaseUrl: String = "",
     /** Paired PC on home Wi-Fi, e.g. https://192.168.1.10:8443; its token lives in apiKeys["local"]. */
     val localUrl: String = "",
@@ -141,7 +161,12 @@ data class Settings(
 
     fun key(p: Provider) = apiKeys[p.id].orEmpty()
 
-    fun model(p: Provider) = models[p.id]?.takeIf { it.isNotBlank() } ?: p.defaultModel
+    /** The chat model; a picture or video model picked before those had their own modes falls back to the default. */
+    fun model(p: Provider) = models[p.id]?.takeIf { it.isNotBlank() && p.mediaKind(it) == null } ?: p.defaultModel
+
+    fun imageModel(p: Provider) = mediaModels["${p.id}:image"]?.takeIf { it.isNotBlank() } ?: p.imageModel
+
+    fun videoModel(p: Provider) = mediaModels["${p.id}:video"]?.takeIf { it.isNotBlank() } ?: p.videoModel
 
     val isPaired get() = localUrl.isNotBlank() && localFingerprint.isNotBlank() && key(Providers.LOCAL).isNotBlank()
 
@@ -185,6 +210,9 @@ class SettingsStore(context: Context) {
         providerId = prefs.getString("provider", null) ?: Providers.LOCAL.id,
         apiKeys = Providers.all.associate { it.id to SecretBox.open(prefs.getString("key_${it.id}", null)) },
         models = Providers.all.associate { it.id to prefs.getString("model_${it.id}", "").orEmpty() },
+        mediaModels = runCatching {
+            JSONObject(prefs.getString("media_models", "{}")!!).let { o -> o.keys().asSequence().associateWith { o.optString(it) } }
+        }.getOrDefault(emptyMap()),
         customBaseUrl = prefs.getString("custom_base_url", "").orEmpty(),
         localUrl = prefs.getString("local_url", "").orEmpty(),
         localRemoteUrl = prefs.getString("local_remote_url", "").orEmpty(),
@@ -215,6 +243,7 @@ class SettingsStore(context: Context) {
         s.apiKeys.forEach { (id, key) -> if (savedKeys[id] != key) putString("key_$id", SecretBox.seal(key)) }
         savedKeys = s.apiKeys
         s.models.forEach { (id, model) -> putString("model_$id", model) }
+        putString("media_models", JSONObject(s.mediaModels).toString())
         putString("custom_base_url", s.customBaseUrl)
         putString("local_url", s.localUrl)
         putString("local_remote_url", s.localRemoteUrl)

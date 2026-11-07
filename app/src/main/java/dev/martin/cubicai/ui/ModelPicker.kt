@@ -140,12 +140,22 @@ fun ModelPickerSheet(vm: ChatViewModel, onOpenSettings: () -> Unit, onDismiss: (
                             owner.takeIf { it.isNotEmpty() },
                             quant.takeIf { it.isNotEmpty() },
                             "recommended".takeIf { m.recommended },
+                            when (provider.mediaKind(m.id)) {
+                                "image" -> "makes\u00A0pictures"
+                                "video" -> "makes\u00A0videos"
+                                else -> null
+                            },
+                            "team\u00A0of\u00A0agents".takeIf { provider.isMultiAgent(m.id) },
                             "free".takeIf { m.free },
                             "sees\u00A0images".takeIf { m.vision },
-                            m.contextTokens.takeIf { it > 0 }?.let { "${contextLabel(it)}\u00A0context" },
+                            m.contextTokens.takeIf { it > 0 && provider.mediaKind(m.id) == null }?.let { "${contextLabel(it)}\u00A0context" },
                             m.sizeBytes.takeIf { it > 0 }?.let { "%.1f\u00A0GB".format(it / 1e9) },
                         ).joinToString(", ")
-                        val isSelected = m.id == selected
+                        val isSelected = m.id == selected || (providerId == settings.providerId && when (provider.mediaKind(m.id)) {
+                            "image" -> state.imageMode && m.id == settings.imageModel(provider)
+                            "video" -> state.videoMode && m.id == settings.videoModel(provider)
+                            else -> false
+                        })
                         // Full-width rows with text on the 20dp edge; the chosen one gets a tinted band, not just a tick.
                         Row(
                             Modifier.fillMaxWidth()

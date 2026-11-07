@@ -67,6 +67,7 @@ import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.Language
 import androidx.compose.material.icons.rounded.Menu
 import androidx.compose.material.icons.rounded.Mic
+import androidx.compose.material.icons.rounded.Movie
 import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.PhotoCamera
 import androidx.compose.material.icons.rounded.Settings
@@ -478,7 +479,8 @@ private fun Composer(state: UiState, vm: ChatViewModel, onCreate: () -> Unit) {
                     Text(
                         when {
                             create != null -> createPlaceholder(create.generator, hasPhoto, usesLast = hasPhoto && state.pending.none { it.isImage })
-                            state.imageMode -> "Describe the image you want"
+                            state.imageMode -> if (hasPhoto) "Say how to change the photo" else "Describe the image you want"
+                            state.videoMode -> if (hasPhoto) "Say how the photo should move" else "Describe the video you want"
                             else -> "Ask anything"
                         },
                     )
@@ -547,19 +549,14 @@ private fun Composer(state: UiState, vm: ChatViewModel, onCreate: () -> Unit) {
                         ),
                     )
                 }
+                // Picture and video chips: just their icon until chosen, so the row fits beside Search on a phone.
                 if (state.settings.provider.images) {
                     Spacer(Modifier.width(6.dp))
-                    FilterChip(
-                        selected = state.imageMode,
-                        onClick = vm::toggleImageMode,
-                        label = { Text("Image") },
-                        leadingIcon = { Icon(Icons.Rounded.Image, null, Modifier.size(18.dp)) },
-                        colors = FilterChipDefaults.filterChipColors(
-                            selectedContainerColor = MaterialTheme.colorScheme.primary,
-                            selectedLabelColor = MaterialTheme.colorScheme.onPrimary,
-                            selectedLeadingIconColor = MaterialTheme.colorScheme.onPrimary,
-                        ),
-                    )
+                    MakeChip(state.imageMode, "Image", Icons.Rounded.Image, vm::toggleImageMode)
+                }
+                if (state.settings.provider.videos) {
+                    Spacer(Modifier.width(6.dp))
+                    MakeChip(state.videoMode, "Video", Icons.Rounded.Movie, vm::toggleVideoMode)
                 }
                 Spacer(Modifier.weight(1f))
                 if (state.current.messages.isNotEmpty() && create == null) ContextMeter(state.current.messages, state.contextLimit)
@@ -739,4 +736,19 @@ private fun dateGroup(time: Long, today: LocalDate): String {
         days < 30 -> "Previous 30 days"
         else -> "Older"
     }
+}
+
+@Composable
+private fun MakeChip(selected: Boolean, label: String, icon: androidx.compose.ui.graphics.vector.ImageVector, onClick: () -> Unit) {
+    FilterChip(
+        selected = selected,
+        onClick = onClick,
+        label = { if (selected) Text(label) else Icon(icon, label, Modifier.size(18.dp)) },
+        leadingIcon = if (selected) ({ Icon(icon, null, Modifier.size(18.dp)) }) else null,
+        colors = FilterChipDefaults.filterChipColors(
+            selectedContainerColor = MaterialTheme.colorScheme.primary,
+            selectedLabelColor = MaterialTheme.colorScheme.onPrimary,
+            selectedLeadingIconColor = MaterialTheme.colorScheme.onPrimary,
+        ),
+    )
 }

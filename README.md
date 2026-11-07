@@ -18,7 +18,8 @@ A personal Android AI chat app built with Kotlin and Jetpack Compose. It talks t
 - **Create images, video, music and speech on your own PC** through ComfyUI: live preview while it renders, photo edits that build on each other, a fixed seed, steps and CFG when you want them, and nothing kept on the PC unless you tap Save.
 - **Chat models that send pictures, voice messages, videos and music**: ask in any chat ("send me a photo of that", "say it as a voice message", "make a short video of it") and the model writes the prompt from the conversation, makes it on your PC, looks at the result and carries on. Characters keep the same face and voice, and can send things on their own.
 - **Keeps working in the background**: switch to another app while a reply is written or a video is made; a notification shows it's working and tells you when it's done.
-- **Image creation** with Gemini (needs a Google account with billing; the free tier has no image quota).
+- **Image and video creation in the cloud**: Grok Imagine pictures (and edits of your photos) and 6-second videos (from a prompt or bringing a photo to life), and Gemini pictures (needs a Google account with billing; the free tier has no image quota). Pick an Imagine model in the model list, or tap the Image or Video chip.
+- **Grok's multi-agent model**: a team of agents researches the question together (it can't use the create tool).
 - **Context meter** beside the send button: how much of the model's context window the chat fills, plus the tokens read and written so far. Tap it for details.
 - **Behaviours** (system prompts): built-in ones, your own, and an "About you" note added to all of them except None.
 - **Voice input, read aloud, copy, share, edit and regenerate**, search across chats, and a light, dark or system theme.
@@ -55,7 +56,7 @@ Open **Settings** and fill in the providers you want. You can then switch betwee
 |---|---|---|
 | **Local PC** | The CubicAI server on your PC (below), paired once | Runs your Ollama models, free and private. Web search goes through SearXNG on the PC. |
 | **Google Gemini** | An API key from [Google AI Studio](https://aistudio.google.com/apikey) | Chat and photos work on the free tier. Image creation needs billing turned on. |
-| **xAI (Grok)** | An API key from [console.x.ai](https://console.x.ai) | Search uses xAI's web and X search. |
+| **xAI (Grok)** | An API key from [console.x.ai](https://console.x.ai) | Search uses xAI's web and X search. Pictures and videos are billed per image and per second (about $0.04 a picture, $0.30-0.50 a video). |
 | **OpenRouter** | An API key from [openrouter.ai](https://openrouter.ai/keys) | Hundreds of models; search uses OpenRouter's web plugin. |
 | **Custom** | A base URL (and a key if it needs one) | Anything that speaks the OpenAI `/chat/completions` API. |
 
@@ -274,7 +275,7 @@ The app is a single `:app` module (`dev.martin.cubicai`):
 | Path | What it does |
 |---|---|
 | `data/` | Settings and providers, encrypted secrets, chats (one JSON file each), attachments, behaviours |
-| `net/LlmClient.kt` | Streaming over Server-Sent Events, web search, image creation, PC certificate pinning and address fallback |
+| `net/LlmClient.kt` | Streaming over Server-Sent Events, web search, image and video creation (Gemini, Grok Imagine), PC certificate pinning and address fallback |
 | `net/MediaClient.kt`, `net/LanFinder.kt` | Jobs on the PC (submit, follow, download, save); finding the PC again over mDNS |
 | `ChatViewModel.kt` | App state, sending, streaming, editing, regenerating, creating, reconnecting, read aloud |
 | `ui/` | Compose screens, the cut-corner theme, Markdown rendering with the word fade, the context meter, the Create sheet and media players |

@@ -1,5 +1,7 @@
 package dev.martin.cubicai.net
 
+import dev.martin.cubicai.data.Provider
+import dev.martin.cubicai.data.Providers
 import dev.martin.cubicai.data.SearchMode
 import dev.martin.cubicai.data.ToolCall
 import dev.martin.cubicai.data.objects
@@ -9,6 +11,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.InternalCoroutinesApi
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import android.util.Base64
 import kotlinx.coroutines.isActive
@@ -82,7 +85,8 @@ data class ModelInfo(
 data class Links(val lan: Boolean, val vpn: Boolean) {
     fun canReach(url: String): Boolean {
         val host = url.substringAfter("://").substringBefore('/').substringBeforeLast(':')
-        if (host.startsWith("[")) return if (host.startsWith("[fd7a:115c:a1e0:", ignoreCase = true)) vpn else lan || vpn
+        // The PC's home IPv6 address is global, but it only lets in its own prefix: from mobile data it's a wasted try.
+        if (host.startsWith("[")) return if (host.startsWith("[fd7a:115c:a1e0:", ignoreCase = true)) vpn else lan
         val octets = host.split('.').mapNotNull { it.toIntOrNull() }.takeIf { it.size == 4 } ?: return true
         val (a, b) = octets
         return when {
@@ -276,8 +280,10 @@ class LlmClient {
         think: Boolean,
         onEvent: (StreamEvent) -> Unit,
     ) = withContext(Dispatchers.IO) {
-        val useResponses = webSearch && search == SearchMode.XAI_TOOLS
-        val body = if (useResponses) responsesBody(model, messages, tools)
+        val multiAgent = search == SearchMode.XAI_TOOLS && "multi-agent" in model
+        val useResponses = (webSearch && search == SearchMode.XAI_TOOLS) || multiAgent
+        // A team of agents takes no functions of ours (only xAI's own tools).
+        val body = if (useResponses) responsesBody(model, messages, tools.takeUnless { multiAgent }, webSearch)
         else chatBody(model, messages, webPlugin = webSearch && search == SearchMode.OPENROUTER_WEB, tools = tools)
             .apply { if (webSearch && search == SearchMode.LOCAL_PC) put("cubic_web_search", true) }
             .apply { if (!think && search == SearchMode.LOCAL_PC) put("cubic_think", false) }
@@ -340,10 +346,19 @@ class LlmClient {
      * Returns the image bytes and their mime type.
      */
     suspend fun generateImage(
+        provider: Provider,
         apiKey: String,
         model: String,
         prompt: String,
         reference: List<String> = emptyList(),
+    ): Pair<ByteArray, String> =
+        if (provider.id == Providers.XAI.id) xaiImage(apiKey, model, prompt, reference) else geminiImage(apiKey, model, prompt, reference)
+
+    private suspend fun geminiImage(
+        apiKey: String,
+        model: String,
+        prompt: String,
+        reference: List<String>,
     ): Pair<ByteArray, String> = withContext(Dispatchers.IO) {
         val parts = JSONArray().put(JSONObject().put("text", prompt))
         reference.forEach { url ->
@@ -376,6 +391,101 @@ class LlmClient {
                         partsOut.firstNotNullOfOrNull { it.str("text") }?.take(300) ?: "The model didn't return an image. Try rephrasing."
                     )
                 Base64.decode(inline.getString("data"), Base64.DEFAULT) to (inline.str("mimeType") ?: inline.str("mime_type") ?: "image/png")
+            }
+        } catch (e: IOException) {
+            ensureActive()
+            throw networkError(e, null)
+        } finally {
+            handle?.dispose()
+        }
+    }
+
+    // --- Grok Imagine (xAI) ------------------------------------------------------------------------
+
+    /** Sends [request] to xAI and returns the parsed JSON body, or throws the provider's own message. */
+    private suspend fun xaiJson(request: Request): JSONObject = withContext(Dispatchers.IO) {
+        val call = http.newCall(request)
+        val handle = cancelOnStop { call.cancel() }
+        try {
+            call.execute().use { response ->
+                val text = response.body.string()
+                if (!response.isSuccessful) throw ApiException(errorMessage(response.code, text))
+                runCatching { JSONObject(text) }.getOrElse { throw ApiException("xAI sent something unexpected. Try again.") }
+            }
+        } catch (e: IOException) {
+            ensureActive()
+            throw networkError(e, null)
+        } finally {
+            handle?.dispose()
+        }
+    }
+
+    private fun xaiPost(apiKey: String, path: String, body: JSONObject) = Request.Builder()
+        .url("${Providers.XAI.baseUrl}$path")
+        .header("Authorization", "Bearer $apiKey")
+        .post(body.toString().toRequestBody(jsonType))
+        .build()
+
+    /** A picture from Grok Imagine; with [reference] photos it edits them (up to 5, as <IMAGE_0>, <IMAGE_1>, …). */
+    private suspend fun xaiImage(apiKey: String, model: String, prompt: String, reference: List<String>): Pair<ByteArray, String> {
+        val body = xaiImageBody(model, prompt, reference)
+        val json = xaiJson(xaiPost(apiKey, if (reference.isEmpty()) "/images/generations" else "/images/edits", body))
+        val image = json.optJSONArray("data")?.optJSONObject(0) ?: throw ApiException("Grok didn't return a picture. Try rephrasing.")
+        val bytes = image.str("b64_json")?.let { Base64.decode(it, Base64.DEFAULT) }
+            ?: image.str("url")?.let { download(it) }
+            ?: throw ApiException("Grok didn't return a picture. Try rephrasing.")
+        return bytes to (image.str("mime_type") ?: sniffImageType(bytes))
+    }
+
+    /**
+     * A video from Grok Imagine, from the prompt or bringing [image] (a data URL) to life. xAI makes it in the
+     * background: we poll until it's done, reporting progress (0-100), then download it. Returns the MP4's bytes.
+     */
+    suspend fun xaiVideo(
+        apiKey: String,
+        model: String,
+        prompt: String,
+        image: String?,
+        seconds: Int,
+        aspect: String?,
+        onProgress: (Int) -> Unit,
+    ): ByteArray {
+        val start = xaiJson(xaiPost(apiKey, "/videos/generations", xaiVideoBody(model, prompt, image, seconds, aspect)))
+        val id = start.str("request_id") ?: throw ApiException("xAI didn't start the video. Try again.")
+        val poll = Request.Builder().url("${Providers.XAI.baseUrl}/videos/$id").header("Authorization", "Bearer $apiKey").build()
+        var misses = 0
+        while (true) {
+            delay(4000)
+            val json = try {
+                xaiJson(poll).also { misses = 0 }
+            } catch (e: ApiException) {
+                // The video keeps being made while the phone's network hiccups: only give up after a while.
+                if (++misses >= 8) throw e else continue
+            }
+            when (json.optString("status")) {
+                "done" -> {
+                    val video = json.optJSONObject("video")
+                    if (video?.optBoolean("respect_moderation", true) == false) {
+                        throw ApiException("xAI's moderation held this video back. Try a different prompt.")
+                    }
+                    val url = video?.str("url") ?: throw ApiException("xAI finished but sent no video. Try again.")
+                    return download(url)
+                }
+                "failed", "expired" -> throw ApiException(
+                    json.optJSONObject("error")?.str("message") ?: "xAI couldn't make this video (${json.optString("status")})."
+                )
+                else -> onProgress(json.optInt("progress", 0).coerceIn(0, 99))
+            }
+        }
+    }
+
+    private suspend fun download(url: String): ByteArray = withContext(Dispatchers.IO) {
+        val call = http.newCall(Request.Builder().url(url).build())
+        val handle = cancelOnStop { call.cancel() }
+        try {
+            call.execute().use { r ->
+                if (!r.isSuccessful) throw ApiException("Couldn't download the result (error ${r.code}). Try again.")
+                r.body.bytes()
             }
         } catch (e: IOException) {
             ensureActive()
@@ -489,7 +599,7 @@ class LlmClient {
 
     // --- Responses API (xAI search tools) -------------------------------------------------------
 
-    private fun responsesBody(model: String, messages: List<ApiMessage>, tools: Tools?) = JSONObject().apply {
+    private fun responsesBody(model: String, messages: List<ApiMessage>, tools: Tools?, webSearch: Boolean) = JSONObject().apply {
         put("model", model)
         put("stream", true)
         // Tool calls and their results are items of their own here, not fields of a message.
@@ -510,8 +620,12 @@ class LlmClient {
             }
         }))
         put("tools", JSONArray()
-            .put(JSONObject().put("type", "web_search"))
-            .put(JSONObject().put("type", "x_search"))
+            .apply {
+                if (webSearch) {
+                    put(JSONObject().put("type", "web_search"))
+                    put(JSONObject().put("type", "x_search"))
+                }
+            }
             .apply {
                 // The same functions, in the Responses API's flatter shape.
                 tools?.functions.objects().mapNotNull { it.optJSONObject("function") }.forEach { f ->
@@ -520,6 +634,7 @@ class LlmClient {
                 }
             })
         if (tools != null && !tools.allowed) put("tool_choice", "none")
+        if (optJSONArray("tools")?.length() == 0) remove("tools")
     }
 
     private fun parseResponsesEvent(json: JSONObject, calls: MutableMap<Int, Array<String>>, onEvent: (StreamEvent) -> Unit) {
@@ -600,7 +715,7 @@ class LlmClient {
                 mismatch != null -> mismatch.message ?: "This isn't your paired PC. Pair again in Settings."
                 // The PC drops connections it doesn't allow (Tailscale while remote access is off) before TLS.
                 e is SSLException -> "Your PC turned the connection away. If you're away from home, turn on remote access in CubicAI Server."
-                e.isRefusal() -> "Your PC is there but CubicAI Server isn't answering. Start it from the CubicAI Server panel, then retry."
+                e.isRefusal() -> "Your PC is there but CubicAI Server isn't answering. Start it from CubicAI Server on your PC, then retry."
                 else -> "Can't reach your PC. Check that CubicAI Server is running, and that you're on home Wi-Fi or Tailscale."
             }
         )
@@ -626,4 +741,31 @@ class LlmClient {
         if (pc && code == 401) return hint!! // the PC's own "invalid token" adds nothing
         return listOfNotNull("Error $code: $detail".trim(), hint).joinToString("\n")
     }
+}
+
+/** Grok Imagine request bodies (kept apart so tests can check them without a network). */
+internal fun xaiImageBody(model: String, prompt: String, reference: List<String>) = JSONObject().apply {
+    put("model", model)
+    put("prompt", prompt)
+    put("response_format", "b64_json")
+    when (reference.size) {
+        0 -> Unit
+        1 -> put("image", JSONObject().put("url", reference[0]).put("type", "image_url"))
+        else -> put("images", JSONArray(reference.take(5).map { JSONObject().put("url", it).put("type", "image_url") }))
+    }
+}
+
+internal fun xaiVideoBody(model: String, prompt: String, image: String?, seconds: Int, aspect: String?) = JSONObject().apply {
+    put("model", model)
+    if (prompt.isNotBlank() || image == null) put("prompt", prompt.ifBlank { "A short cinematic scene" })
+    put("duration", seconds.coerceIn(1, 15))
+    if (image != null) put("image", JSONObject().put("url", image))
+    else if (aspect != null) put("aspect_ratio", aspect) // a photo sets its own shape
+}
+
+/** PNG, WebP or (by default) JPEG, from the first bytes. */
+internal fun sniffImageType(bytes: ByteArray): String = when {
+    bytes.size > 4 && bytes[0] == 0x89.toByte() && bytes[1] == 'P'.code.toByte() -> "image/png"
+    bytes.size > 12 && String(bytes, 8, 4, Charsets.US_ASCII) == "WEBP" -> "image/webp"
+    else -> "image/jpeg"
 }
