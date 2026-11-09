@@ -35,7 +35,32 @@ data class Bot(
     val pending: Int = 0,
     /** Whether it may use the PC's sandboxed computer (terminal and browser). */
     val computer: Boolean = true,
+    /** Whether it may use the user's Google account (when the PC has one connected). */
+    val google: Boolean = false,
+    /** Whether it may use this phone (reminders, notifications, clipboard, links, location). */
+    val phone: Boolean = true,
+    /** The apps (MCP server ids on the PC) whose tools it gets. */
+    val mcp: List<String> = emptyList(),
 )
+
+/** The PC's Google connection. */
+data class GoogleStatus(val connected: Boolean, val email: String?, val hasClient: Boolean, val note: String? = null)
+
+/** An app (MCP server) on the PC. Header/env values never come back, only their names. */
+data class McpServer(
+    val id: String,
+    val name: String,
+    /** remote or sandbox. */
+    val kind: String,
+    val url: String,
+    val command: String,
+    val secrets: List<String>,
+    val enabled: Boolean,
+    /** changes, always or never. */
+    val ask: String,
+)
+
+data class McpTool(val name: String, val description: String, val readOnly: Boolean)
 
 /**
  * A task the PC starts the Bot on at set times. [schedule] is the PC's JSON
@@ -69,6 +94,8 @@ data class BotFeedItem(
     /** A routine that found nothing worth telling. */
     val quiet: Boolean,
     val routine: String?,
+    /** For kind "phone": what the Bot sent this phone ({id, do: remind|notify|copy|open, …}). */
+    val phone: JSONObject? = null,
 )
 
 data class BotCall(val id: String, val name: String, val args: String)
@@ -113,13 +140,17 @@ sealed interface BotEvent {
     data class Approval(override val seq: Int, val id: String, val text: String) : BotEvent
     /** That wait is over (answered, stopped or timed out). */
     data class Approved(override val seq: Int, val id: String) : BotEvent
+    /** Something for this phone ({id, do, …}): a delivery to carry out, or a question to answer. */
+    data class Phone(override val seq: Int, val phone: JSONObject) : BotEvent
+    /** A question to the phone is over (answered or timed out). */
+    data class PhoneDone(override val seq: Int, val id: String) : BotEvent
 }
 
 /** An action the Bot waits on the user's yes for. */
 data class BotApproval(val id: String, val text: String)
 
 /** A Bot's chat as the PC has it, and where to follow its run from if it's working. */
-data class BotChat(val messages: List<BotMessage>, val running: Boolean, val follow: Int?, val approval: BotApproval? = null)
+data class BotChat(val messages: List<BotMessage>, val running: Boolean, val follow: Int?, val approval: BotApproval? = null, val phone: JSONObject? = null)
 
 /** Which cloud keys the PC holds (never the keys themselves). */
 data class PcKeys(val present: Set<String>, val customUrl: String?)
@@ -144,8 +175,24 @@ internal fun botFrom(o: JSONObject): Bot {
         routines = o.optInt("routines"),
         pending = o.optInt("pending"),
         computer = o.optBoolean("computer", true),
+        google = o.optBoolean("google", false),
+        phone = o.optBoolean("phone", true),
+        mcp = o.optJSONArray("mcp").strings(),
     )
 }
+
+internal fun mcpServerFrom(o: JSONObject) = McpServer(
+    id = o.optString("id"),
+    name = o.optString("name"),
+    kind = o.optString("kind", "remote"),
+    url = o.optString("url"),
+    command = o.optString("command"),
+    secrets = (o.optJSONArray("headers") ?: o.optJSONArray("env")).strings(),
+    enabled = o.optBoolean("enabled", true),
+    ask = o.optString("ask", "changes"),
+)
+
+private fun googleFrom(o: JSONObject) = GoogleStatus(o.optBoolean("connected"), o.str("email")?.takeIf { it.isNotBlank() }, o.optBoolean("client"), o.str("note"))
 
 internal fun routineFrom(o: JSONObject) = BotRoutine(
     id = o.optString("id"),
@@ -170,6 +217,7 @@ internal fun feedItemFrom(o: JSONObject) = BotFeedItem(
     text = o.optString("text"),
     quiet = o.optBoolean("quiet"),
     routine = o.optJSONObject("routine")?.str("name"),
+    phone = o.optJSONObject("phone"),
 )
 
 internal fun botMessageFrom(o: JSONObject) = BotMessage(
@@ -202,6 +250,8 @@ internal fun botEventFrom(o: JSONObject): BotEvent? {
         "done" -> BotEvent.Done(seq, o.str("error"), o.optBoolean("stopped"))
         "approval" -> BotEvent.Approval(seq, o.optString("id"), o.optString("text"))
         "approved" -> BotEvent.Approved(seq, o.optString("id"))
+        "phone" -> o.optJSONObject("phone")?.let { BotEvent.Phone(seq, it) }
+        "phone_done" -> BotEvent.PhoneDone(seq, o.optString("id"))
         else -> null
     }
 }
@@ -273,6 +323,7 @@ suspend fun LlmClient.botChat(baseUrls: List<String>, token: String, pin: String
         BotChat(
             o.optJSONArray("messages").objects().map(::botMessageFrom), o.optBoolean("running"), if (o.isNull("follow")) null else o.optInt("follow"),
             o.optJSONObject("approval")?.let { BotApproval(it.optString("id"), it.optString("text")) },
+            o.optJSONObject("phone"),
         )
     }
 
@@ -354,3 +405,50 @@ suspend fun LlmClient.answerBot(baseUrls: List<String>, token: String, pin: Stri
 /** A browser step's screenshot (JPEG bytes). */
 suspend fun LlmClient.botShot(baseUrls: List<String>, token: String, pin: String, id: String, messageId: String): ByteArray =
     botCall(baseUrls, token, pin, { url("$it/bots/$id/shots/$messageId.jpg") }) { r -> r.body.bytes() }
+
+/** The phone's answer to a question its Bot asked ({error} when it can't). */
+suspend fun LlmClient.answerPhone(baseUrls: List<String>, token: String, pin: String, id: String, request: String, answer: JSONObject) =
+    botCall(baseUrls, token, pin, { url("$it/bots/$id/phone").post(json(JSONObject().put("id", request).put("answer", answer))) }) { }
+
+// --- Google ---------------------------------------------------------------------------------------
+
+suspend fun LlmClient.googleStatus(baseUrls: List<String>, token: String, pin: String): GoogleStatus =
+    botCall(baseUrls, token, pin, { url("$it/google") }) { r -> googleFrom(JSONObject(r.body.string())) }
+
+/** The user's Google Cloud "Desktop app" client, kept on the PC. */
+suspend fun LlmClient.googleClient(baseUrls: List<String>, token: String, pin: String, id: String, secret: String): GoogleStatus =
+    botCall(baseUrls, token, pin, { url("$it/google").put(json(JSONObject().put("client_id", id).put("client_secret", secret))) }) { r -> googleFrom(JSONObject(r.body.string())) }
+
+/** Starts a sign-in that Google sends back to [redirect]; the page to open. */
+suspend fun LlmClient.googleStart(baseUrls: List<String>, token: String, pin: String, redirect: String): String =
+    botCall(baseUrls, token, pin, { url("$it/google/start").post(json(JSONObject().put("redirect", redirect))) }) { r -> JSONObject(r.body.string()).optString("url") }
+
+suspend fun LlmClient.googleFinish(baseUrls: List<String>, token: String, pin: String, code: String, state: String): GoogleStatus =
+    botCall(baseUrls, token, pin, { url("$it/google/finish").post(json(JSONObject().put("code", code).put("state", state))) }) { r -> googleFrom(JSONObject(r.body.string())) }
+
+suspend fun LlmClient.googleSignOut(baseUrls: List<String>, token: String, pin: String): GoogleStatus =
+    botCall(baseUrls, token, pin, { url("$it/google").delete() }) { r -> googleFrom(JSONObject(r.body.string())) }
+
+// --- Apps (MCP) -----------------------------------------------------------------------------------
+
+suspend fun LlmClient.mcpServers(baseUrls: List<String>, token: String, pin: String): List<McpServer> =
+    botCall(baseUrls, token, pin, { url("$it/mcp") }) { r -> JSONObject(r.body.string()).optJSONArray("servers").objects().map(::mcpServerFrom) }
+
+private fun toolsOf(o: JSONObject) = o.optJSONArray("tools").objects().map { McpTool(it.optString("name"), it.optString("description"), it.optBoolean("read_only")) }
+
+/** Adds an app; the PC tries it at once: its tools, or why it couldn't reach it. */
+suspend fun LlmClient.addMcp(baseUrls: List<String>, token: String, pin: String, fields: JSONObject): Triple<McpServer, List<McpTool>, String?> =
+    botCall(baseUrls, token, pin, { url("$it/mcp").post(json(fields)) }) { r ->
+        val o = JSONObject(r.body.string())
+        Triple(mcpServerFrom(o.getJSONObject("server")), toolsOf(o), o.str("error"))
+    }
+
+suspend fun LlmClient.updateMcp(baseUrls: List<String>, token: String, pin: String, id: String, fields: JSONObject): McpServer =
+    botCall(baseUrls, token, pin, { url("$it/mcp/$id").put(json(fields)) }) { r -> mcpServerFrom(JSONObject(r.body.string()).getJSONObject("server")) }
+
+suspend fun LlmClient.deleteMcp(baseUrls: List<String>, token: String, pin: String, id: String) =
+    botCall(baseUrls, token, pin, { url("$it/mcp/$id").delete() }) { }
+
+/** An app's tools, asked afresh (or why it can't be reached). */
+suspend fun LlmClient.mcpTools(baseUrls: List<String>, token: String, pin: String, id: String): Pair<List<McpTool>, String?> =
+    botCall(baseUrls, token, pin, { url("$it/mcp/$id/tools") }) { r -> JSONObject(r.body.string()).let { toolsOf(it) to it.str("error") } }

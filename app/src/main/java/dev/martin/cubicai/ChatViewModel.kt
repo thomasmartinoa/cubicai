@@ -207,7 +207,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     })
 
     /** The Bots on the paired PC (see bots/BotsController). */
-    val bots = dev.martin.cubicai.bots.BotsController(viewModelScope, client) { _state.value.settings }
+    val bots = dev.martin.cubicai.bots.BotsController(viewModelScope, client, app) { _state.value.settings }
 
     /** In a Grok call: the reply being said (still coming in, or said last), in the open chat. */
     private var grokReplyId: String? = null

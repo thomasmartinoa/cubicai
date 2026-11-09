@@ -11,6 +11,20 @@ import dev.martin.cubicai.net.BotMessage
 import dev.martin.cubicai.net.BotApproval
 import dev.martin.cubicai.net.BotRoutine
 import dev.martin.cubicai.net.answerBot
+import dev.martin.cubicai.net.answerPhone
+import dev.martin.cubicai.net.GoogleStatus
+import dev.martin.cubicai.net.McpServer
+import dev.martin.cubicai.net.McpTool
+import dev.martin.cubicai.net.addMcp
+import dev.martin.cubicai.net.deleteMcp
+import dev.martin.cubicai.net.googleClient
+import dev.martin.cubicai.net.googleFinish
+import dev.martin.cubicai.net.googleSignOut
+import dev.martin.cubicai.net.googleStart
+import dev.martin.cubicai.net.googleStatus
+import dev.martin.cubicai.net.mcpServers
+import dev.martin.cubicai.net.mcpTools
+import dev.martin.cubicai.net.updateMcp
 import dev.martin.cubicai.net.botShot
 import dev.martin.cubicai.net.addRoutine
 import dev.martin.cubicai.net.botRoutines
@@ -34,6 +48,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -53,6 +68,8 @@ data class OpenBot(
     val routines: List<BotRoutine> = emptyList(),
     /** An action it waits on the user's yes for. */
     val approval: BotApproval? = null,
+    /** A location question waiting for Android's permission (its request id): the screen asks. */
+    val locationAsk: String? = null,
     val loading: Boolean = true,
     val running: Boolean = false,
     /** Set while the Bot works: what it's writing or doing now. */
@@ -68,6 +85,12 @@ data class BotsState(
     val loading: Boolean = false,
     val error: String? = null,
     val open: OpenBot? = null,
+    /** The PC's Google connection and apps (MCP servers), once loaded. */
+    val google: GoogleStatus? = null,
+    val apps: List<McpServer>? = null,
+    val connectionsError: String? = null,
+    /** A Google sign-in is waiting for the browser to come back. */
+    val signingIn: Boolean = false,
 )
 
 /**
@@ -77,8 +100,12 @@ data class BotsState(
 class BotsController(
     private val scope: CoroutineScope,
     private val client: LlmClient,
+    private val context: android.content.Context,
     private val settings: () -> Settings,
 ) {
+    /** Questions to the phone already answered (one comes by the run and by /messages). */
+    private val asked = mutableSetOf<String>()
+    private val waitingLocation = mutableMapOf<String, JSONObject>()
     private val _state = MutableStateFlow(BotsState())
     val state: StateFlow<BotsState> = _state.asStateFlow()
 
@@ -222,6 +249,7 @@ class BotsController(
                         loading = false, running = chat.running, live = if (chat.running) LiveTurn() else null, error = null, reconnecting = false,
                     ))
                 }
+                chat.phone?.let { phone(bot, it) }
                 if (chat.running) followRun(id, chat.follow ?: 0)
             } catch (e: CancellationException) {
                 throw e
@@ -247,6 +275,7 @@ class BotsController(
                     next = ev.seq + 1
                     misses = 0
                     apply(id, ev)
+                    if (ev is BotEvent.Phone) _state.value.open?.bot?.takeIf { it.id == id }?.let { phone(it, ev.phone) }
                 }
                 break
             } catch (e: CancellationException) {
@@ -302,6 +331,8 @@ class BotsController(
             is BotEvent.Done -> o.copy(running = false, live = null, reconnecting = false, approval = null, bot = o.bot.copy(running = false))
             is BotEvent.Approval -> o.copy(reconnecting = false, approval = BotApproval(ev.id, ev.text))
             is BotEvent.Approved -> o.copy(approval = o.approval?.takeIf { it.id != ev.id })
+            is BotEvent.Phone -> o.copy(reconnecting = false)
+            is BotEvent.PhoneDone -> o.copy(locationAsk = o.locationAsk?.takeIf { it != ev.id })
         }
     }
 
@@ -375,6 +406,147 @@ class BotsController(
             done(result)
         }
     }
+
+    /** Something from [bot] for this phone: carried out, or (a question) answered. */
+    private fun phone(bot: Bot, p: JSONObject) {
+        if (!PhoneTools.isQuestion(p)) {
+            PhoneTools.deliver(context, bot.id, bot.name, bot.color, p, BotFeed.appVisible)
+            return
+        }
+        val rid = p.optString("id")
+        if (!asked.add(rid)) return
+        // Location needs Android's permission: the screen asks for it first.
+        if (p.optString("do") == "location" && !PhoneTools.hasLocation(context) && BotFeed.appVisible) {
+            waitingLocation[rid] = p
+            setOpen(bot.id) { it.copy(locationAsk = rid) }
+            return
+        }
+        answerPhone(bot.id, p)
+    }
+
+    private fun answerPhone(botId: String, p: JSONObject) {
+        scope.launch {
+            runCatching {
+                val answer = PhoneTools.answer(context, p)
+                val (urls, token, pin) = pc()
+                client.answerPhone(urls, token, pin, botId, p.optString("id"), answer)
+            }.onFailure { if (it is CancellationException) throw it }
+        }
+    }
+
+    /** The screen asked Android for location (granted or not): answer the question that waited. */
+    fun locationAnswered() {
+        val open = _state.value.open ?: return
+        val rid = open.locationAsk ?: return
+        setOpen(open.bot.id) { it.copy(locationAsk = null) }
+        waitingLocation.remove(rid)?.let { answerPhone(open.bot.id, it) }
+    }
+
+    // --- Accounts and apps (Google, MCP) ------------------------------------------------------------
+
+    fun loadConnections() {
+        scope.launch {
+            try {
+                val (urls, token, pin) = pc()
+                val google = runCatching { client.googleStatus(urls, token, pin) }
+                val apps = client.mcpServers(urls, token, pin)
+                _state.update { it.copy(google = google.getOrNull(), apps = apps, connectionsError = google.exceptionOrNull()?.message) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _state.update { it.copy(connectionsError = e.message ?: "Couldn't reach your PC.") }
+            }
+        }
+    }
+
+    private fun <T> connections(work: suspend (List<String>, String, String) -> T, done: (Result<T>) -> Unit = {}) {
+        scope.launch {
+            val r = runCatching { val (urls, token, pin) = pc(); work(urls, token, pin) }.onFailure { if (it is CancellationException) throw it }
+            done(r)
+        }
+    }
+
+    fun setGoogleClient(id: String, secret: String, done: (Result<GoogleStatus>) -> Unit) =
+        connections({ u, t, p -> client.googleClient(u, t, p, id.trim(), secret.trim()) }) { r -> r.onSuccess { g -> _state.update { it.copy(google = g) } }; done(r) }
+
+    fun signOutGoogle() = connections({ u, t, p -> client.googleSignOut(u, t, p) }) { r -> r.onSuccess { g -> _state.update { it.copy(google = g) } } }
+
+    private var signIn: Job? = null
+
+    /**
+     * Signs in to Google on this phone's browser: Google sends it back to a loopback address this app
+     * listens on, and the code goes to the PC, which keeps the tokens. [openUrl] opens the browser.
+     */
+    fun signInGoogle(openUrl: (String) -> Unit, done: (Result<GoogleStatus>) -> Unit) {
+        signIn?.cancel()
+        _state.update { it.copy(signingIn = true) }
+        signIn = scope.launch {
+            val r = runCatching {
+                val (urls, token, pin) = pc()
+                val (code, state) = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    java.net.ServerSocket(0, 4, java.net.InetAddress.getByName("127.0.0.1")).use { server ->
+                        val url = client.googleStart(urls, token, pin, "http://127.0.0.1:${server.localPort}")
+                        val expected = android.net.Uri.parse(url).getQueryParameter("state")
+                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) { openUrl(url) }
+                        server.soTimeout = 1_000
+                        val end = System.currentTimeMillis() + 15 * 60_000
+                        var got: Pair<String, String>? = null
+                        while (got == null) {
+                            ensureActive()
+                            if (System.currentTimeMillis() > end) throw ApiException("The sign-in took too long; try again.")
+                            val sock = try { server.accept() } catch (_: java.net.SocketTimeoutException) { continue }
+                            sock.use {
+                                val line = it.getInputStream().bufferedReader().readLine().orEmpty()
+                                val q = android.net.Uri.parse("http://x" + line.split(" ").getOrElse(1) { "/" })
+                                val (msg, result) = when {
+                                    q.getQueryParameter("state") != expected -> "Waiting for Google…" to null
+                                    q.getQueryParameter("error") != null -> "Sign-in was cancelled. Go back to CubicAI." to Result.failure<Pair<String, String>>(ApiException("Google sign-in was cancelled (${q.getQueryParameter("error")})."))
+                                    q.getQueryParameter("code") != null -> "Signed in. Go back to CubicAI." to Result.success(q.getQueryParameter("code")!! to expected!!)
+                                    else -> "Waiting for Google…" to null
+                                }
+                                val page = "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'><title>CubicAI</title><body style='font-family:sans-serif;padding:2em'><h2>$msg</h2>"
+                                val bytes = page.toByteArray()
+                                it.getOutputStream().apply {
+                                    write("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ${bytes.size}\r\nConnection: close\r\n\r\n".toByteArray())
+                                    write(bytes)
+                                    flush()
+                                }
+                                if (result != null) got = result.getOrThrow()
+                            }
+                        }
+                        got!!
+                    }
+                }
+                client.googleFinish(urls, token, pin, code, state)
+            }.onFailure { if (it is CancellationException) { _state.update { s -> s.copy(signingIn = false) }; throw it } }
+            _state.update { s -> s.copy(signingIn = false, google = r.getOrNull() ?: s.google) }
+            done(r)
+        }
+    }
+
+    fun cancelSignIn() {
+        signIn?.cancel()
+        _state.update { it.copy(signingIn = false) }
+    }
+
+    /** Adds an app; the PC tries it at once (its tools, or why it couldn't reach it). */
+    fun addApp(fields: JSONObject, done: (Result<Triple<McpServer, List<McpTool>, String?>>) -> Unit) =
+        connections({ u, t, p -> client.addMcp(u, t, p, fields) }) { r ->
+            r.onSuccess { (srv, _, _) -> _state.update { it.copy(apps = it.apps.orEmpty() + srv) } }
+            done(r)
+        }
+
+    fun updateApp(id: String, fields: JSONObject, done: (Result<McpServer>) -> Unit = {}) =
+        connections({ u, t, p -> client.updateMcp(u, t, p, id, fields) }) { r ->
+            r.onSuccess { srv -> _state.update { s -> s.copy(apps = s.apps?.map { if (it.id == id) srv else it }) } }
+            done(r)
+        }
+
+    fun deleteApp(id: String) = connections({ u, t, p -> client.deleteMcp(u, t, p, id) }) { r ->
+        r.onSuccess { _state.update { s -> s.copy(apps = s.apps?.filterNot { it.id == id }) } }
+    }
+
+    fun appTools(id: String, done: (Result<Pair<List<McpTool>, String?>>) -> Unit) = connections({ u, t, p -> client.mcpTools(u, t, p, id) }, done)
 
     /** Allows or refuses the action the open Bot waits on. */
     fun answer(allow: Boolean) {

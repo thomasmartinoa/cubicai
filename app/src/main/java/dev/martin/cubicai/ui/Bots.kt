@@ -53,6 +53,22 @@ import androidx.compose.material.icons.rounded.Folder
 import androidx.compose.material.icons.rounded.Language
 import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.Schedule
+import androidx.compose.material.icons.rounded.Mail
+import androidx.compose.material.icons.rounded.Drafts
+import androidx.compose.material.icons.rounded.CalendarMonth
+import androidx.compose.material.icons.rounded.EventAvailable
+import androidx.compose.material.icons.rounded.EditCalendar
+import androidx.compose.material.icons.rounded.FolderOpen
+import androidx.compose.material.icons.rounded.Download
+import androidx.compose.material.icons.rounded.UploadFile
+import androidx.compose.material.icons.rounded.Alarm
+import androidx.compose.material.icons.rounded.Notifications
+import androidx.compose.material.icons.rounded.LocationOn
+import androidx.compose.material.icons.rounded.BatteryStd
+import androidx.compose.material.icons.rounded.Extension
+import androidx.compose.material.icons.automirrored.rounded.Send
+import androidx.compose.material.icons.automirrored.rounded.OpenInNew
+import android.net.Uri
 import androidx.compose.material.icons.rounded.PanTool
 import androidx.compose.foundation.Image
 import androidx.compose.runtime.produceState
@@ -166,7 +182,9 @@ private fun providerName(id: String) = Providers.all.firstOrNull { it.id == id }
 fun BotsScreen(vm: ChatViewModel, onBack: () -> Unit, onOpenBot: (String) -> Unit, onOpenSettings: () -> Unit) {
     val state by vm.bots.state.collectAsStateWithLifecycle()
     var editing by remember { mutableStateOf<BotDraft?>(null) }
+    var connections by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) { vm.bots.watchList() }
+    if (connections) ConnectionsSheet(vm, onDismiss = { connections = false })
 
     Scaffold(
         topBar = {
@@ -174,6 +192,7 @@ fun BotsScreen(vm: ChatViewModel, onBack: () -> Unit, onOpenBot: (String) -> Uni
                 navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back") } },
                 title = { Text("Bots") },
                 actions = {
+                    if (vm.bots.paired) IconButton(onClick = { connections = true }) { Icon(Icons.Rounded.Extension, "Accounts and apps") }
                     if (vm.bots.paired) IconButton(onClick = { editing = BotDraft.blank(vm) }) { Icon(Icons.Rounded.Add, "New Bot") }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background),
@@ -391,10 +410,13 @@ data class BotDraft(
     /** Null until loaded (new Bots start with none). */
     val memory: String?,
     val computer: Boolean = true,
+    val google: Boolean = false,
+    val phone: Boolean = true,
+    val mcp: List<String> = emptyList(),
 ) {
     companion object {
         /** An existing Bot; its memory (null here) is fetched when the sheet opens. */
-        fun of(bot: Bot) = BotDraft(bot.id, bot.name, bot.job, bot.color, bot.provider, bot.model, null, bot.computer)
+        fun of(bot: Bot) = BotDraft(bot.id, bot.name, bot.job, bot.color, bot.provider, bot.model, null, bot.computer, bot.google, bot.phone, bot.mcp)
 
         /** A new Bot on the chat's model when that can be one, else the PC's. */
         fun blank(vm: ChatViewModel): BotDraft {
@@ -427,6 +449,9 @@ fun BotEditSheet(vm: ChatViewModel, start: BotDraft, onOpenSettings: () -> Unit,
         }
     }
     val canSave = draft.name.isNotBlank() && draft.model.isNotBlank() && !saving
+    val bots by vm.bots.state.collectAsStateWithLifecycle()
+    var connections by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) { vm.bots.loadConnections() }
 
     fun save() {
         saving = true
@@ -438,6 +463,9 @@ fun BotEditSheet(vm: ChatViewModel, start: BotDraft, onOpenSettings: () -> Unit,
             .put("provider", draft.provider)
             .put("model", draft.model)
             .put("computer", draft.computer)
+            .put("google", draft.google)
+            .put("phone", draft.phone)
+            .put("mcp", org.json.JSONArray(draft.mcp))
         draft.memory?.let { if (draft.id != null && savedMemory != null && it != savedMemory) fields.put("memory", it) }
         val done: (Result<Bot>) -> Unit = { r ->
             saving = false
@@ -509,6 +537,40 @@ fun BotEditSheet(vm: ChatViewModel, start: BotDraft, onOpenSettings: () -> Unit,
                 "A terminal and a browser in a locked-down box on your PC (public websites and the workspace only). It asks you before sending a form.",
                 Modifier.fillMaxWidth().clip(MaterialTheme.shapes.small).clickable { draft = draft.copy(computer = !draft.computer) }.padding(vertical = 4.dp),
             ) { CutSwitch(draft.computer) }
+            val google = bots.google
+            SettingRow(
+                "Google",
+                if (google?.connected == true) "Gmail, Calendar and Drive of ${google.email ?: "your account"}. It reads freely and asks before sending or changing anything."
+                else "Not connected. Tap to set it up.",
+                Modifier.fillMaxWidth().clip(MaterialTheme.shapes.small).clickable {
+                    if (google?.connected == true) draft = draft.copy(google = !draft.google) else connections = true
+                }.padding(vertical = 4.dp),
+            ) { CutSwitch(draft.google && google?.connected == true) }
+            SettingRow(
+                "This phone",
+                "Reminders that ring here, notifications, copying text and opening links. It can ask where the phone is while the app is open.",
+                Modifier.fillMaxWidth().clip(MaterialTheme.shapes.small).clickable { draft = draft.copy(phone = !draft.phone) }.padding(vertical = 4.dp),
+            ) { CutSwitch(draft.phone) }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Apps", Modifier.weight(1f), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                TextButton(onClick = { connections = true }, modifier = Modifier.offset(x = 12.dp), shape = MaterialTheme.shapes.small) { Text("Manage") }
+            }
+            val apps = bots.apps.orEmpty()
+            if (apps.isEmpty()) Text(
+                "Tools from other apps (MCP). Add one under Manage.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            apps.forEach { app ->
+                val on = app.id in draft.mcp
+                SettingRow(
+                    app.name,
+                    if (app.kind == "sandbox") "Runs in the Bots' computer" + if (!app.enabled) " · switched off" else "" else Uri.parse(app.url).host.orEmpty() + if (!app.enabled) " · switched off" else "",
+                    Modifier.fillMaxWidth().clip(MaterialTheme.shapes.small).clickable {
+                        draft = draft.copy(mcp = if (on) draft.mcp - app.id else draft.mcp + app.id)
+                    }.padding(vertical = 4.dp),
+                ) { CutSwitch(on) }
+            }
             if (draft.id != null) {
                 OutlinedTextField(
                     value = draft.memory.orEmpty(),
@@ -543,6 +605,7 @@ fun BotEditSheet(vm: ChatViewModel, start: BotDraft, onOpenSettings: () -> Unit,
         current = draft.provider to draft.model,
         onPick = { p, m -> draft = draft.copy(provider = p.id, model = m) },
     )
+    if (connections) ConnectionsSheet(vm, onDismiss = { connections = false })
     if (confirmDelete) DeleteBotDialog(start.name, onDismiss = { confirmDelete = false }, onConfirm = {
         confirmDelete = false
         draft.id?.let { id -> vm.bots.delete(id) { r -> r.onSuccess { onDismiss() }.onFailure { error = it.message } } }
@@ -630,9 +693,32 @@ private fun stepLabel(c: BotCall, done: Boolean): Pair<ImageVector, String> {
         "browser_type" -> Icons.Rounded.Keyboard to (if (done) "Typed “${s("text").take(40)}”" else "Typing “${s("text").take(40)}”")
         "browser_scroll" -> Icons.Rounded.SwapVert to (if (done) "Scrolled ${s("direction").ifBlank { "down" }}" else "Scrolling")
         "browser_back" -> Icons.AutoMirrored.Rounded.ArrowBack to (if (done) "Went back" else "Going back")
+        "gmail_search" -> Icons.Rounded.Mail to (if (done) "Searched your mail for “${s("query")}”" else "Searching your mail")
+        "gmail_read" -> Icons.Rounded.Mail to (if (done) "Read an email" else "Reading an email")
+        "gmail_send" -> Icons.AutoMirrored.Rounded.Send to (if (done) "Emailed ${s("to")}" else "Emailing ${s("to")}")
+        "gmail_draft" -> Icons.Rounded.Drafts to (if (done) "Drafted an email to ${s("to")}" else "Drafting an email")
+        "calendar_events" -> Icons.Rounded.CalendarMonth to (if (done) "Looked at your calendar" else "Looking at your calendar")
+        "calendar_create" -> Icons.Rounded.EventAvailable to (if (done) "Added “${s("title")}” to your calendar" else "Adding “${s("title")}”")
+        "calendar_update" -> Icons.Rounded.EditCalendar to (if (done) "Changed an event" else "Changing an event")
+        "calendar_delete" -> Icons.Rounded.EventBusy to (if (done) "Deleted an event" else "Deleting an event")
+        "drive_search" -> Icons.Rounded.FolderOpen to (if (done) "Searched your Drive for “${s("query")}”" else "Searching your Drive")
+        "drive_read" -> Icons.Rounded.Description to (if (done) "Read a Drive file" else "Reading a Drive file")
+        "drive_download" -> Icons.Rounded.Download to (if (done) "Copied a Drive file to the workspace" else "Copying from Drive")
+        "drive_create" -> Icons.Rounded.UploadFile to (if (done) "Put “${s("name")}” in your Drive" else "Putting “${s("name")}” in your Drive")
+        "phone_remind" -> Icons.Rounded.Alarm to (if (done) "Set a reminder: ${s("text")}" else "Setting a reminder")
+        "phone_notify" -> Icons.Rounded.Notifications to (if (done) "Sent you a notification" else "Sending a notification")
+        "phone_copy" -> Icons.Rounded.ContentCopy to (if (done) "Sent text to copy" else "Sending text to copy")
+        "phone_open" -> Icons.AutoMirrored.Rounded.OpenInNew to (if (done) "Sent a link: ${domainOf(s("url"))}" else "Sending a link")
+        "phone_location" -> Icons.Rounded.LocationOn to (if (done) "Asked where your phone is" else "Asking where your phone is")
+        "phone_status" -> Icons.Rounded.BatteryStd to (if (done) "Checked your phone" else "Checking your phone")
         "schedule_routine" -> Icons.Rounded.Schedule to (if (done) "Proposed the routine “${s("name")}”" else "Proposing a routine")
         "cancel_routine" -> Icons.Rounded.EventBusy to (if (done) "Withdrew or switched off “${s("name")}”" else "Cancelling a routine")
-        else -> Icons.Rounded.Tune to c.name
+        else -> if ("__" in c.name) {
+            // An app's tool (MCP): app__tool.
+            val app = c.name.substringBefore("__")
+            val tool = c.name.substringAfter("__").replace('_', ' ').replace('-', ' ')
+            Icons.Rounded.Extension to (if (done) "Used $app: $tool" else "Using $app: $tool")
+        } else Icons.Rounded.Tune to c.name
     }
 }
 
@@ -654,6 +740,13 @@ fun BotChatScreen(vm: ChatViewModel, onBack: () -> Unit, onOpenSettings: () -> U
     var draft by rememberSaveable(bot.id) { mutableStateOf("") }
     LaunchedEffect(Unit) { vm.bots.watchOpen() }
     val colors = remember(bot.color) { cubeColors(bot.color) }
+    // The Bot asked where the phone is: Android's permission first (answered either way).
+    val locationPermission = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.RequestMultiplePermissions(),
+    ) { vm.bots.locationAnswered() }
+    LaunchedEffect(open.locationAsk) {
+        if (open.locationAsk != null) locationPermission.launch(arrayOf(android.Manifest.permission.ACCESS_FINE_LOCATION, android.Manifest.permission.ACCESS_COARSE_LOCATION))
+    }
 
     Scaffold(
         topBar = {

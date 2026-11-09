@@ -102,7 +102,9 @@ object BotFeed {
         val seen = prefs.getStringSet("seen", emptySet()).orEmpty()
         val fresh = items.filter { it.id !in seen }
         // The first check ever only sets where to start from.
-        if (notify && !appVisible && after > 0) fresh.filter { !it.quiet }.forEach { show(context, it) }
+        // What a Bot sent this phone is carried out whether or not the app shows (each only once).
+        if (after > 0) fresh.filter { it.kind == "phone" && it.phone != null }.forEach { PhoneTools.deliver(context, it.bot, it.name, it.color, it.phone!!, appVisible) }
+        if (notify && !appVisible && after > 0) fresh.filter { !it.quiet && it.kind != "phone" }.forEach { show(context, it) }
         prefs.edit {
             putLong("after", upto)
             putStringSet("seen", (items.map { it.id }).takeLast(50).toSet())
