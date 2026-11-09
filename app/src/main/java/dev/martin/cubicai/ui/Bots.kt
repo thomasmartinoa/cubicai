@@ -53,6 +53,17 @@ import androidx.compose.material.icons.rounded.Folder
 import androidx.compose.material.icons.rounded.Language
 import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.Schedule
+import androidx.compose.material.icons.rounded.PanTool
+import androidx.compose.foundation.Image
+import androidx.compose.runtime.produceState
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import androidx.compose.material.icons.rounded.Terminal
+import androidx.compose.material.icons.rounded.TouchApp
+import androidx.compose.material.icons.rounded.Keyboard
+import androidx.compose.material.icons.rounded.SwapVert
 import androidx.compose.material.icons.rounded.EventBusy
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Stop
@@ -131,6 +142,12 @@ private val IDEAS = listOf(
         "Help me write: drafts, edits, emails, posts. Keep longer pieces as files in writing/ in the workspace and update them when I ask. " +
             "Learn my style and preferences and remember them.",
         "#14b8a6",
+    ),
+    BotIdea(
+        "Coder",
+        "Write and run code for me on your computer: scripts, data crunching, file conversions, small tools. Keep projects in code/ in the workspace, " +
+            "run what you write to check it works, fix it until it does, and tell me how to use it.",
+        "#4caf50",
     ),
     BotIdea(
         "Planner",
@@ -232,7 +249,7 @@ private fun Intro() {
         Text("Give each Bot a role", Modifier.padding(top = 16.dp), style = MaterialTheme.typography.headlineSmall)
         Text(
             "Bots live on your PC and keep working when you close the app. Each has its own job, chat and memory; " +
-                "they can search the web, read pages and keep files in a workspace folder they share.",
+                "they search the web, use a sandboxed computer (terminal and browser), keep files in a shared workspace and can work on a schedule.",
             Modifier.padding(top = 8.dp),
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -373,10 +390,11 @@ data class BotDraft(
     val model: String,
     /** Null until loaded (new Bots start with none). */
     val memory: String?,
+    val computer: Boolean = true,
 ) {
     companion object {
         /** An existing Bot; its memory (null here) is fetched when the sheet opens. */
-        fun of(bot: Bot) = BotDraft(bot.id, bot.name, bot.job, bot.color, bot.provider, bot.model, null)
+        fun of(bot: Bot) = BotDraft(bot.id, bot.name, bot.job, bot.color, bot.provider, bot.model, null, bot.computer)
 
         /** A new Bot on the chat's model when that can be one, else the PC's. */
         fun blank(vm: ChatViewModel): BotDraft {
@@ -419,6 +437,7 @@ fun BotEditSheet(vm: ChatViewModel, start: BotDraft, onOpenSettings: () -> Unit,
             .put("color", draft.color)
             .put("provider", draft.provider)
             .put("model", draft.model)
+            .put("computer", draft.computer)
         draft.memory?.let { if (draft.id != null && savedMemory != null && it != savedMemory) fields.put("memory", it) }
         val done: (Result<Bot>) -> Unit = { r ->
             saving = false
@@ -485,6 +504,11 @@ fun BotEditSheet(vm: ChatViewModel, start: BotDraft, onOpenSettings: () -> Unit,
                     )
                 }
             }
+            SettingRow(
+                "Computer",
+                "A terminal and a browser in a locked-down box on your PC (public websites and the workspace only). It asks you before sending a form.",
+                Modifier.fillMaxWidth().clip(MaterialTheme.shapes.small).clickable { draft = draft.copy(computer = !draft.computer) }.padding(vertical = 4.dp),
+            ) { CutSwitch(draft.computer) }
             if (draft.id != null) {
                 OutlinedTextField(
                     value = draft.memory.orEmpty(),
@@ -534,7 +558,7 @@ private sealed interface BotRowItem {
     data class User(val m: BotMessage) : BotRowItem { override val key get() = m.id }
     data class RoutineRun(val m: BotMessage) : BotRowItem { override val key get() = m.id }
     data class Head(override val key: String, val spinning: Boolean, val took: Long) : BotRowItem
-    data class Step(val call: BotCall, val result: BotMessage?, override val key: String) : BotRowItem
+    data class Step(val call: BotCall, val result: BotMessage?, override val key: String, val live: Boolean = false) : BotRowItem
     data class Reply(val m: BotMessage, val sources: List<String>) : BotRowItem { override val key get() = m.id }
     data class Failure(val m: BotMessage) : BotRowItem { override val key get() = m.id }
     data class Live(val turn: LiveTurn, val withHead: Boolean) : BotRowItem { override val key get() = "live" }
@@ -565,7 +589,8 @@ private fun rowsOf(o: OpenBot): List<BotRowItem> {
                 else if (m.text.isNotBlank() || m.stopped || (m.reasoning.isNotBlank() && m.calls.isEmpty())) rows += BotRowItem.Reply(m, if (m.calls.isEmpty()) sources.distinct() else emptyList())
                 m.calls.forEach { c ->
                     val r = results[c.id]
-                    rows += BotRowItem.Step(c, r, "step:" + c.id + ":" + m.id)
+                    // A call without its result while the Bot works is the one under way.
+                    rows += BotRowItem.Step(c, r, "step:" + c.id + ":" + m.id, live = r == null && o.running)
                     r?.citations?.let { sources += it }
                 }
             }
@@ -576,7 +601,13 @@ private fun rowsOf(o: OpenBot): List<BotRowItem> {
         val headIndex = rows.indexOfLast { it is BotRowItem.Head }
         val answering = headIndex > lastUser
         if (answering) rows[headIndex] = (rows[headIndex] as BotRowItem.Head).copy(spinning = true, took = 0)
-        rows += BotRowItem.Live(o.live ?: LiveTurn(), withHead = !answering)
+        // The tool under way already shows as its stored step.
+        val stored = o.messages.flatMap { m -> m.calls.map { it.id } }.toSet()
+        val turn = o.live ?: LiveTurn()
+        val stepUnderWay = turn.tool?.id in stored
+        val live = if (stepUnderWay) turn.copy(tool = null) else turn
+        // While that step works (or waits for the user's yes) there's nothing more to show.
+        if (!(stepUnderWay && live.text.isEmpty() && live.reasoning.isEmpty() && answering)) rows += BotRowItem.Live(live, withHead = !answering)
     }
     return rows
 }
@@ -593,6 +624,12 @@ private fun stepLabel(c: BotCall, done: Boolean): Pair<ImageVector, String> {
         "write_file" -> Icons.Rounded.EditNote to (if (done) "Saved ${s("path")}" else "Saving ${s("path")}")
         "remember" -> Icons.Rounded.Bookmark to (if (done) "Remembered: ${s("note")}" else "Remembering")
         "forget" -> Icons.Rounded.BookmarkRemove to (if (done) "Forgot notes about “${s("text")}”" else "Forgetting")
+        "run_command" -> Icons.Rounded.Terminal to (if (done) "Ran " else "Running ") + "`" + s("command").lineSequence().first().take(80) + "`"
+        "browser_open" -> Icons.Rounded.Language to (if (done) "Opened ${domainOf(s("url"))}" else "Opening ${domainOf(s("url"))}")
+        "browser_click" -> Icons.Rounded.TouchApp to (if (done) "Clicked ${s("element")}" else "Clicking ${s("element")}")
+        "browser_type" -> Icons.Rounded.Keyboard to (if (done) "Typed “${s("text").take(40)}”" else "Typing “${s("text").take(40)}”")
+        "browser_scroll" -> Icons.Rounded.SwapVert to (if (done) "Scrolled ${s("direction").ifBlank { "down" }}" else "Scrolling")
+        "browser_back" -> Icons.AutoMirrored.Rounded.ArrowBack to (if (done) "Went back" else "Going back")
         "schedule_routine" -> Icons.Rounded.Schedule to (if (done) "Proposed the routine “${s("name")}”" else "Proposing a routine")
         "cancel_routine" -> Icons.Rounded.EventBusy to (if (done) "Withdrew or switched off “${s("name")}”" else "Cancelling a routine")
         else -> Icons.Rounded.Tune to c.name
@@ -666,9 +703,14 @@ fun BotChatScreen(vm: ChatViewModel, onBack: () -> Unit, onOpenSettings: () -> U
                         Cube(32.dp, spinning = true, colors = colors)
                     }
                     open.messages.isEmpty() && !open.running -> BotWelcome(bot)
-                    else -> BotMessages(open, chatState.settings.thoughtsOpen, vm::setThoughtsOpen)
+                    else -> BotMessages(open, chatState.settings.thoughtsOpen, vm::setThoughtsOpen) { m -> BotShot(vm, bot.id, m.id) }
                 }
             }
+            AnimatedVisibility(
+                visible = open.approval != null,
+                enter = expandVertically(tween(200)) + fadeIn(tween(200)),
+                exit = shrinkVertically(tween(160)) + fadeOut(tween(120)),
+            ) { open.approval?.let { ActionApproval(bot.name, it.text, onAnswer = vm.bots::answer) } }
             RoutineApprovals(vm, open)
             AnimatedVisibility(
                 visible = open.error != null || open.reconnecting,
@@ -744,7 +786,7 @@ private fun BotWelcome(bot: Bot) {
 }
 
 @Composable
-private fun BotMessages(open: OpenBot, thoughtsOpen: Boolean?, onThoughts: (Boolean) -> Unit) {
+private fun BotMessages(open: OpenBot, thoughtsOpen: Boolean?, onThoughts: (Boolean) -> Unit, shot: @Composable (BotMessage) -> Unit) {
     val rows = remember(open.messages, open.live, open.running) { rowsOf(open) }
     val colors = remember(open.bot.color) { cubeColors(open.bot.color) }
     // Newest at the bottom and kept there while the Bot writes: reverseLayout pins the view to the
@@ -764,7 +806,7 @@ private fun BotMessages(open: OpenBot, thoughtsOpen: Boolean?, onThoughts: (Bool
                     is BotRowItem.User -> BotUserBubble(row.m.text)
                     is BotRowItem.RoutineRun -> RoutineRunRow(row.m.routine.orEmpty(), row.m.text)
                     is BotRowItem.Head -> BotHeader(open.bot.name, colors, row.spinning, null, row.took)
-                    is BotRowItem.Step -> StepRow(row.call, row.result)
+                    is BotRowItem.Step -> StepRow(row.call, row.result, live = row.live, shot = shot)
                     is BotRowItem.Reply -> Column {
                         if (row.m.reasoning.isNotBlank()) ReasoningBlock(row.m.reasoning, active = false, preferred = thoughtsOpen, onToggle = onThoughts)
                         if (row.m.text.isNotBlank()) MarkdownText(row.m.text)
@@ -819,7 +861,7 @@ private fun LiveTurnView(name: String, colors: CubeColors, row: BotRowItem.Live,
 }
 
 @Composable
-private fun StepRow(call: BotCall, result: BotMessage?, live: Boolean = false) {
+private fun StepRow(call: BotCall, result: BotMessage?, live: Boolean = false, shot: (@Composable (BotMessage) -> Unit)? = null) {
     var open by remember { mutableStateOf(false) }
     val (icon, label) = stepLabel(call, done = !live)
     val failed = result?.failed == true
@@ -836,7 +878,11 @@ private fun StepRow(call: BotCall, result: BotMessage?, live: Boolean = false) {
             Spacer(Modifier.width(8.dp))
             if (live) ShimmerText(label)
             else Text(
-                label + if (failed) " (failed)" else "",
+                label + when {
+                    result?.text?.startsWith("NOT DONE. The user said no") == true -> " (you said no)"
+                    failed -> " (failed)"
+                    else -> ""
+                },
                 style = MaterialTheme.typography.bodyMedium,
                 color = tint,
                 maxLines = 2,
@@ -844,14 +890,18 @@ private fun StepRow(call: BotCall, result: BotMessage?, live: Boolean = false) {
             )
             if (result != null && !failed) Icon(Icons.Rounded.Check, null, Modifier.padding(start = 6.dp).size(14.dp), tint = MaterialTheme.colorScheme.primary)
         }
+        // What the browser showed, so you can watch it work.
+        if (result?.shot == true && shot != null) shot(result)
         AnimatedVisibility(open && result != null, enter = expandVertically(tween(200)) + fadeIn(tween(200)), exit = shrinkVertically(tween(160)) + fadeOut(tween(120))) {
             Surface(color = MaterialTheme.colorScheme.surfaceContainer, shape = MaterialTheme.shapes.medium, modifier = Modifier.fillMaxWidth().padding(top = 4.dp)) {
-                Text(
-                    result?.text.orEmpty().trim(),
-                    Modifier.heightIn(max = 240.dp).verticalScroll(rememberScrollState()).padding(12.dp),
-                    style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+                Column {
+                    Text(
+                        result?.text.orEmpty().trim(),
+                        Modifier.heightIn(max = 240.dp).verticalScroll(rememberScrollState()).padding(12.dp),
+                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
         }
     }
@@ -936,6 +986,51 @@ private fun BotComposer(
                     }
                 }
             }
+        }
+    }
+}
+
+/** The Bot waits for a yes before doing something that sends data (a form on a website). */
+@Composable
+private fun ActionApproval(name: String, text: String, onAnswer: (Boolean) -> Unit) {
+    Surface(
+        shape = MaterialTheme.shapes.medium,
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary),
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+    ) {
+        Column(Modifier.padding(start = 16.dp, end = 8.dp, top = 12.dp, bottom = 4.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Rounded.PanTool, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.primary)
+                Text("$name asks first", Modifier.padding(start = 8.dp), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+            }
+            Text(text, Modifier.padding(top = 6.dp, end = 8.dp), style = MaterialTheme.typography.bodyMedium)
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                TextButton(onClick = { onAnswer(false) }, shape = MaterialTheme.shapes.small) { Text("Don't") }
+                TextButton(onClick = { onAnswer(true) }, shape = MaterialTheme.shapes.small) { Text("Allow") }
+            }
+        }
+    }
+}
+
+/** A browser step's screenshot; tap for the whole page view. */
+@Composable
+private fun BotShot(vm: ChatViewModel, botId: String, messageId: String) {
+    val bitmap by produceState<android.graphics.Bitmap?>(null, messageId) { value = vm.bots.shot(botId, messageId) }
+    var full by remember { mutableStateOf(false) }
+    val b = bitmap ?: return
+    val image = remember(b) { b.asImageBitmap() }
+    Image(
+        image,
+        "What the browser showed",
+        Modifier.padding(top = 4.dp).fillMaxWidth().heightIn(max = 200.dp).clip(MaterialTheme.shapes.medium)
+            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, MaterialTheme.shapes.medium).clickable { full = true },
+        contentScale = ContentScale.Crop,
+        alignment = Alignment.TopCenter,
+    )
+    if (full) Dialog(onDismissRequest = { full = false }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Box(Modifier.fillMaxSize().clickable { full = false }.padding(16.dp), contentAlignment = Alignment.Center) {
+            Image(image, "What the browser showed", Modifier.fillMaxWidth().clip(MaterialTheme.shapes.medium), contentScale = ContentScale.FillWidth)
         }
     }
 }

@@ -8,7 +8,10 @@ import dev.martin.cubicai.net.BotCall
 import dev.martin.cubicai.net.BotEvent
 import dev.martin.cubicai.net.BotGoneException
 import dev.martin.cubicai.net.BotMessage
+import dev.martin.cubicai.net.BotApproval
 import dev.martin.cubicai.net.BotRoutine
+import dev.martin.cubicai.net.answerBot
+import dev.martin.cubicai.net.botShot
 import dev.martin.cubicai.net.addRoutine
 import dev.martin.cubicai.net.botRoutines
 import dev.martin.cubicai.net.deleteRoutine
@@ -48,6 +51,8 @@ data class OpenBot(
     val messages: List<BotMessage> = emptyList(),
     /** Its routines; ones it proposed wait for approval. */
     val routines: List<BotRoutine> = emptyList(),
+    /** An action it waits on the user's yes for. */
+    val approval: BotApproval? = null,
     val loading: Boolean = true,
     val running: Boolean = false,
     /** Set while the Bot works: what it's writing or doing now. */
@@ -213,7 +218,7 @@ class BotsController(
                 val routines = runCatching { client.botRoutines(urls, token, pin, id) }.getOrNull()
                 _state.update { s ->
                     s.copy(open = s.open?.takeIf { it.bot.id == id }?.copy(
-                        bot = bot.copy(running = chat.running), memory = memory, messages = chat.messages, routines = routines ?: s.open.routines,
+                        bot = bot.copy(running = chat.running), memory = memory, messages = chat.messages, routines = routines ?: s.open.routines, approval = chat.approval,
                         loading = false, running = chat.running, live = if (chat.running) LiveTurn() else null, error = null, reconnecting = false,
                     ))
                 }
@@ -294,7 +299,9 @@ class BotsController(
                     },
                 )
             }
-            is BotEvent.Done -> o.copy(running = false, live = null, reconnecting = false, bot = o.bot.copy(running = false))
+            is BotEvent.Done -> o.copy(running = false, live = null, reconnecting = false, approval = null, bot = o.bot.copy(running = false))
+            is BotEvent.Approval -> o.copy(reconnecting = false, approval = BotApproval(ev.id, ev.text))
+            is BotEvent.Approved -> o.copy(approval = o.approval?.takeIf { it.id != ev.id })
         }
     }
 
@@ -367,6 +374,34 @@ class BotsController(
             result.onSuccess { m -> setOpen(id) { it.copy(memory = m) } }
             done(result)
         }
+    }
+
+    /** Allows or refuses the action the open Bot waits on. */
+    fun answer(allow: Boolean) {
+        val open = _state.value.open ?: return
+        val a = open.approval ?: return
+        setOpen(open.bot.id) { it.copy(approval = null) }
+        scope.launch {
+            runCatching {
+                val (urls, token, pin) = pc()
+                client.answerBot(urls, token, pin, open.bot.id, a.id, allow)
+            }.onFailure { e ->
+                if (e is CancellationException) throw e
+                setOpen(open.bot.id) { it.copy(error = e.message) }
+            }
+        }
+    }
+
+    private val shots = android.util.LruCache<String, android.graphics.Bitmap>(24)
+
+    /** A browser step's screenshot, decoded (kept for a few steps). */
+    suspend fun shot(botId: String, messageId: String): android.graphics.Bitmap? {
+        shots.get(messageId)?.let { return it }
+        return runCatching {
+            val (urls, token, pin) = pc()
+            val bytes = client.botShot(urls, token, pin, botId, messageId)
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) { android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size) }
+        }.onFailure { if (it is CancellationException) throw it }.getOrNull()?.also { shots.put(messageId, it) }
     }
 
     // --- Routines ---------------------------------------------------------------------------------

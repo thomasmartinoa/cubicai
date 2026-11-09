@@ -33,6 +33,8 @@ data class Bot(
     /** Routines switched on, and ones the Bot proposed that wait for the user's yes. */
     val routines: Int = 0,
     val pending: Int = 0,
+    /** Whether it may use the PC's sandboxed computer (terminal and browser). */
+    val computer: Boolean = true,
 )
 
 /**
@@ -91,6 +93,8 @@ data class BotMessage(
     val stopped: Boolean = false,
     val model: String? = null,
     val took: Long = 0,
+    /** A browser step with a screenshot (fetched by the message's id). */
+    val shot: Boolean = false,
 )
 
 /** What a Bot's run sends while it works. [seq] numbers them, so a phone that comes back can carry on. */
@@ -105,10 +109,17 @@ sealed interface BotEvent {
     /** A message was stored (the user's, a finished turn, a tool's result or an error). */
     data class Posted(override val seq: Int, val message: BotMessage) : BotEvent
     data class Done(override val seq: Int, val error: String?, val stopped: Boolean) : BotEvent
+    /** The Bot waits for the user to allow an action (e.g. submitting a form). */
+    data class Approval(override val seq: Int, val id: String, val text: String) : BotEvent
+    /** That wait is over (answered, stopped or timed out). */
+    data class Approved(override val seq: Int, val id: String) : BotEvent
 }
 
+/** An action the Bot waits on the user's yes for. */
+data class BotApproval(val id: String, val text: String)
+
 /** A Bot's chat as the PC has it, and where to follow its run from if it's working. */
-data class BotChat(val messages: List<BotMessage>, val running: Boolean, val follow: Int?)
+data class BotChat(val messages: List<BotMessage>, val running: Boolean, val follow: Int?, val approval: BotApproval? = null)
 
 /** Which cloud keys the PC holds (never the keys themselves). */
 data class PcKeys(val present: Set<String>, val customUrl: String?)
@@ -132,6 +143,7 @@ internal fun botFrom(o: JSONObject): Bot {
         created = o.optDouble("created", 0.0),
         routines = o.optInt("routines"),
         pending = o.optInt("pending"),
+        computer = o.optBoolean("computer", true),
     )
 }
 
@@ -176,6 +188,7 @@ internal fun botMessageFrom(o: JSONObject) = BotMessage(
     stopped = o.optBoolean("stopped"),
     model = o.str("model"),
     took = o.optLong("took"),
+    shot = o.optBoolean("shot"),
 )
 
 internal fun botEventFrom(o: JSONObject): BotEvent? {
@@ -187,6 +200,8 @@ internal fun botEventFrom(o: JSONObject): BotEvent? {
         "tool" -> BotEvent.Tool(seq, BotCall(o.optString("id"), o.optString("name"), o.optString("args", "{}")))
         "message" -> o.optJSONObject("message")?.let { BotEvent.Posted(seq, botMessageFrom(it)) }
         "done" -> BotEvent.Done(seq, o.str("error"), o.optBoolean("stopped"))
+        "approval" -> BotEvent.Approval(seq, o.optString("id"), o.optString("text"))
+        "approved" -> BotEvent.Approved(seq, o.optString("id"))
         else -> null
     }
 }
@@ -255,7 +270,10 @@ suspend fun LlmClient.deleteBot(baseUrls: List<String>, token: String, pin: Stri
 suspend fun LlmClient.botChat(baseUrls: List<String>, token: String, pin: String, id: String): BotChat =
     botCall(baseUrls, token, pin, { url("$it/bots/$id/messages") }) { r ->
         val o = JSONObject(r.body.string())
-        BotChat(o.optJSONArray("messages").objects().map(::botMessageFrom), o.optBoolean("running"), if (o.isNull("follow")) null else o.optInt("follow"))
+        BotChat(
+            o.optJSONArray("messages").objects().map(::botMessageFrom), o.optBoolean("running"), if (o.isNull("follow")) null else o.optInt("follow"),
+            o.optJSONObject("approval")?.let { BotApproval(it.optString("id"), it.optString("text")) },
+        )
     }
 
 /**
@@ -328,3 +346,11 @@ suspend fun LlmClient.botFeed(baseUrls: List<String>, token: String, pin: String
         val o = JSONObject(r.body.string())
         o.optJSONArray("items").objects().map(::feedItemFrom) to o.optLong("now", after)
     }
+
+/** Answers an action the Bot waits on. */
+suspend fun LlmClient.answerBot(baseUrls: List<String>, token: String, pin: String, id: String, approval: String, allow: Boolean) =
+    botCall(baseUrls, token, pin, { url("$it/bots/$id/approval").post(json(JSONObject().put("id", approval).put("allow", allow))) }) { }
+
+/** A browser step's screenshot (JPEG bytes). */
+suspend fun LlmClient.botShot(baseUrls: List<String>, token: String, pin: String, id: String, messageId: String): ByteArray =
+    botCall(baseUrls, token, pin, { url("$it/bots/$id/shots/$messageId.jpg") }) { r -> r.body.bytes() }
