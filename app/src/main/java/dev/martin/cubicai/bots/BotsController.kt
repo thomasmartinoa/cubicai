@@ -25,6 +25,7 @@ import dev.martin.cubicai.net.googleStatus
 import dev.martin.cubicai.net.mcpServers
 import dev.martin.cubicai.net.mcpTools
 import dev.martin.cubicai.net.updateMcp
+import dev.martin.cubicai.net.botScreen
 import dev.martin.cubicai.net.botShot
 import dev.martin.cubicai.net.addRoutine
 import dev.martin.cubicai.net.botRoutines
@@ -104,6 +105,8 @@ data class OpenBot(
 data class Teaching(
     val botId: String,
     val botName: String,
+    /** Taking over from the Bot mid-task: its browser waits, and "Hand back" lets it carry on. */
+    val takeover: Boolean = false,
     val state: TeachState? = null,
     val picture: android.graphics.Bitmap? = null,
     /** A step is on its way to the PC. */
@@ -772,10 +775,28 @@ class BotsController(
     private fun setTeaching(change: (Teaching) -> Teaching) = _state.update { s -> s.copy(teaching = s.teaching?.let(change)) }
 
     /** Opens the Bot's browser for the user to show it a task. */
-    fun startTeach(bot: Bot) {
-        _state.update { it.copy(teaching = Teaching(bot.id, bot.name, busy = true)) }
-        teachStep(JSONObject().put("do", "start"))
+    fun startTeach(bot: Bot, takeover: Boolean = false) {
+        _state.update { it.copy(teaching = Teaching(bot.id, bot.name, takeover = takeover, busy = true)) }
+        teachStep(JSONObject().put("do", "start").put("takeover", takeover))
     }
+
+    /** The browser as it is now, for watching a Bot work; null with why when there's nothing to see. */
+    suspend fun screen(botId: String): Result<android.graphics.Bitmap> = runCatching {
+        val (urls, token, pin) = pc()
+        val bytes = client.botScreen(urls, token, pin, botId)
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) { android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size) }
+            ?: error("The browser gave no picture.")
+    }.onFailure { if (it is CancellationException) throw it }
+
+    /** A Bot's picture as a file in the cache, for sharing it to another app. */
+    suspend fun pictureFile(botId: String, messageId: String): java.io.File? = runCatching {
+        val (urls, token, pin) = pc()
+        val bytes = client.botShot(urls, token, pin, botId, messageId)
+        val ext = if (bytes.size > 3 && bytes[0] == 0x89.toByte() && bytes[1] == 'P'.code.toByte()) "png" else "jpg"
+        val dir = java.io.File(context.cacheDir, "camera").apply { mkdirs() }
+        dir.listFiles { f -> f.name.startsWith("bot-") }?.forEach { it.delete() }
+        java.io.File(dir, "bot-$messageId.$ext").apply { writeBytes(bytes) }
+    }.onFailure { if (it is CancellationException) throw it }.getOrNull()
 
     /** A step in the browser ({do: open|tap|text|key|scroll|back|look, …}); the picture follows. */
     private var lastStep = "" to 0L

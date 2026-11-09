@@ -127,6 +127,14 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.material.icons.rounded.Image
+import androidx.compose.material.icons.rounded.Share
+import androidx.compose.material.icons.rounded.Visibility
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.material3.FilledTonalButton
+import androidx.compose.foundation.layout.sizeIn
+import androidx.compose.foundation.layout.aspectRatio
+import kotlinx.coroutines.launch
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.style.TextAlign
@@ -690,7 +698,7 @@ private fun rowsOf(o: OpenBot): List<BotRowItem> {
                 rows += when {
                     m.routine != null -> BotRowItem.RoutineRun(m)
                     m.from != null -> BotRowItem.Handoff(m)
-                    m.taught.isNotEmpty() -> BotRowItem.Taught(m)
+                    m.taught.isNotEmpty() || m.tookOver -> BotRowItem.Taught(m)
                     else -> BotRowItem.User(m)
                 }
                 headed = false
@@ -753,6 +761,10 @@ private fun stepLabel(c: BotCall, done: Boolean): Pair<ImageVector, String> {
         "forget" -> Icons.Rounded.BookmarkRemove to (if (done) "Forgot notes about “${s("text")}”" else "Forgetting")
         "run_command" -> Icons.Rounded.Terminal to (if (done) "Ran " else "Running ") + "`" + s("command").lineSequence().first().take(80) + "`"
         "browser_open" -> Icons.Rounded.Language to (if (done) "Opened ${domainOf(s("url"))}" else "Opening ${domainOf(s("url"))}")
+        "make_picture" -> Icons.Rounded.Image to when {
+            s("edit").isNotBlank() -> if (done) "Edited ${s("edit")}" else "Editing ${s("edit")}"
+            else -> if (done) "Made a picture" else "Making a picture"
+        }
         "browser_click" -> Icons.Rounded.TouchApp to (if (done) "Clicked ${s("element")}" else "Clicking ${s("element")}")
         "browser_type" -> Icons.Rounded.Keyboard to (if (done) "Typed “${s("text").take(40)}”" else "Typing “${s("text").take(40)}”")
         "browser_scroll" -> Icons.Rounded.SwapVert to (if (done) "Scrolled ${s("direction").ifBlank { "down" }}" else "Scrolling")
@@ -806,6 +818,7 @@ fun BotChatScreen(vm: ChatViewModel, onBack: () -> Unit, onOpenSettings: () -> U
     var routinesOpen by remember { mutableStateOf(false) }
     var skillsOpen by remember { mutableStateOf(false) }
     var groupEditing by remember { mutableStateOf(false) }
+    var watching by remember { mutableStateOf(false) }
     var draft by rememberSaveable(bot.id) { mutableStateOf("") }
     val members = remember(open.group, state.bots) { open.group?.members.orEmpty().mapNotNull { m -> state.bots.firstOrNull { it.id == m } } }
     // Who said something: in a group, the Bot by its id; otherwise this Bot.
@@ -845,6 +858,8 @@ fun BotChatScreen(vm: ChatViewModel, onBack: () -> Unit, onOpenSettings: () -> U
                 actions = {
                     if (open.isGroup) IconButton(onClick = { groupEditing = true }) { Icon(Icons.Rounded.Tune, "Edit group") }
                     else {
+                        // While it works on its computer: watch it (and take over).
+                        if (bot.computer && open.running) IconButton(onClick = { watching = true }) { Icon(Icons.Rounded.Visibility, "Watch its screen") }
                         val pending = open.routines.count { !it.approved }
                         IconButton(onClick = { routinesOpen = true }) {
                             BadgedBox(badge = { if (pending > 0) Badge { Text("$pending") } }) { Icon(Icons.Rounded.Schedule, "Routines") }
@@ -854,6 +869,12 @@ fun BotChatScreen(vm: ChatViewModel, onBack: () -> Unit, onOpenSettings: () -> U
                     Box {
                         IconButton(onClick = { menu = true }) { Icon(Icons.Rounded.MoreVert, "More") }
                         CubicMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                            if (!open.isGroup) DropdownMenuItem(
+                                text = { Text("Watch its screen") },
+                                leadingIcon = { Icon(Icons.Rounded.Visibility, null) },
+                                enabled = bot.computer,
+                                onClick = { menu = false; watching = true },
+                            )
                             if (!open.isGroup) DropdownMenuItem(
                                 text = { Text("Teach a task") },
                                 leadingIcon = { Icon(Icons.Rounded.School, null) },
@@ -885,7 +906,7 @@ fun BotChatScreen(vm: ChatViewModel, onBack: () -> Unit, onOpenSettings: () -> U
                         Cube(32.dp, spinning = true, colors = colors)
                     }
                     open.messages.isEmpty() && !open.running -> if (open.isGroup) GroupWelcome(bot.name, members) else BotWelcome(bot)
-                    else -> BotMessages(open, chatState.settings.thoughtsOpen, vm::setThoughtsOpen, who) { m -> BotShot(vm, m.bot ?: bot.id, m.id) }
+                    else -> BotMessages(open, chatState.settings.thoughtsOpen, vm::setThoughtsOpen, who) { m -> BotShot(vm, m.bot ?: bot.id, m.id, picture = m.tool == "make_picture") }
                 }
             }
             AnimatedVisibility(
@@ -953,6 +974,7 @@ fun BotChatScreen(vm: ChatViewModel, onBack: () -> Unit, onOpenSettings: () -> U
     if (skillsOpen) SkillsSheet(vm, onDismiss = { skillsOpen = false })
     if (groupEditing) GroupEditSheet(vm, open.group, onDismiss = { groupEditing = false }, onSaved = { groupEditing = false })
     if (state.teaching != null) TeachScreen(vm)
+    else if (watching && !open.isGroup) WatchScreen(vm, bot, open.live?.tool?.let { stepLabel(it, false).second }, open.running, onClose = { watching = false })
     if (editing) {
         BotEditSheet(vm, BotDraft.of(bot), onOpenSettings = onOpenSettings, onDismiss = { editing = false }, onSaved = { editing = false })
     }
@@ -1020,7 +1042,7 @@ private fun BotMessages(open: OpenBot, thoughtsOpen: Boolean?, onThoughts: (Bool
                     is BotRowItem.User -> BotUserBubble(row.m.text)
                     is BotRowItem.RoutineRun -> RoutineRunRow(row.m.routine.orEmpty(), row.m.text)
                     is BotRowItem.Handoff -> HandoffRow(row.m.from.orEmpty(), row.m.text)
-                    is BotRowItem.Taught -> TaughtRow(row.m.text, row.m.taught)
+                    is BotRowItem.Taught -> TaughtRow(row.m.text, row.m.taught, row.m.tookOver)
                     is BotRowItem.Head -> who(row.bot).let { (name, colors) -> BotHeader(name, colors, row.spinning, null, row.took) }
                     is BotRowItem.Step -> StepRow(row.call, row.result, live = row.live, shot = shot)
                     is BotRowItem.Reply -> Column {
@@ -1085,19 +1107,19 @@ private fun HandoffRow(from: String, text: String) {
 
 /** A task the user showed the Bot in its browser: what for, and the steps (folded). */
 @Composable
-private fun TaughtRow(what: String, steps: List<String>) {
+private fun TaughtRow(what: String, steps: List<String>, tookOver: Boolean = false) {
     var unfolded by remember { mutableStateOf(false) }
     Column(Modifier.fillMaxWidth().clip(MaterialTheme.shapes.small).clickable { unfolded = !unfolded }.padding(vertical = 4.dp).animateContentSize(tween(200))) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Icon(Icons.Rounded.School, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
             Text(
-                "You showed it a task · ${steps.size} step${if (steps.size == 1) "" else "s"}",
+                (if (tookOver) "You took over its browser" else "You showed it a task") + " · ${steps.size} step${if (steps.size == 1) "" else "s"}",
                 Modifier.padding(start = 8.dp),
                 style = MaterialTheme.typography.labelLarge,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
-        Text(what, Modifier.padding(start = 24.dp, top = 2.dp), style = MaterialTheme.typography.bodyMedium)
+        if (what.isNotBlank()) Text(what, Modifier.padding(start = 24.dp, top = 2.dp), style = MaterialTheme.typography.bodyMedium)
         if (unfolded) steps.forEachIndexed { i, st ->
             Text("${i + 1}. $st", Modifier.padding(start = 24.dp, top = 2.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
@@ -1299,24 +1321,49 @@ private fun ActionApproval(name: String, text: String, onAnswer: (Boolean) -> Un
     }
 }
 
-/** A browser step's screenshot; tap for the whole page view. */
+/**
+ * A browser step's screenshot (the top of the page), or a picture the Bot made (whole, up to 320dp,
+ * with Share in the full view). Tap for the full view.
+ */
 @Composable
-private fun BotShot(vm: ChatViewModel, botId: String, messageId: String) {
+private fun BotShot(vm: ChatViewModel, botId: String, messageId: String, picture: Boolean = false) {
     val bitmap by produceState<android.graphics.Bitmap?>(null, messageId) { value = vm.bots.shot(botId, messageId) }
     var full by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val b = bitmap ?: return
     val image = remember(b) { b.asImageBitmap() }
+    val what = if (picture) "The picture it made" else "What the browser showed"
     Image(
         image,
-        "What the browser showed",
-        Modifier.padding(top = 4.dp).fillMaxWidth().heightIn(max = 200.dp).clip(MaterialTheme.shapes.medium)
+        what,
+        if (picture) Modifier.padding(top = 6.dp).sizeIn(maxWidth = 320.dp, maxHeight = 320.dp).aspectRatio(b.width.toFloat() / b.height)
+            .clip(MaterialTheme.shapes.medium).clickable { full = true }
+        else Modifier.padding(top = 4.dp).fillMaxWidth().heightIn(max = 200.dp).clip(MaterialTheme.shapes.medium)
             .border(1.dp, MaterialTheme.colorScheme.outlineVariant, MaterialTheme.shapes.medium).clickable { full = true },
-        contentScale = ContentScale.Crop,
+        contentScale = if (picture) ContentScale.Fit else ContentScale.Crop,
         alignment = Alignment.TopCenter,
     )
     if (full) Dialog(onDismissRequest = { full = false }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
-        Box(Modifier.fillMaxSize().clickable { full = false }.padding(16.dp), contentAlignment = Alignment.Center) {
-            Image(image, "What the browser showed", Modifier.fillMaxWidth().clip(MaterialTheme.shapes.medium), contentScale = ContentScale.FillWidth)
+        Column(Modifier.fillMaxSize().clickable { full = false }.padding(16.dp), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
+            Image(image, what, Modifier.fillMaxWidth().clip(MaterialTheme.shapes.medium), contentScale = ContentScale.FillWidth)
+            if (picture) FilledTonalButton(
+                onClick = {
+                    scope.launch {
+                        val f = vm.bots.pictureFile(botId, messageId) ?: return@launch
+                        val uri = androidx.core.content.FileProvider.getUriForFile(context, "${context.packageName}.files", f)
+                        val send = android.content.Intent(android.content.Intent.ACTION_SEND).setType("image/*").putExtra(android.content.Intent.EXTRA_STREAM, uri)
+                            .addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        context.startActivity(android.content.Intent.createChooser(send, null))
+                    }
+                },
+                shape = MaterialTheme.shapes.small,
+                modifier = Modifier.padding(top = 16.dp),
+            ) {
+                Icon(Icons.Rounded.Share, null, Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("Share")
+            }
         }
     }
 }

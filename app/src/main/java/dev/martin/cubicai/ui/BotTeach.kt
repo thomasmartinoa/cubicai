@@ -90,28 +90,44 @@ fun TeachScreen(vm: ChatViewModel) {
     LaunchedEffect(Unit) { vm.bots.watchTeach() }
     LaunchedEffect(st?.url) { st?.url?.takeIf { it.isNotBlank() && it != "about:blank" }?.let { address = it } }
     fun step(v: JSONObject) = vm.bots.teachStep(v)
-    val close = { if (st?.steps.isNullOrEmpty()) vm.bots.cancelTeach() else confirmClose = true }
+    // Taking over: closing hands the browser back (the Bot is waiting for it).
+    val close = {
+        when {
+            t.takeover -> vm.bots.finishTeach("") {}
+            st?.steps.isNullOrEmpty() -> vm.bots.cancelTeach()
+            else -> confirmClose = true
+        }
+    }
 
     Dialog(onDismissRequest = close, properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
         Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
             Column(Modifier.fillMaxSize().systemBarsPadding().imePadding()) {
                 // Top bar: close, who's being taught and how many steps, Done.
                 Row(Modifier.fillMaxWidth().padding(start = 4.dp, end = 12.dp, top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                    IconButton(onClick = close) { Icon(Icons.Rounded.Close, "Stop teaching") }
+                    IconButton(onClick = close) { Icon(Icons.Rounded.Close, if (t.takeover) "Hand back" else "Stop teaching") }
                     Column(Modifier.weight(1f)) {
-                        Text("Teach ${t.botName}", style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(
+                            if (t.takeover) "You have ${t.botName}'s browser" else "Teach ${t.botName}",
+                            style = MaterialTheme.typography.titleMedium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Icon(Icons.Rounded.FiberManualRecord, null, Modifier.size(10.dp), tint = MaterialTheme.colorScheme.error)
                             val n = st?.steps?.size ?: 0
                             Text(
-                                "  Recording · $n step${if (n == 1) "" else "s"}",
+                                (if (t.takeover) "  ${t.botName} waits · " else "  Recording · ") + "$n step${if (n == 1) "" else "s"}",
                                 Modifier.clickable(enabled = n > 0) { showSteps = !showSteps },
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
                     }
-                    Button(onClick = { finishing = true }, enabled = !st?.steps.isNullOrEmpty() && !t.busy, shape = MaterialTheme.shapes.small) { Text("Done") }
+                    Button(
+                        onClick = { finishing = true },
+                        enabled = !t.busy && (t.takeover || !st?.steps.isNullOrEmpty()),
+                        shape = MaterialTheme.shapes.small,
+                    ) { Text(if (t.takeover) "Hand back" else "Done") }
                 }
                 if (t.busy) LinearProgressIndicator(Modifier.fillMaxWidth().padding(top = 4.dp)) else Box(Modifier.padding(top = 8.dp))
                 Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
@@ -166,7 +182,9 @@ fun TeachScreen(vm: ChatViewModel) {
                         }
                     }
                     if (st?.steps.isNullOrEmpty()) Text(
-                        "Show ${t.botName} how you do the task, step by step: open the page, tap where you'd click, type into fields. " +
+                        if (t.takeover) "${t.botName} waits while you use its browser: log in, get past a check, or fix what it's stuck on. " +
+                            "Hand back when you're done and it carries on from where you left the page. Passwords you type are never written down."
+                        else "Show ${t.botName} how you do the task, step by step: open the page, tap where you'd click, type into fields. " +
                             "When you're done, it writes the steps up as a skill for you to check. Passwords you type are never written down.",
                         Modifier.padding(16.dp),
                         style = MaterialTheme.typography.bodySmall,
@@ -176,7 +194,28 @@ fun TeachScreen(vm: ChatViewModel) {
             }
         }
     }
-    if (finishing) {
+    if (finishing && t.takeover) {
+        var note by remember { mutableStateOf("") }
+        AlertDialog(
+            onDismissRequest = { finishing = false },
+            title = { Text("Hand back to ${t.botName}?") },
+            text = {
+                Column {
+                    Text("Anything it should know? (optional)", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    OutlinedTextField(
+                        value = note,
+                        onValueChange = { note = it.take(2000) },
+                        placeholder = { Text("e.g. I logged in; carry on from the cart") },
+                        minLines = 2,
+                        shape = MaterialTheme.shapes.small,
+                        modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
+                    )
+                }
+            },
+            confirmButton = { Button(onClick = { finishing = false; vm.bots.finishTeach(note) {} }, shape = MaterialTheme.shapes.small) { Text("Hand back") } },
+            dismissButton = { TextButton(onClick = { finishing = false }) { Text("Keep it") } },
+        )
+    } else if (finishing) {
         var what by remember { mutableStateOf("") }
         AlertDialog(
             onDismissRequest = { finishing = false },
@@ -218,7 +257,7 @@ private fun KeyButton(icon: androidx.compose.ui.graphics.vector.ImageVector, lab
 
 /** The browser's screenshot: tap to click there; pinch to zoom and drag to look around. */
 @Composable
-private fun BrowserPicture(picture: android.graphics.Bitmap?, onTap: (Float, Float) -> Unit) {
+private fun BrowserPicture(picture: android.graphics.Bitmap?, onTap: ((Float, Float) -> Unit)?) {
     var size by remember { mutableStateOf(IntSize.Zero) }
     var scale by remember { mutableFloatStateOf(1f) }
     var pan by remember { mutableStateOf(Offset.Zero) }
@@ -238,7 +277,8 @@ private fun BrowserPicture(picture: android.graphics.Bitmap?, onTap: (Float, Flo
                     pan = Offset((pan.x + move.x).coerceIn(-maxX, maxX), (pan.y + move.y).coerceIn(-maxY, maxY))
                 }
             }
-            .pointerInput(Unit) {
+            .pointerInput(onTap != null) {
+                if (onTap == null) return@pointerInput
                 detectTapGestures { at ->
                     if (size.width == 0) return@detectTapGestures
                     // Where on the page that is, undoing the zoom (it scales around the centre).
@@ -260,6 +300,55 @@ private fun BrowserPicture(picture: android.graphics.Bitmap?, onTap: (Float, Flo
         )
         if (scale > 1.05f) IconButton(onClick = { scale = 1f; pan = Offset.Zero }, Modifier.align(Alignment.TopEnd)) {
             Icon(Icons.Rounded.ZoomOutMap, "Fit", tint = MaterialTheme.colorScheme.primary)
+        }
+    }
+}
+
+/**
+ * Watching a Bot work: its computer's browser, refreshed every 1.5 s, with what it's doing now. "Take
+ * over" hands the browser to you (the Bot's next browser step waits) and opens it in [TeachScreen].
+ */
+@Composable
+fun WatchScreen(vm: ChatViewModel, bot: dev.martin.cubicai.net.Bot, doing: String?, working: Boolean, onClose: () -> Unit) {
+    var picture by remember { mutableStateOf<android.graphics.Bitmap?>(null) }
+    var why by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(bot.id) {
+        while (true) {
+            vm.bots.screen(bot.id).onSuccess { picture = it; why = null }.onFailure { why = it.message }
+            kotlinx.coroutines.delay(1_500)
+        }
+    }
+    Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
+        Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+            Column(Modifier.fillMaxSize().systemBarsPadding()) {
+                Row(Modifier.fillMaxWidth().padding(start = 4.dp, end = 16.dp, top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = onClose) { Icon(Icons.Rounded.Close, "Stop watching") }
+                    Column(Modifier.weight(1f)) {
+                        Text("Watching ${bot.name}", style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        if (working) ShimmerText(doing ?: "Working") else Text(
+                            "Not working right now",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(top = 12.dp)) {
+                    BrowserPicture(picture, onTap = null)
+                    why?.let { Text(it, Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                    Text(
+                        "Step in when it needs you: a login, a check that wants a person, a page it's stuck on. It waits while you have the browser and carries on when you hand it back.",
+                        Modifier.padding(16.dp),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Button(
+                        onClick = { vm.bots.startTeach(bot, takeover = true); onClose() },
+                        enabled = picture != null,
+                        shape = MaterialTheme.shapes.small,
+                        modifier = Modifier.padding(horizontal = 16.dp),
+                    ) { Text("Take over") }
+                }
+            }
         }
     }
 }

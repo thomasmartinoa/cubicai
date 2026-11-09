@@ -163,6 +163,8 @@ data class BotMessage(
     val from: String? = null,
     /** The user taught a task: the steps they took in the browser. */
     val taught: List<String> = emptyList(),
+    /** Those steps were the user taking the browser over mid-task (not teaching a skill). */
+    val tookOver: Boolean = false,
 )
 
 /** What a Bot's run sends while it works. [seq] numbers them, so a phone that comes back can carry on. */
@@ -309,6 +311,7 @@ internal fun botMessageFrom(o: JSONObject) = BotMessage(
     bot = o.str("bot"),
     from = o.optJSONObject("from")?.str("name"),
     taught = o.optJSONArray("taught").strings(),
+    tookOver = o.optBoolean("took_over"),
 )
 
 internal fun botEventFrom(o: JSONObject): BotEvent? {
@@ -476,6 +479,10 @@ suspend fun LlmClient.botFeed(baseUrls: List<String>, token: String, pin: String
 /** Answers an action the Bot waits on. */
 suspend fun LlmClient.answerBot(baseUrls: List<String>, token: String, pin: String, id: String, approval: String, allow: Boolean) =
     botCall(baseUrls, token, pin, { url("$it/${thread(id)}/approval").post(json(JSONObject().put("id", approval).put("allow", allow))) }) { }
+
+/** The Bots' computer's browser right now (JPEG), to watch a Bot work; fails while the computer is off. */
+suspend fun LlmClient.botScreen(baseUrls: List<String>, token: String, pin: String, id: String): ByteArray =
+    botCall(baseUrls, token, pin, { url("$it/bots/$id/screen") }) { r -> r.body.bytes() }
 
 /** A browser step's screenshot (JPEG bytes). */
 suspend fun LlmClient.botShot(baseUrls: List<String>, token: String, pin: String, id: String, messageId: String): ByteArray =
