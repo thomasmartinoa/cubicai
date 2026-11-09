@@ -66,6 +66,14 @@ import androidx.compose.material.icons.rounded.Notifications
 import androidx.compose.material.icons.rounded.LocationOn
 import androidx.compose.material.icons.rounded.BatteryStd
 import androidx.compose.material.icons.rounded.Extension
+import androidx.compose.material.icons.rounded.AutoStories
+import androidx.compose.material.icons.rounded.Groups
+import androidx.compose.material.icons.rounded.School
+import androidx.compose.material.icons.rounded.Forum
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.material3.SuggestionChip
+import androidx.compose.material3.SuggestionChipDefaults
+import dev.martin.cubicai.net.BotGroup
 import androidx.compose.material.icons.automirrored.rounded.Send
 import androidx.compose.material.icons.automirrored.rounded.OpenInNew
 import android.net.Uri
@@ -183,8 +191,15 @@ fun BotsScreen(vm: ChatViewModel, onBack: () -> Unit, onOpenBot: (String) -> Uni
     val state by vm.bots.state.collectAsStateWithLifecycle()
     var editing by remember { mutableStateOf<BotDraft?>(null) }
     var connections by remember { mutableStateOf(false) }
+    var skills by remember { mutableStateOf(false) }
+    // A group being made (null id: new) or changed.
+    var groupEdit by remember { mutableStateOf<Pair<Boolean, BotGroup?>?>(null) }
     LaunchedEffect(Unit) { vm.bots.watchList() }
     if (connections) ConnectionsSheet(vm, onDismiss = { connections = false })
+    if (skills) SkillsSheet(vm, onDismiss = { skills = false })
+    groupEdit?.let { (_, g) ->
+        GroupEditSheet(vm, g, onDismiss = { groupEdit = null }, onSaved = { saved -> groupEdit = null; if (g == null) onOpenBot(saved.thread) })
+    }
 
     Scaffold(
         topBar = {
@@ -192,6 +207,10 @@ fun BotsScreen(vm: ChatViewModel, onBack: () -> Unit, onOpenBot: (String) -> Uni
                 navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back") } },
                 title = { Text("Bots") },
                 actions = {
+                    if (vm.bots.paired) IconButton(onClick = { skills = true }) {
+                        val waiting = state.skills.count { !it.approved }
+                        BadgedBox(badge = { if (waiting > 0) Badge { Text("$waiting") } }) { Icon(Icons.Rounded.AutoStories, "Skills") }
+                    }
                     if (vm.bots.paired) IconButton(onClick = { connections = true }) { Icon(Icons.Rounded.Extension, "Accounts and apps") }
                     if (vm.bots.paired) IconButton(onClick = { editing = BotDraft.blank(vm) }) { Icon(Icons.Rounded.Add, "New Bot") }
                 },
@@ -226,6 +245,34 @@ fun BotsScreen(vm: ChatViewModel, onBack: () -> Unit, onOpenBot: (String) -> Uni
                             onDelete = { vm.bots.delete(bot.id) },
                             modifier = Modifier.animateItem(),
                         )
+                    }
+                    if (state.groups.isNotEmpty()) item(key = "groups") {
+                        Text(
+                            "Group chats",
+                            Modifier.padding(top = 16.dp, bottom = 4.dp),
+                            style = MaterialTheme.typography.titleSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    items(state.groups, key = { "group:" + it.id }) { g ->
+                        GroupRow(
+                            g, state.bots,
+                            onOpen = { onOpenBot(g.thread) },
+                            onEdit = { groupEdit = true to g },
+                            onDelete = { vm.bots.deleteGroup(g.id) },
+                            modifier = Modifier.animateItem(),
+                        )
+                    }
+                    if (state.bots.size >= 2) item(key = "new-group") {
+                        OutlinedButton(
+                            onClick = { groupEdit = true to null },
+                            shape = MaterialTheme.shapes.small,
+                            modifier = Modifier.padding(top = if (state.groups.isEmpty()) 8.dp else 0.dp),
+                        ) {
+                            Icon(Icons.Rounded.Groups, null, Modifier.size(18.dp))
+                            Spacer(Modifier.width(8.dp))
+                            Text("New group chat")
+                        }
                     }
                     item(key = "ideas") {
                         Text(
@@ -620,7 +667,10 @@ private sealed interface BotRowItem {
 
     data class User(val m: BotMessage) : BotRowItem { override val key get() = m.id }
     data class RoutineRun(val m: BotMessage) : BotRowItem { override val key get() = m.id }
-    data class Head(override val key: String, val spinning: Boolean, val took: Long) : BotRowItem
+    data class Handoff(val m: BotMessage) : BotRowItem { override val key get() = m.id }
+    data class Taught(val m: BotMessage) : BotRowItem { override val key get() = m.id }
+    /** Who answers; [bot] is the speaker in a group. */
+    data class Head(override val key: String, val spinning: Boolean, val took: Long, val bot: String? = null) : BotRowItem
     data class Step(val call: BotCall, val result: BotMessage?, override val key: String, val live: Boolean = false) : BotRowItem
     data class Reply(val m: BotMessage, val sources: List<String>) : BotRowItem { override val key get() = m.id }
     data class Failure(val m: BotMessage) : BotRowItem { override val key get() = m.id }
@@ -633,18 +683,30 @@ private fun rowsOf(o: OpenBot): List<BotRowItem> {
     var headed = false
     var head = -1
     var sources = mutableListOf<String>()
+    var speaker: String? = null
     for (m in o.messages) {
         when (m.role) {
             "user" -> {
-                rows += if (m.routine != null) BotRowItem.RoutineRun(m) else BotRowItem.User(m)
+                rows += when {
+                    m.routine != null -> BotRowItem.RoutineRun(m)
+                    m.from != null -> BotRowItem.Handoff(m)
+                    m.taught.isNotEmpty() -> BotRowItem.Taught(m)
+                    else -> BotRowItem.User(m)
+                }
                 headed = false
                 sources = mutableListOf()
             }
             "assistant" -> {
+                // In a group each Bot's turn gets its own header.
+                if (o.isGroup && m.bot != speaker) {
+                    headed = false
+                    sources = mutableListOf() // another Bot's sources aren't this one's
+                }
                 if (!headed && (m.text.isNotBlank() || m.calls.isNotEmpty() || m.error != null || m.stopped || m.reasoning.isNotBlank())) {
                     head = rows.size
-                    rows += BotRowItem.Head("head:" + m.id, spinning = false, took = 0)
+                    rows += BotRowItem.Head("head:" + m.id, spinning = false, took = 0, bot = m.bot)
                     headed = true
+                    speaker = m.bot
                 }
                 // The header shows the time over the whole answer: every turn, tool-calling ones too.
                 if (headed) (rows[head] as BotRowItem.Head).let { rows[head] = it.copy(took = it.took + m.took) }
@@ -660,9 +722,11 @@ private fun rowsOf(o: OpenBot): List<BotRowItem> {
         }
     }
     if (o.running || o.live != null) {
-        val lastUser = rows.indexOfLast { it is BotRowItem.User || it is BotRowItem.RoutineRun }
+        val lastUser = rows.indexOfLast { it is BotRowItem.User || it is BotRowItem.RoutineRun || it is BotRowItem.Handoff || it is BotRowItem.Taught }
         val headIndex = rows.indexOfLast { it is BotRowItem.Head }
-        val answering = headIndex > lastUser
+        val liveBot = o.live?.bot
+        // In a group, the header above is someone else's once another Bot starts.
+        val answering = headIndex > lastUser && (!o.isGroup || liveBot == null || (rows[headIndex] as BotRowItem.Head).bot == liveBot)
         if (answering) rows[headIndex] = (rows[headIndex] as BotRowItem.Head).copy(spinning = true, took = 0)
         // The tool under way already shows as its stored step.
         val stored = o.messages.flatMap { m -> m.calls.map { it.id } }.toSet()
@@ -713,6 +777,9 @@ private fun stepLabel(c: BotCall, done: Boolean): Pair<ImageVector, String> {
         "phone_status" -> Icons.Rounded.BatteryStd to (if (done) "Checked your phone" else "Checking your phone")
         "schedule_routine" -> Icons.Rounded.Schedule to (if (done) "Proposed the routine “${s("name")}”" else "Proposing a routine")
         "cancel_routine" -> Icons.Rounded.EventBusy to (if (done) "Withdrew or switched off “${s("name")}”" else "Cancelling a routine")
+        "use_skill" -> Icons.Rounded.AutoStories to (if (done) "Followed the skill /${s("name").removePrefix("/")}" else "Looking up /${s("name").removePrefix("/")}")
+        "save_skill" -> Icons.Rounded.School to (if (done) "Proposed the skill /${s("name").removePrefix("/")}" else "Writing a skill")
+        "ask_bot" -> Icons.Rounded.Forum to (if (done) "Asked ${s("bot").removePrefix("@")}" else "Asking ${s("bot").removePrefix("@")}")
         else -> if ("__" in c.name) {
             // An app's tool (MCP): app__tool.
             val app = c.name.substringBefore("__")
@@ -737,7 +804,15 @@ fun BotChatScreen(vm: ChatViewModel, onBack: () -> Unit, onOpenSettings: () -> U
     var menu by remember { mutableStateOf(false) }
     var confirmClear by remember { mutableStateOf(false) }
     var routinesOpen by remember { mutableStateOf(false) }
+    var skillsOpen by remember { mutableStateOf(false) }
+    var groupEditing by remember { mutableStateOf(false) }
     var draft by rememberSaveable(bot.id) { mutableStateOf("") }
+    val members = remember(open.group, state.bots) { open.group?.members.orEmpty().mapNotNull { m -> state.bots.firstOrNull { it.id == m } } }
+    // Who said something: in a group, the Bot by its id; otherwise this Bot.
+    val who: (String?) -> Pair<String, CubeColors> = { id ->
+        val b = id?.let { i -> state.bots.firstOrNull { it.id == i } }
+        if (b != null) b.name to cubeColors(b.color) else bot.name to cubeColors(bot.color)
+    }
     LaunchedEffect(Unit) { vm.bots.watchOpen() }
     val colors = remember(bot.color) { cubeColors(bot.color) }
     // The Bot asked where the phone is: Android's permission first (answered either way).
@@ -754,11 +829,11 @@ fun BotChatScreen(vm: ChatViewModel, onBack: () -> Unit, onOpenSettings: () -> U
                 navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back") } },
                 title = {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Cube(24.dp, spinning = open.running, colors = colors)
+                        if (open.isGroup) GroupCubes(members, 20.dp, spinning = open.running) else Cube(24.dp, spinning = open.running, colors = colors)
                         Column(Modifier.padding(start = 12.dp)) {
                             Text(bot.name, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             Text(
-                                "${displayModelName(bot.model)} · ${providerName(bot.provider)}",
+                                if (open.isGroup) members.joinToString(", ") { it.name } else "${displayModelName(bot.model)} · ${providerName(bot.provider)}",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 maxLines = 1,
@@ -768,14 +843,28 @@ fun BotChatScreen(vm: ChatViewModel, onBack: () -> Unit, onOpenSettings: () -> U
                     }
                 },
                 actions = {
-                    val pending = open.routines.count { !it.approved }
-                    IconButton(onClick = { routinesOpen = true }) {
-                        BadgedBox(badge = { if (pending > 0) Badge { Text("$pending") } }) { Icon(Icons.Rounded.Schedule, "Routines") }
+                    if (open.isGroup) IconButton(onClick = { groupEditing = true }) { Icon(Icons.Rounded.Tune, "Edit group") }
+                    else {
+                        val pending = open.routines.count { !it.approved }
+                        IconButton(onClick = { routinesOpen = true }) {
+                            BadgedBox(badge = { if (pending > 0) Badge { Text("$pending") } }) { Icon(Icons.Rounded.Schedule, "Routines") }
+                        }
+                        IconButton(onClick = { editing = true }) { Icon(Icons.Rounded.Tune, "Edit Bot") }
                     }
-                    IconButton(onClick = { editing = true }) { Icon(Icons.Rounded.Tune, "Edit Bot") }
                     Box {
                         IconButton(onClick = { menu = true }) { Icon(Icons.Rounded.MoreVert, "More") }
                         CubicMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                            if (!open.isGroup) DropdownMenuItem(
+                                text = { Text("Teach a task") },
+                                leadingIcon = { Icon(Icons.Rounded.School, null) },
+                                enabled = bot.computer && !open.loading,
+                                onClick = { menu = false; vm.bots.startTeach(bot) },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Skills") },
+                                leadingIcon = { Icon(Icons.Rounded.AutoStories, null) },
+                                onClick = { menu = false; skillsOpen = true },
+                            )
                             DropdownMenuItem(
                                 text = { Text("Clear chat", color = MaterialTheme.colorScheme.error) },
                                 leadingIcon = { Icon(Icons.Rounded.DeleteSweep, null, tint = MaterialTheme.colorScheme.error) },
@@ -795,16 +884,17 @@ fun BotChatScreen(vm: ChatViewModel, onBack: () -> Unit, onOpenSettings: () -> U
                     open.loading && open.messages.isEmpty() -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                         Cube(32.dp, spinning = true, colors = colors)
                     }
-                    open.messages.isEmpty() && !open.running -> BotWelcome(bot)
-                    else -> BotMessages(open, chatState.settings.thoughtsOpen, vm::setThoughtsOpen) { m -> BotShot(vm, bot.id, m.id) }
+                    open.messages.isEmpty() && !open.running -> if (open.isGroup) GroupWelcome(bot.name, members) else BotWelcome(bot)
+                    else -> BotMessages(open, chatState.settings.thoughtsOpen, vm::setThoughtsOpen, who) { m -> BotShot(vm, m.bot ?: bot.id, m.id) }
                 }
             }
             AnimatedVisibility(
                 visible = open.approval != null,
                 enter = expandVertically(tween(200)) + fadeIn(tween(200)),
                 exit = shrinkVertically(tween(160)) + fadeOut(tween(120)),
-            ) { open.approval?.let { ActionApproval(bot.name, it.text, onAnswer = vm.bots::answer) } }
+            ) { open.approval?.let { ActionApproval(if (open.isGroup) who(open.live?.bot).first else bot.name, it.text, onAnswer = vm.bots::answer) } }
             RoutineApprovals(vm, open)
+            SkillApprovals(vm, open)
             AnimatedVisibility(
                 visible = open.error != null || open.reconnecting,
                 enter = expandVertically(tween(180)) + fadeIn(tween(180)),
@@ -824,25 +914,57 @@ fun BotChatScreen(vm: ChatViewModel, onBack: () -> Unit, onOpenSettings: () -> U
                     }
                 }
             }
+            // Finishing an @name (groups) or a /skill from what's being typed.
+            val word = draft.takeLastWhile { !it.isWhitespace() }
+            val suggestions = when {
+                open.isGroup && word.startsWith("@") -> members.filter { it.name.replace(" ", "").startsWith(word.drop(1), ignoreCase = true) }.map { "@" + it.name.replace(" ", "") to it.name }
+                word.startsWith("/") -> state.skills.filter { it.approved && it.name.startsWith(word.drop(1).lowercase()) }.map { "/" + it.name to it.about }
+                else -> emptyList()
+            }
+            if (suggestions.isNotEmpty()) Row(
+                Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                suggestions.take(8).forEach { (insert, hint) ->
+                    SuggestionChip(
+                        onClick = { draft = draft.dropLast(word.length) + insert + " " },
+                        label = { Text(insert + if (hint.isNotBlank() && !insert.startsWith("@")) " · " + hint.take(40) else "", maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                        shape = MaterialTheme.shapes.small,
+                        colors = SuggestionChipDefaults.suggestionChipColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
+                    )
+                }
+            }
             BotComposer(
                 draft = draft,
                 onDraft = { draft = it },
                 running = open.running,
                 enabled = !open.loading,
-                placeholder = if (open.running) "Add something while it works" else "Message ${bot.name}",
+                placeholder = when {
+                    open.running -> "Add something while it works"
+                    open.isGroup -> "Message ${bot.name}"
+                    else -> "Message ${bot.name}"
+                },
                 onSend = { vm.bots.send(draft); draft = "" },
                 onStop = vm.bots::stop,
             )
         }
     }
     if (routinesOpen) RoutinesSheet(vm, open, onDismiss = { routinesOpen = false })
+    if (skillsOpen) SkillsSheet(vm, onDismiss = { skillsOpen = false })
+    if (groupEditing) GroupEditSheet(vm, open.group, onDismiss = { groupEditing = false }, onSaved = { groupEditing = false })
+    if (state.teaching != null) TeachScreen(vm)
     if (editing) {
         BotEditSheet(vm, BotDraft.of(bot), onOpenSettings = onOpenSettings, onDismiss = { editing = false }, onSaved = { editing = false })
     }
     if (confirmClear) AlertDialog(
         onDismissRequest = { confirmClear = false },
         title = { Text("Clear the chat?") },
-        text = { Text("${bot.name}'s messages are deleted from your PC. What it remembers and the files it saved stay.") },
+        text = {
+            Text(
+                if (open.isGroup) "The group's messages are deleted from your PC. Each Bot's own chat and memory stay."
+                else "${bot.name}'s messages are deleted from your PC. What it remembers and the files it saved stay.",
+            )
+        },
         confirmButton = {
             TextButton(onClick = { confirmClear = false; vm.bots.clearChat() }) { Text("Clear", color = MaterialTheme.colorScheme.error) }
         },
@@ -879,9 +1001,8 @@ private fun BotWelcome(bot: Bot) {
 }
 
 @Composable
-private fun BotMessages(open: OpenBot, thoughtsOpen: Boolean?, onThoughts: (Boolean) -> Unit, shot: @Composable (BotMessage) -> Unit) {
+private fun BotMessages(open: OpenBot, thoughtsOpen: Boolean?, onThoughts: (Boolean) -> Unit, who: (String?) -> Pair<String, CubeColors>, shot: @Composable (BotMessage) -> Unit) {
     val rows = remember(open.messages, open.live, open.running) { rowsOf(open) }
-    val colors = remember(open.bot.color) { cubeColors(open.bot.color) }
     // Newest at the bottom and kept there while the Bot writes: reverseLayout pins the view to the
     // bottom only while it's there, so each new row (a message, a step, the turn under way) brings it back.
     val listState = rememberLazyListState()
@@ -898,7 +1019,9 @@ private fun BotMessages(open: OpenBot, thoughtsOpen: Boolean?, onThoughts: (Bool
                 when (row) {
                     is BotRowItem.User -> BotUserBubble(row.m.text)
                     is BotRowItem.RoutineRun -> RoutineRunRow(row.m.routine.orEmpty(), row.m.text)
-                    is BotRowItem.Head -> BotHeader(open.bot.name, colors, row.spinning, null, row.took)
+                    is BotRowItem.Handoff -> HandoffRow(row.m.from.orEmpty(), row.m.text)
+                    is BotRowItem.Taught -> TaughtRow(row.m.text, row.m.taught)
+                    is BotRowItem.Head -> who(row.bot).let { (name, colors) -> BotHeader(name, colors, row.spinning, null, row.took) }
                     is BotRowItem.Step -> StepRow(row.call, row.result, live = row.live, shot = shot)
                     is BotRowItem.Reply -> Column {
                         if (row.m.reasoning.isNotBlank()) ReasoningBlock(row.m.reasoning, active = false, preferred = thoughtsOpen, onToggle = onThoughts)
@@ -907,9 +1030,76 @@ private fun BotMessages(open: OpenBot, thoughtsOpen: Boolean?, onThoughts: (Bool
                         if (row.sources.isNotEmpty()) Sources(row.sources)
                     }
                     is BotRowItem.Failure -> ErrorCard(row.m.error.orEmpty(), null)
-                    is BotRowItem.Live -> LiveTurnView(open.bot.name, colors, row, thoughtsOpen, onThoughts)
+                    is BotRowItem.Live -> who(row.turn.bot).let { (name, colors) -> LiveTurnView(name, colors, row, thoughtsOpen, onThoughts) }
                 }
             }
+        }
+    }
+}
+
+/** An empty group chat: who's in it and how it works. */
+@Composable
+private fun GroupWelcome(name: String, members: List<Bot>) {
+    Column(
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 32.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        GroupCubes(members, 40.dp)
+        Text(name, Modifier.padding(top = 16.dp), style = MaterialTheme.typography.headlineSmall)
+        Text(
+            members.joinToString(", ") { it.name },
+            Modifier.padding(top = 4.dp),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+        )
+        Text(
+            "@mention a Bot to ask it; otherwise the one whose job fits best answers. Bots bring each other in when part of the job is someone else's.",
+            Modifier.padding(top = 16.dp),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+        )
+    }
+}
+
+/** A task another Bot handed this one: who asked, and what (folded to a few lines). */
+@Composable
+private fun HandoffRow(from: String, text: String) {
+    var unfolded by remember { mutableStateOf(false) }
+    Column(Modifier.fillMaxWidth().clip(MaterialTheme.shapes.small).clickable { unfolded = !unfolded }.padding(vertical = 4.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Rounded.Forum, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("$from asked", Modifier.padding(start = 8.dp), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Text(
+            text,
+            Modifier.padding(start = 24.dp, top = 2.dp).animateContentSize(tween(200)),
+            style = MaterialTheme.typography.bodyMedium,
+            maxLines = if (unfolded) Int.MAX_VALUE else 3,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+/** A task the user showed the Bot in its browser: what for, and the steps (folded). */
+@Composable
+private fun TaughtRow(what: String, steps: List<String>) {
+    var unfolded by remember { mutableStateOf(false) }
+    Column(Modifier.fillMaxWidth().clip(MaterialTheme.shapes.small).clickable { unfolded = !unfolded }.padding(vertical = 4.dp).animateContentSize(tween(200))) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Rounded.School, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(
+                "You showed it a task · ${steps.size} step${if (steps.size == 1) "" else "s"}",
+                Modifier.padding(start = 8.dp),
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Text(what, Modifier.padding(start = 24.dp, top = 2.dp), style = MaterialTheme.typography.bodyMedium)
+        if (unfolded) steps.forEachIndexed { i, st ->
+            Text("${i + 1}. $st", Modifier.padding(start = 24.dp, top = 2.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }
@@ -1043,9 +1233,12 @@ private fun BotComposer(
         modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
     ) {
         Row(verticalAlignment = Alignment.Bottom) {
+            // Held with its cursor, so text put in from outside (a suggestion) leaves the cursor at its end.
+            var field by remember { mutableStateOf(androidx.compose.ui.text.input.TextFieldValue(draft)) }
+            if (field.text != draft) field = androidx.compose.ui.text.input.TextFieldValue(draft, androidx.compose.ui.text.TextRange(draft.length))
             TextField(
-                value = draft,
-                onValueChange = onDraft,
+                value = field,
+                onValueChange = { field = it; onDraft(it.text) },
                 placeholder = { Text(placeholder, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                 maxLines = 6,
                 enabled = enabled,

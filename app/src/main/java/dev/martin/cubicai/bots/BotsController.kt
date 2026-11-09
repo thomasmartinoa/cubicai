@@ -43,6 +43,22 @@ import dev.martin.cubicai.net.pushKeys
 import dev.martin.cubicai.net.sendToBot
 import dev.martin.cubicai.net.stopBot
 import dev.martin.cubicai.net.updateBot
+import dev.martin.cubicai.net.BotGroup
+import dev.martin.cubicai.net.Skill
+import dev.martin.cubicai.net.TeachState
+import dev.martin.cubicai.net.addSkill
+import dev.martin.cubicai.net.createGroup
+import dev.martin.cubicai.net.deleteGroup
+import dev.martin.cubicai.net.deleteSkill
+import dev.martin.cubicai.net.getGroup
+import dev.martin.cubicai.net.listGroups
+import dev.martin.cubicai.net.listSkills
+import dev.martin.cubicai.net.teachCancel
+import dev.martin.cubicai.net.teachDone
+import dev.martin.cubicai.net.teachShot
+import dev.martin.cubicai.net.teachStep
+import dev.martin.cubicai.net.updateGroup
+import dev.martin.cubicai.net.updateSkill
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -57,11 +73,14 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 
-/** The turn a Bot is writing right now (words and thoughts so far, and the tool it's using). */
-data class LiveTurn(val text: String = "", val reasoning: String = "", val tool: BotCall? = null)
+/** The turn a Bot is writing right now (words and thoughts so far, the tool it's using; in a group, who). */
+data class LiveTurn(val text: String = "", val reasoning: String = "", val tool: BotCall? = null, val bot: String? = null)
 
 data class OpenBot(
+    /** The Bot; for a group chat a stand-in with the thread id "g:<id>" and the group's name. */
     val bot: Bot,
+    /** Set for a group chat. */
+    val group: BotGroup? = null,
     val memory: String = "",
     val messages: List<BotMessage> = emptyList(),
     /** Its routines; ones it proposed wait for approval. */
@@ -77,6 +96,21 @@ data class OpenBot(
     /** Lost the PC while following (the Bot carries on there); retrying. */
     val reconnecting: Boolean = false,
     val error: String? = null,
+) {
+    val isGroup get() = bot.id.startsWith("g:")
+}
+
+/** Teaching [botId] a task in its browser. */
+data class Teaching(
+    val botId: String,
+    val botName: String,
+    val state: TeachState? = null,
+    val picture: android.graphics.Bitmap? = null,
+    /** A step is on its way to the PC. */
+    val busy: Boolean = false,
+    val error: String? = null,
+    /** The steps went to the Bot; the screen closes. */
+    val done: Boolean = false,
 )
 
 data class BotsState(
@@ -91,6 +125,10 @@ data class BotsState(
     val connectionsError: String? = null,
     /** A Google sign-in is waiting for the browser to come back. */
     val signingIn: Boolean = false,
+    val groups: List<BotGroup> = emptyList(),
+    /** The skills library (with the Bots' proposals waiting for approval). */
+    val skills: List<Skill> = emptyList(),
+    val teaching: Teaching? = null,
 )
 
 /**
@@ -132,10 +170,13 @@ class BotsController(
             try {
                 val (urls, token, pin) = pc()
                 val bots = client.listBots(urls, token, pin)
+                // A gateway from before groups and skills answers 404: none then.
+                val groups = runCatching { client.listGroups(urls, token, pin) }.getOrNull()
+                val skills = runCatching { client.listSkills(urls, token, pin) }.getOrNull()
                 _state.update { s ->
                     // The open Bot's profile follows the list (it may have been changed on another phone).
                     val open = s.open?.let { o -> bots.firstOrNull { it.id == o.bot.id }?.let { o.copy(bot = it.copy(running = o.running || it.running)) } ?: o }
-                    s.copy(bots = bots, loaded = true, loading = false, error = null, open = open)
+                    s.copy(bots = bots, groups = groups ?: s.groups, skills = skills ?: s.skills, loaded = true, loading = false, error = null, open = open)
                 }
             } catch (e: CancellationException) {
                 throw e
@@ -149,7 +190,7 @@ class BotsController(
     suspend fun watchList() {
         while (true) {
             refresh()
-            delay(if (_state.value.bots.any { it.running }) 4_000 else 30_000)
+            delay(if (_state.value.bots.any { it.running } || _state.value.groups.any { it.running }) 4_000 else 30_000)
         }
     }
 
@@ -220,11 +261,22 @@ class BotsController(
 
     fun open(id: String) {
         // From a notification the list may not be loaded yet: a stand-in until the PC answers.
-        val known = _state.value.bots.firstOrNull { it.id == id } ?: Bot(id, "", "", "#2f6bff", "local", "")
+        val group = if (id.startsWith("g:")) _state.value.groups.firstOrNull { it.thread == id } else null
+        val known = if (id.startsWith("g:")) groupStandIn(id, group) else _state.value.bots.firstOrNull { it.id == id } ?: Bot(id, "", "", "#2f6bff", "local", "")
         follow?.cancel()
-        _state.update { it.copy(open = OpenBot(known, running = known.running)) }
+        _state.update { it.copy(open = OpenBot(known, group = group, running = known.running)) }
         load(id)
     }
+
+    /** A group chat shows as a "Bot" named after the group, in its first member's colour. */
+    private fun groupStandIn(id: String, g: BotGroup?): Bot {
+        val first = g?.members?.firstNotNullOfOrNull { m -> _state.value.bots.firstOrNull { it.id == m } }
+        return Bot(id, g?.name ?: "", "", first?.color ?: "#2f6bff", "local", "", running = g?.running == true, phone = true, computer = false)
+    }
+
+    /** The Bots of the open group (or the open Bot itself). */
+    private fun membersOf(o: OpenBot): List<Bot> =
+        if (o.isGroup) o.group?.members.orEmpty().mapNotNull { m -> _state.value.bots.firstOrNull { it.id == m } } else listOf(o.bot)
 
     fun close() {
         follow?.cancel()
@@ -239,10 +291,18 @@ class BotsController(
         follow = scope.launch {
             try {
                 val (urls, token, pin) = pc()
-                val (bot, memory) = client.getBot(urls, token, pin, id)
-                runCatching { pushKeyFor(bot.provider) } // a cloud Bot works with this phone's current key
+                if (id.startsWith("g:")) {
+                    val bots = runCatching { client.listBots(urls, token, pin) }.getOrNull()
+                    if (bots != null) _state.update { it.copy(bots = bots) }
+                    val group = client.getGroup(urls, token, pin, id.removePrefix("g:"))
+                    _state.update { s -> s.copy(open = s.open?.takeIf { it.bot.id == id }?.copy(group = group, bot = groupStandIn(id, group))) }
+                    membersOf(_state.value.open ?: return@launch).forEach { runCatching { pushKeyFor(it.provider) } }
+                }
+                val (bot, memory) = if (id.startsWith("g:")) _state.value.open!!.bot to "" else client.getBot(urls, token, pin, id)
+                if (!id.startsWith("g:")) runCatching { pushKeyFor(bot.provider) } // a cloud Bot works with this phone's current key
                 val chat = client.botChat(urls, token, pin, id)
-                val routines = runCatching { client.botRoutines(urls, token, pin, id) }.getOrNull()
+                val routines = if (id.startsWith("g:")) emptyList() else runCatching { client.botRoutines(urls, token, pin, id) }.getOrNull()
+                runCatching { client.listSkills(urls, token, pin) }.getOrNull()?.let { sk -> _state.update { it.copy(skills = sk) } }
                 _state.update { s ->
                     s.copy(open = s.open?.takeIf { it.bot.id == id }?.copy(
                         bot = bot.copy(running = chat.running), memory = memory, messages = chat.messages, routines = routines ?: s.open.routines, approval = chat.approval,
@@ -299,8 +359,10 @@ class BotsController(
         runCatching {
             val (urls, token, pin) = pc()
             val chat = client.botChat(urls, token, pin, id)
-            val memory = client.getBot(urls, token, pin, id).second // it may have remembered or forgotten something
-            val routines = runCatching { client.botRoutines(urls, token, pin, id) }.getOrNull() // or proposed a routine
+            val group = id.startsWith("g:")
+            val memory = if (group) "" else client.getBot(urls, token, pin, id).second // it may have remembered or forgotten something
+            val routines = if (group) null else runCatching { client.botRoutines(urls, token, pin, id) }.getOrNull() // or proposed a routine
+            runCatching { client.listSkills(urls, token, pin) }.getOrNull()?.let { sk -> _state.update { it.copy(skills = sk) } } // or a skill
             setOpen(id) { it.copy(messages = chat.messages, memory = memory, routines = routines ?: it.routines, running = chat.running, live = null, reconnecting = false, bot = it.bot.copy(running = chat.running)) }
             if (chat.running) followRun(id, chat.follow ?: 0)
         }.onFailure { if (it is CancellationException) throw it }
@@ -310,7 +372,7 @@ class BotsController(
     private fun apply(id: String, ev: BotEvent) = setOpen(id) { o ->
         val live = o.live ?: LiveTurn()
         when (ev) {
-            is BotEvent.Thinking -> o.copy(running = true, reconnecting = false, live = LiveTurn())
+            is BotEvent.Thinking -> o.copy(running = true, reconnecting = false, live = LiveTurn(bot = ev.bot))
             is BotEvent.Text -> o.copy(reconnecting = false, live = live.copy(text = live.text + ev.delta, tool = null))
             is BotEvent.Reasoning -> o.copy(reconnecting = false, live = live.copy(reasoning = live.reasoning + ev.delta))
             is BotEvent.Tool -> o.copy(reconnecting = false, live = live.copy(tool = ev.call))
@@ -322,7 +384,7 @@ class BotsController(
                     reconnecting = false,
                     // A finished turn replaces the words written live; a tool's result ends that tool.
                     live = when (m.role) {
-                        "assistant" -> LiveTurn()
+                        "assistant" -> LiveTurn(bot = live.bot)
                         "tool" -> live.copy(tool = null)
                         else -> o.live
                     },
@@ -343,7 +405,7 @@ class BotsController(
         if (words.isEmpty()) return
         scope.launch {
             try {
-                runCatching { pushKeyFor(open.bot.provider) }
+                membersOf(open).forEach { runCatching { pushKeyFor(it.provider) } }
                 val (urls, token, pin) = pc()
                 val (message, queued) = client.sendToBot(urls, token, pin, id, words)
                 setOpen(id) { o ->
@@ -655,5 +717,132 @@ class BotsController(
 
     fun networkBack() {
         networkBack.trySend(Unit)
+    }
+
+    // --- Groups -----------------------------------------------------------------------------------
+
+    fun createGroup(name: String, members: List<String>, done: (Result<BotGroup>) -> Unit) = connections({ u, t, p ->
+        client.createGroup(u, t, p, JSONObject().put("name", name.trim()).put("members", org.json.JSONArray(members)))
+    }) { r -> r.onSuccess { g -> _state.update { it.copy(groups = it.groups + g) } }; done(r) }
+
+    fun updateGroup(id: String, name: String, members: List<String>, done: (Result<BotGroup>) -> Unit) = connections({ u, t, p ->
+        client.updateGroup(u, t, p, id, JSONObject().put("name", name.trim()).put("members", org.json.JSONArray(members)))
+    }) { r ->
+        r.onSuccess { g ->
+            _state.update { s ->
+                s.copy(
+                    groups = s.groups.map { if (it.id == id) g else it },
+                    open = s.open?.takeIf { it.bot.id == g.thread }?.let { it.copy(group = g, bot = groupStandIn(g.thread, g).copy(running = it.running)) } ?: s.open,
+                )
+            }
+        }
+        done(r)
+    }
+
+    fun deleteGroup(id: String, done: (Result<Unit>) -> Unit = {}) = connections({ u, t, p -> client.deleteGroup(u, t, p, id) }) { r ->
+        r.onSuccess {
+            _state.update { s -> s.copy(groups = s.groups.filterNot { it.id == id }, open = s.open?.takeIf { it.bot.id != "g:$id" }) }
+            if (_state.value.open == null) follow?.cancel()
+        }
+        done(r)
+    }
+
+    // --- Skills -----------------------------------------------------------------------------------
+
+    private fun skills(done: (Result<Unit>) -> Unit, call: suspend (List<String>, String, String) -> List<Skill>) =
+        connections(call) { r -> r.onSuccess { list -> _state.update { it.copy(skills = list) } }; done(r.map { }) }
+
+    fun loadSkills() = skills({}) { u, t, p -> client.listSkills(u, t, p) }
+
+    fun addSkill(name: String, about: String, steps: String, done: (Result<Unit>) -> Unit) =
+        skills(done) { u, t, p -> client.addSkill(u, t, p, JSONObject().put("name", name).put("about", about).put("steps", steps)) }
+
+    fun updateSkill(id: String, name: String, about: String, steps: String, done: (Result<Unit>) -> Unit) =
+        skills(done) { u, t, p -> client.updateSkill(u, t, p, id, JSONObject().put("name", name).put("about", about).put("steps", steps)) }
+
+    fun approveSkill(id: String, done: (Result<Unit>) -> Unit = ::reportError) = skills(done) { u, t, p -> client.updateSkill(u, t, p, id, JSONObject().put("approved", true)) }
+
+    /** Deletes a skill, or declines one a Bot proposed. */
+    fun deleteSkill(id: String, done: (Result<Unit>) -> Unit = ::reportError) = skills(done) { u, t, p -> client.deleteSkill(u, t, p, id) }
+
+    // --- Teaching a task --------------------------------------------------------------------------
+
+    private var teachJob: Job? = null
+
+    private fun setTeaching(change: (Teaching) -> Teaching) = _state.update { s -> s.copy(teaching = s.teaching?.let(change)) }
+
+    /** Opens the Bot's browser for the user to show it a task. */
+    fun startTeach(bot: Bot) {
+        _state.update { it.copy(teaching = Teaching(bot.id, bot.name, busy = true)) }
+        teachStep(JSONObject().put("do", "start"))
+    }
+
+    /** A step in the browser ({do: open|tap|text|key|scroll|back|look, …}); the picture follows. */
+    private var lastStep = "" to 0L
+
+    fun teachStep(step: JSONObject) {
+        val t = _state.value.teaching ?: return
+        if (teachJob?.isActive == true && step.optString("do") == "look") return
+        // The same step twice within a moment is one press seen twice (Go fires on the key and the action).
+        val now = android.os.SystemClock.uptimeMillis()
+        val said = step.toString()
+        if (said == lastStep.first && now - lastStep.second < 400) return
+        lastStep = said to now
+        val before = teachJob
+        teachJob = scope.launch {
+            before?.join() // steps go one after another, in the order they were made
+            if (step.optString("do") != "look") setTeaching { it.copy(busy = true, error = null) }
+            try {
+                val (urls, token, pin) = pc()
+                val st = client.teachStep(urls, token, pin, t.botId, step)
+                val old = _state.value.teaching?.state?.shot
+                val picture = if (st.shot != old || _state.value.teaching?.picture == null) {
+                    runCatching {
+                        val bytes = client.teachShot(urls, token, pin, t.botId)
+                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) { android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size) }
+                    }.getOrNull()
+                } else null
+                setTeaching { it.copy(state = st, picture = picture ?: it.picture, busy = false, error = st.error) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                setTeaching { it.copy(busy = false, error = e.message ?: "Couldn't reach the browser.") }
+            }
+        }
+    }
+
+    /** While the teaching screen shows: a fresh picture every few seconds (pages load and change). */
+    suspend fun watchTeach() {
+        while (true) {
+            delay(3_000)
+            val t = _state.value.teaching ?: return
+            if (!t.busy && !t.done) teachStep(JSONObject().put("do", "look"))
+        }
+    }
+
+    /** The steps go to the Bot, which writes them up as a skill; the Bot's chat follows it working. */
+    fun finishTeach(what: String, done: (Result<Unit>) -> Unit) {
+        val t = _state.value.teaching ?: return
+        scope.launch {
+            teachJob?.join()
+            setTeaching { it.copy(busy = true, error = null) }
+            val r = runCatching {
+                val (urls, token, pin) = pc()
+                client.teachDone(urls, token, pin, t.botId, what.trim())
+            }.onFailure { if (it is CancellationException) throw it }
+            r.onSuccess {
+                _state.update { it.copy(teaching = null) }
+                if (_state.value.open?.bot?.id == t.botId) load(t.botId)
+            }.onFailure { e -> setTeaching { it.copy(busy = false, error = e.message) } }
+            done(r.map { })
+        }
+    }
+
+    /** Leaves without sending anything (the PC forgets the steps). */
+    fun cancelTeach() {
+        val t = _state.value.teaching ?: return
+        teachJob?.cancel()
+        _state.update { it.copy(teaching = null) }
+        scope.launch { runCatching { val (u, tk, p) = pc(); client.teachCancel(u, tk, p, t.botId) } }
     }
 }

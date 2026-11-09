@@ -62,6 +62,38 @@ data class McpServer(
 
 data class McpTool(val name: String, val description: String, val readOnly: Boolean)
 
+/** A group chat on the PC: two to six Bots and the user. Its chat is opened as the thread "g:<id>". */
+data class BotGroup(
+    val id: String,
+    val name: String,
+    val members: List<String>,
+    val running: Boolean = false,
+    val last: String? = null,
+    /** Who said [last]: a Bot id, or null for the user. */
+    val lastBot: String? = null,
+    val lastError: Boolean = false,
+    val lastAt: Long = 0,
+) {
+    val thread get() = "g:$id"
+}
+
+/** A saved how-to every Bot can use (`/name` in a message). A Bot's proposal waits for approval. */
+data class Skill(
+    val id: String,
+    val name: String,
+    val about: String,
+    val steps: String,
+    val approved: Boolean,
+    /** "user", or the id of the Bot that proposed it. */
+    val by: String,
+    val byName: String,
+    /** A proposed change to this skill's id. */
+    val replaces: String?,
+)
+
+/** Teaching a Bot a task in its browser: where the browser is, the steps so far, the screenshot's number. */
+data class TeachState(val url: String, val title: String, val steps: List<String>, val shot: Int, val error: String?)
+
 /**
  * A task the PC starts the Bot on at set times. [schedule] is the PC's JSON
  * ({kind: daily, time, days} | {kind: every, hours} | {kind: once, date, time, at}); [`when`] says it in words.
@@ -96,6 +128,9 @@ data class BotFeedItem(
     val routine: String?,
     /** For kind "phone": what the Bot sent this phone ({id, do: remind|notify|copy|open, …}). */
     val phone: JSONObject? = null,
+    /** Set when it happened in a group chat. */
+    val groupId: String? = null,
+    val groupName: String? = null,
 )
 
 data class BotCall(val id: String, val name: String, val args: String)
@@ -122,13 +157,20 @@ data class BotMessage(
     val took: Long = 0,
     /** A browser step with a screenshot (fetched by the message's id). */
     val shot: Boolean = false,
+    /** In a group chat: the Bot that said it. */
+    val bot: String? = null,
+    /** A task another Bot handed over: that Bot's name. */
+    val from: String? = null,
+    /** The user taught a task: the steps they took in the browser. */
+    val taught: List<String> = emptyList(),
 )
 
 /** What a Bot's run sends while it works. [seq] numbers them, so a phone that comes back can carry on. */
 sealed interface BotEvent {
     val seq: Int
 
-    data class Thinking(override val seq: Int) : BotEvent
+    /** A turn starts; in a group, [bot] is the one speaking. */
+    data class Thinking(override val seq: Int, val bot: String? = null) : BotEvent
     data class Text(override val seq: Int, val delta: String) : BotEvent
     data class Reasoning(override val seq: Int, val delta: String) : BotEvent
     /** A tool starts. */
@@ -218,6 +260,33 @@ internal fun feedItemFrom(o: JSONObject) = BotFeedItem(
     quiet = o.optBoolean("quiet"),
     routine = o.optJSONObject("routine")?.str("name"),
     phone = o.optJSONObject("phone"),
+    groupId = o.optJSONObject("group")?.str("id"),
+    groupName = o.optJSONObject("group")?.str("name"),
+)
+
+internal fun groupFrom(o: JSONObject): BotGroup {
+    val last = o.optJSONObject("last")
+    return BotGroup(
+        id = o.optString("id"),
+        name = o.optString("name"),
+        members = o.optJSONArray("members").strings(),
+        running = o.optBoolean("running"),
+        last = last?.let { it.str("error") ?: it.str("text") },
+        lastBot = last?.str("bot"),
+        lastError = last?.str("error") != null,
+        lastAt = last?.optLong("at") ?: 0,
+    )
+}
+
+internal fun skillFrom(o: JSONObject) = Skill(
+    id = o.optString("id"),
+    name = o.optString("name"),
+    about = o.optString("about"),
+    steps = o.optString("steps"),
+    approved = o.optBoolean("approved"),
+    by = o.optString("by", "user"),
+    byName = o.optString("by_name"),
+    replaces = o.str("replaces"),
 )
 
 internal fun botMessageFrom(o: JSONObject) = BotMessage(
@@ -237,12 +306,15 @@ internal fun botMessageFrom(o: JSONObject) = BotMessage(
     model = o.str("model"),
     took = o.optLong("took"),
     shot = o.optBoolean("shot"),
+    bot = o.str("bot"),
+    from = o.optJSONObject("from")?.str("name"),
+    taught = o.optJSONArray("taught").strings(),
 )
 
 internal fun botEventFrom(o: JSONObject): BotEvent? {
     val seq = o.optInt("seq", -1)
     return when (o.optString("type")) {
-        "thinking" -> BotEvent.Thinking(seq)
+        "thinking" -> BotEvent.Thinking(seq, o.str("bot"))
         "text" -> BotEvent.Text(seq, o.optString("delta"))
         "reasoning" -> BotEvent.Reasoning(seq, o.optString("delta"))
         "tool" -> BotEvent.Tool(seq, BotCall(o.optString("id"), o.optString("name"), o.optString("args", "{}")))
@@ -295,6 +367,9 @@ private suspend fun <T> LlmClient.botCall(
 
 private fun LlmClient.json(o: JSONObject) = o.toString().toRequestBody(jsonType)
 
+/** A chat's routes: a Bot's own ("bots/<id>"), or a group's (thread "g:<id>" → "groups/<id>"). */
+private fun thread(id: String) = if (id.startsWith("g:")) "groups/${id.removePrefix("g:")}" else "bots/$id"
+
 suspend fun LlmClient.listBots(baseUrls: List<String>, token: String, pin: String): List<Bot> =
     botCall(baseUrls, token, pin, { url("$it/bots") }) { r -> JSONObject(r.body.string()).optJSONArray("bots").objects().map(::botFrom) }
 
@@ -318,7 +393,7 @@ suspend fun LlmClient.deleteBot(baseUrls: List<String>, token: String, pin: Stri
     botCall(baseUrls, token, pin, { url("$it/bots/$id").delete() }) { }
 
 suspend fun LlmClient.botChat(baseUrls: List<String>, token: String, pin: String, id: String): BotChat =
-    botCall(baseUrls, token, pin, { url("$it/bots/$id/messages") }) { r ->
+    botCall(baseUrls, token, pin, { url("$it/${thread(id)}/messages") }) { r ->
         val o = JSONObject(r.body.string())
         BotChat(
             o.optJSONArray("messages").objects().map(::botMessageFrom), o.optBoolean("running"), if (o.isNull("follow")) null else o.optInt("follow"),
@@ -332,15 +407,15 @@ suspend fun LlmClient.botChat(baseUrls: List<String>, token: String, pin: String
  * second value is true).
  */
 suspend fun LlmClient.sendToBot(baseUrls: List<String>, token: String, pin: String, id: String, text: String): Pair<BotMessage, Boolean> =
-    botCall(baseUrls, token, pin, { url("$it/bots/$id/messages").post(json(JSONObject().put("text", text))) }) { r ->
+    botCall(baseUrls, token, pin, { url("$it/${thread(id)}/messages").post(json(JSONObject().put("text", text))) }) { r ->
         JSONObject(r.body.string()).let { botMessageFrom(it.getJSONObject("message")) to it.optBoolean("queued") }
     }
 
 suspend fun LlmClient.clearBotChat(baseUrls: List<String>, token: String, pin: String, id: String) =
-    botCall(baseUrls, token, pin, { url("$it/bots/$id/messages").delete() }) { }
+    botCall(baseUrls, token, pin, { url("$it/${thread(id)}/messages").delete() }) { }
 
 suspend fun LlmClient.stopBot(baseUrls: List<String>, token: String, pin: String, id: String) =
-    botCall(baseUrls, token, pin, { url("$it/bots/$id/run").delete() }) { }
+    botCall(baseUrls, token, pin, { url("$it/${thread(id)}/run").delete() }) { }
 
 /**
  * Follows a Bot's run from event [after] until it ends. Throws if the connection drops first (the Bot
@@ -348,7 +423,7 @@ suspend fun LlmClient.stopBot(baseUrls: List<String>, token: String, pin: String
  */
 suspend fun LlmClient.followBot(
     baseUrls: List<String>, token: String, pin: String, id: String, after: Int, onEvent: (BotEvent) -> Unit,
-) = botCall(baseUrls, token, pin, { url("$it/bots/$id/events?after=$after").header("Accept", "text/event-stream") }) { r ->
+) = botCall(baseUrls, token, pin, { url("$it/${thread(id)}/events?after=$after").header("Accept", "text/event-stream") }) { r ->
     val source = r.body.source()
     while (true) {
         val line = source.readUtf8Line() ?: break
@@ -400,7 +475,7 @@ suspend fun LlmClient.botFeed(baseUrls: List<String>, token: String, pin: String
 
 /** Answers an action the Bot waits on. */
 suspend fun LlmClient.answerBot(baseUrls: List<String>, token: String, pin: String, id: String, approval: String, allow: Boolean) =
-    botCall(baseUrls, token, pin, { url("$it/bots/$id/approval").post(json(JSONObject().put("id", approval).put("allow", allow))) }) { }
+    botCall(baseUrls, token, pin, { url("$it/${thread(id)}/approval").post(json(JSONObject().put("id", approval).put("allow", allow))) }) { }
 
 /** A browser step's screenshot (JPEG bytes). */
 suspend fun LlmClient.botShot(baseUrls: List<String>, token: String, pin: String, id: String, messageId: String): ByteArray =
@@ -408,7 +483,7 @@ suspend fun LlmClient.botShot(baseUrls: List<String>, token: String, pin: String
 
 /** The phone's answer to a question its Bot asked ({error} when it can't). */
 suspend fun LlmClient.answerPhone(baseUrls: List<String>, token: String, pin: String, id: String, request: String, answer: JSONObject) =
-    botCall(baseUrls, token, pin, { url("$it/bots/$id/phone").post(json(JSONObject().put("id", request).put("answer", answer))) }) { }
+    botCall(baseUrls, token, pin, { url("$it/${thread(id)}/phone").post(json(JSONObject().put("id", request).put("answer", answer))) }) { }
 
 // --- Google ---------------------------------------------------------------------------------------
 
@@ -452,3 +527,61 @@ suspend fun LlmClient.deleteMcp(baseUrls: List<String>, token: String, pin: Stri
 /** An app's tools, asked afresh (or why it can't be reached). */
 suspend fun LlmClient.mcpTools(baseUrls: List<String>, token: String, pin: String, id: String): Pair<List<McpTool>, String?> =
     botCall(baseUrls, token, pin, { url("$it/mcp/$id/tools") }) { r -> JSONObject(r.body.string()).let { toolsOf(it) to it.str("error") } }
+
+// --- Groups ---------------------------------------------------------------------------------------
+
+suspend fun LlmClient.listGroups(baseUrls: List<String>, token: String, pin: String): List<BotGroup> =
+    botCall(baseUrls, token, pin, { url("$it/groups") }) { r -> JSONObject(r.body.string()).optJSONArray("groups").objects().map(::groupFrom) }
+
+/** Makes a group from {name, members}. */
+suspend fun LlmClient.createGroup(baseUrls: List<String>, token: String, pin: String, fields: JSONObject): BotGroup =
+    botCall(baseUrls, token, pin, { url("$it/groups").post(json(fields)) }) { r -> groupFrom(JSONObject(r.body.string()).getJSONObject("group")) }
+
+suspend fun LlmClient.getGroup(baseUrls: List<String>, token: String, pin: String, id: String): BotGroup =
+    botCall(baseUrls, token, pin, { url("$it/groups/$id") }) { r -> groupFrom(JSONObject(r.body.string()).getJSONObject("group")) }
+
+suspend fun LlmClient.updateGroup(baseUrls: List<String>, token: String, pin: String, id: String, fields: JSONObject): BotGroup =
+    botCall(baseUrls, token, pin, { url("$it/groups/$id").put(json(fields)) }) { r -> groupFrom(JSONObject(r.body.string()).getJSONObject("group")) }
+
+suspend fun LlmClient.deleteGroup(baseUrls: List<String>, token: String, pin: String, id: String) =
+    botCall(baseUrls, token, pin, { url("$it/groups/$id").delete() }) { }
+
+// --- Skills ---------------------------------------------------------------------------------------
+
+private fun skillsOf(r: okhttp3.Response) = JSONObject(r.body.string()).optJSONArray("skills").objects().map(::skillFrom)
+
+suspend fun LlmClient.listSkills(baseUrls: List<String>, token: String, pin: String): List<Skill> =
+    botCall(baseUrls, token, pin, { url("$it/skills") }, ::skillsOf)
+
+/** The user's own skill {name, about, steps}; returns all skills. */
+suspend fun LlmClient.addSkill(baseUrls: List<String>, token: String, pin: String, fields: JSONObject): List<Skill> =
+    botCall(baseUrls, token, pin, { url("$it/skills").post(json(fields)) }, ::skillsOf)
+
+/** Changes a skill, or approves a proposal ({approved: true}); returns all skills. */
+suspend fun LlmClient.updateSkill(baseUrls: List<String>, token: String, pin: String, id: String, fields: JSONObject): List<Skill> =
+    botCall(baseUrls, token, pin, { url("$it/skills/$id").put(json(fields)) }, ::skillsOf)
+
+/** Deletes a skill, or declines a proposal; returns all skills. */
+suspend fun LlmClient.deleteSkill(baseUrls: List<String>, token: String, pin: String, id: String): List<Skill> =
+    botCall(baseUrls, token, pin, { url("$it/skills/$id").delete() }, ::skillsOf)
+
+// --- Teaching a task ------------------------------------------------------------------------------
+
+/** One step of teaching Bot [id] in its browser ({do: start|look|open|tap|text|key|scroll|back, …}). */
+suspend fun LlmClient.teachStep(baseUrls: List<String>, token: String, pin: String, id: String, step: JSONObject): TeachState =
+    botCall(baseUrls, token, pin, { url("$it/bots/$id/teach").post(json(step)) }) { r ->
+        val o = JSONObject(r.body.string())
+        TeachState(o.optString("url"), o.optString("title"), o.optJSONArray("steps").strings(), o.optInt("shot"), o.str("error"))
+    }
+
+suspend fun LlmClient.teachShot(baseUrls: List<String>, token: String, pin: String, id: String): ByteArray =
+    botCall(baseUrls, token, pin, { url("$it/bots/$id/teach/shot") }) { r -> r.body.bytes() }
+
+/** Done: the steps go to the Bot ([what]: what the task is for), which writes a skill. */
+suspend fun LlmClient.teachDone(baseUrls: List<String>, token: String, pin: String, id: String, what: String): BotMessage =
+    botCall(baseUrls, token, pin, { url("$it/bots/$id/teach/done").post(json(JSONObject().put("what", what))) }) { r ->
+        botMessageFrom(JSONObject(r.body.string()).getJSONObject("message"))
+    }
+
+suspend fun LlmClient.teachCancel(baseUrls: List<String>, token: String, pin: String, id: String) =
+    botCall(baseUrls, token, pin, { url("$it/bots/$id/teach").delete() }) { }

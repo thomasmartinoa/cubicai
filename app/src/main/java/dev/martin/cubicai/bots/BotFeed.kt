@@ -24,6 +24,7 @@ import dev.martin.cubicai.net.BotFeedItem
 import dev.martin.cubicai.net.LlmClient
 import dev.martin.cubicai.net.botFeed
 import dev.martin.cubicai.net.listBots
+import dev.martin.cubicai.net.listGroups
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -109,7 +110,8 @@ object BotFeed {
             putLong("after", upto)
             putStringSet("seen", (items.map { it.id }).takeLast(50).toSet())
         }
-        runCatching { client.listBots(urls, token, pin).any { it.running } }.getOrDefault(false)
+        runCatching { client.listBots(urls, token, pin).any { it.running } }.getOrDefault(false) ||
+            runCatching { client.listGroups(urls, token, pin).any { it.running } }.getOrDefault(false)
     }
 
     private fun show(context: Context, item: BotFeedItem) {
@@ -120,15 +122,17 @@ object BotFeed {
         manager.createNotificationChannel(NotificationChannel(CHANNEL, "Bots", NotificationManager.IMPORTANCE_DEFAULT).apply {
             description = "When a Bot finishes something or asks you to approve a routine"
         })
-        val title = item.name + (item.routine?.let { " · $it" } ?: "")
+        val title = (item.groupName?.let { "$it · " } ?: "") + item.name + (item.routine?.let { " · $it" } ?: "")
+        // A group's news opens the group (one notification per group, like one per Bot).
+        val target = item.groupId?.let { "g:$it" } ?: item.bot
         val text = when (item.kind) {
             "approval" -> "Wants to " + item.text.removePrefix("wants to ")
             "error" -> "Couldn't finish: " + item.text
             else -> item.text.ifBlank { "Done." }
         }
         val open = PendingIntent.getActivity(
-            context, item.bot.hashCode(),
-            Intent(context, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP).putExtra(MainActivity.EXTRA_BOT, item.bot),
+            context, target.hashCode(),
+            Intent(context, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP).putExtra(MainActivity.EXTRA_BOT, target),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         val n = NotificationCompat.Builder(context, CHANNEL)
@@ -143,7 +147,7 @@ object BotFeed {
             .setAutoCancel(true)
             .build()
         // One per Bot: its newest news replaces the last.
-        manager.notify("bot:" + item.bot, 0, n)
+        manager.notify("bot:$target", 0, n)
     }
 
     /** Opening a Bot clears its notification. */
