@@ -59,6 +59,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
@@ -205,6 +206,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         override fun grokReplyEnd(cut: Boolean) = grokReplyEnded(cut)
     })
 
+    /** The Bots on the paired PC (see bots/BotsController). */
+    val bots = dev.martin.cubicai.bots.BotsController(viewModelScope, client) { _state.value.settings }
+
     /** In a Grok call: the reply being said (still coming in, or said last), in the open chat. */
     private var grokReplyId: String? = null
     private var grokReplyOpen = false
@@ -232,7 +236,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             _state.update { it.copy(chats = chats) }
         }
         refreshContextLimit()
-        viewModelScope.launch { networkBack.collect { call.networkBack() } }
+        viewModelScope.launch { networkBack.collect { call.networkBack(); bots.networkBack() } }
         // In a call: whether something is being made (it's said so), and an answer owed once it's done.
         viewModelScope.launch {
             _state.map { s -> s.current.messages.any { it.mediaPending } }.distinctUntilChanged().collect { call.setMaking(it) }
@@ -241,21 +245,28 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             _state.map { it.streaming }.distinctUntilChanged().collect { streaming -> if (!streaming) answerWaitingCall() }
         }
         // While a reply is written or something is made, a foreground service keeps the app alive in the background.
-        WorkService.onStopTapped = { viewModelScope.launch { stop() } }
+        // A Bot working on the PC while its chat is open counts too: the phone keeps following it, and its
+        // answer comes as the Bot's notification.
+        WorkService.onStopTapped = { viewModelScope.launch { if (_state.value.streaming) stop() else bots.stop() } }
         viewModelScope.launch {
             var working = false
-            _state.map(::workText).distinctUntilChanged().collectLatest { text ->
-                if (text != null) {
-                    working = true
-                    WorkService.update(app, text)
-                } else if (working) {
-                    // A picture and the model's look at it run back to back: wait a moment so the notice doesn't flicker.
-                    delay(2500)
-                    working = false
-                    WorkService.update(app, null)
-                    if (!visible) notifyDone()
+            var botWork = false
+            combine(_state, bots.state) { s, b -> workText(s) ?: b.open?.takeIf { it.running }?.let { "${it.bot.name.ifBlank { "Your Bot" }} is working on your PC" } }
+                .distinctUntilChanged().collectLatest { text ->
+                    if (text != null) {
+                        working = true
+                        botWork = workText(_state.value) == null
+                        WorkService.update(app, text)
+                    } else if (working) {
+                        // A picture and the model's look at it run back to back: wait a moment so the notice doesn't flicker.
+                        delay(2500)
+                        working = false
+                        WorkService.update(app, null)
+                        if (!visible) {
+                            if (botWork) runCatching { dev.martin.cubicai.bots.BotFeed.check(app) } else notifyDone()
+                        }
+                    }
                 }
-            }
         }
     }
 
@@ -264,7 +275,16 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     fun setVisible(shown: Boolean) {
         visible = shown
-        if (shown) WorkService.clearDone(getApplication())
+        dev.martin.cubicai.bots.BotFeed.appVisible = shown
+        if (shown) {
+            WorkService.clearDone(getApplication())
+            bots.resume()
+            bots.state.value.open?.let { dev.martin.cubicai.bots.BotFeed.clear(getApplication(), it.bot.id) }
+        } else if (_state.value.settings.isPaired) {
+            // Bot notifications: what happened while on screen is seen; a Bot still at work gets checked on soon.
+            dev.martin.cubicai.bots.BotFeed.schedule(getApplication())
+            dev.martin.cubicai.bots.BotFeed.leaving(getApplication(), bots.anyWorking, viewModelScope)
+        }
     }
 
     private fun workText(s: UiState): String? {

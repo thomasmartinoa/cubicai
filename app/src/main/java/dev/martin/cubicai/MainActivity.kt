@@ -32,6 +32,8 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.core.content.IntentCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import dev.martin.cubicai.ui.BotChatScreen
+import dev.martin.cubicai.ui.BotsScreen
 import dev.martin.cubicai.ui.CallScreen
 import dev.martin.cubicai.ui.ChatScreen
 import dev.martin.cubicai.ui.CubicTheme
@@ -40,11 +42,16 @@ import dev.martin.cubicai.ui.SettingsScreen
 
 class MainActivity : ComponentActivity() {
     private val vm: ChatViewModel by viewModels()
+    /** A Bot to open, from its notification. */
+    private var openBot by mutableStateOf<String?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        if (savedInstanceState == null) handleShare(intent)
+        if (savedInstanceState == null) {
+            handleShare(intent)
+            openBot = intent?.getStringExtra(EXTRA_BOT)
+        }
         askForNotifications()
         setContent {
             val state by vm.state.collectAsStateWithLifecycle()
@@ -59,21 +66,47 @@ class MainActivity : ComponentActivity() {
                     if (state.settings.privacyScreen) window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
                     else window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
                 }
-                var showSettings by rememberSaveable { mutableStateOf(false) }
-                BackHandler(enabled = showSettings) { showSettings = false }
+                // chat, settings, bots (the list) or bot (the open Bot's chat).
+                var screen by rememberSaveable { mutableStateOf("chat") }
+                val botsState by vm.bots.state.collectAsStateWithLifecycle()
+                // The open Bot doesn't survive the process; back to the list then.
+                if (screen == "bot" && botsState.open == null) screen = "bots"
+                LaunchedEffect(openBot) {
+                    val id = openBot ?: return@LaunchedEffect
+                    openBot = null
+                    vm.bots.open(id)
+                    dev.martin.cubicai.bots.BotFeed.clear(this@MainActivity, id)
+                    screen = "bot"
+                }
+                fun depth(s: String) = when (s) { "chat" -> 0; "bot" -> 2; else -> 1 }
+                BackHandler(enabled = screen != "chat") {
+                    screen = when (screen) {
+                        "bot" -> { vm.bots.close(); "bots" }
+                        else -> "chat"
+                    }
+                }
                 val call by vm.call.state.collectAsStateWithLifecycle()
                 Box {
                 AnimatedContent(
-                    targetState = showSettings,
+                    targetState = screen,
                     transitionSpec = {
-                        val dir = if (targetState) 1 else -1
+                        val dir = if (depth(targetState) > depth(initialState)) 1 else -1
                         (fadeIn(tween(200)) + slideInHorizontally(tween(220)) { it / 10 * dir }) togetherWith
                             (fadeOut(tween(120)) + slideOutHorizontally(tween(220)) { -it / 10 * dir })
                     },
                     label = "screen",
-                ) { settings ->
-                    if (settings) SettingsScreen(vm, onBack = { showSettings = false })
-                    else ChatScreen(vm, onOpenSettings = { showSettings = true })
+                ) { shown ->
+                    when (shown) {
+                        "settings" -> SettingsScreen(vm, onBack = { screen = "chat" })
+                        "bots" -> BotsScreen(
+                            vm,
+                            onBack = { screen = "chat" },
+                            onOpenBot = { vm.bots.open(it); screen = "bot" },
+                            onOpenSettings = { screen = "settings" },
+                        )
+                        "bot" -> BotChatScreen(vm, onBack = { vm.bots.close(); screen = "bots" }, onOpenSettings = { screen = "settings" })
+                        else -> ChatScreen(vm, onOpenSettings = { screen = "settings" }, onOpenBots = { screen = "bots" })
+                    }
                 }
                 // A call covers the app; pulled down, the chat shows with the call in a bar on top.
                 AnimatedVisibility(
@@ -99,6 +132,7 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         handleShare(intent)
+        intent.getStringExtra(EXTRA_BOT)?.let { openBot = it }
     }
 
     /**
@@ -125,5 +159,9 @@ class MainActivity : ComponentActivity() {
         vm.newChat()
         stream?.let { vm.addAttachments(listOf(it)) }
         text?.let { vm.setDraft(it) }
+    }
+
+    companion object {
+        const val EXTRA_BOT = "dev.martin.cubicai.BOT"
     }
 }

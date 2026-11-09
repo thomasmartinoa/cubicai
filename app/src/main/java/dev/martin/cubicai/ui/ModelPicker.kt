@@ -42,15 +42,27 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.martin.cubicai.ChatViewModel
+import dev.martin.cubicai.data.Provider
 import dev.martin.cubicai.data.Providers
 import dev.martin.cubicai.net.ModelInfo
 
+/**
+ * Picks the chat's model, or with [onPick] a model for something else (a Bot): then [current] is that
+ * one (provider id, model), and only models that can chat with tools are offered.
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ModelPickerSheet(vm: ChatViewModel, onOpenSettings: () -> Unit, onDismiss: () -> Unit) {
+fun ModelPickerSheet(
+    vm: ChatViewModel,
+    onOpenSettings: () -> Unit,
+    onDismiss: () -> Unit,
+    title: String = "Choose a model",
+    current: Pair<String, String>? = null,
+    onPick: ((Provider, String) -> Unit)? = null,
+) {
     val state by vm.state.collectAsStateWithLifecycle()
     val settings = state.settings
-    var providerId by remember { mutableStateOf(settings.providerId) }
+    var providerId by remember { mutableStateOf(current?.first ?: settings.providerId) }
     val provider = Providers.get(providerId)
     var models by remember(providerId) { mutableStateOf<List<ModelInfo>?>(null) }
     var error by remember(providerId) { mutableStateOf<String?>(null) }
@@ -67,14 +79,20 @@ fun ModelPickerSheet(vm: ChatViewModel, onOpenSettings: () -> Unit, onDismiss: (
             }
     }
 
-    val selected = if (providerId == settings.providerId) settings.model(provider) else null
+    val selected = when {
+        onPick != null -> current?.second?.takeIf { current.first == providerId }
+        providerId == settings.providerId -> settings.model(provider)
+        else -> null
+    }
     val filtered = models.orEmpty().filter { m ->
         (query.isBlank() || m.id.contains(query.trim(), ignoreCase = true)) &&
-            (!freeOnly || m.free) && (!visionOnly || m.vision)
+            (!freeOnly || m.free) && (!visionOnly || m.vision) &&
+            // A Bot works with tools: no picture/video models, no team-of-agents models, none that says it can't.
+            (onPick == null || (provider.mediaKind(m.id) == null && !provider.isMultiAgent(m.id) && m.tools != false))
     }
 
     fun choose(id: String) {
-        vm.selectModel(provider, id)
+        if (onPick != null) onPick(provider, id) else vm.selectModel(provider, id)
         onDismiss()
     }
 
@@ -82,7 +100,7 @@ fun ModelPickerSheet(vm: ChatViewModel, onOpenSettings: () -> Unit, onDismiss: (
         // Everything sits on the sheet's 20dp edge; the provider tabs scroll edge to edge but start on it too.
         val edge = Modifier.padding(horizontal = 20.dp)
         Column(Modifier.padding(bottom = 16.dp)) {
-            Text("Choose a model", style = MaterialTheme.typography.titleLarge, modifier = edge.padding(bottom = 12.dp))
+            Text(title, style = MaterialTheme.typography.titleLarge, modifier = edge.padding(bottom = 12.dp))
             Row(
                 Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 20.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -151,7 +169,7 @@ fun ModelPickerSheet(vm: ChatViewModel, onOpenSettings: () -> Unit, onDismiss: (
                             m.contextTokens.takeIf { it > 0 && provider.mediaKind(m.id) == null }?.let { "${contextLabel(it)}\u00A0context" },
                             m.sizeBytes.takeIf { it > 0 }?.let { "%.1f\u00A0GB".format(it / 1e9) },
                         ).joinToString(", ")
-                        val isSelected = m.id == selected || (providerId == settings.providerId && when (provider.mediaKind(m.id)) {
+                        val isSelected = m.id == selected || (onPick == null && providerId == settings.providerId && when (provider.mediaKind(m.id)) {
                             "image" -> state.imageMode && m.id == settings.imageModel(provider)
                             "video" -> state.videoMode && m.id == settings.videoModel(provider)
                             else -> false

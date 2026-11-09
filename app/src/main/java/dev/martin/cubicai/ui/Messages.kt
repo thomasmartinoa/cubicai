@@ -459,7 +459,7 @@ private fun ModelPrompt(asked: JSONObject, kind: String, onEdit: (() -> Unit)?) 
 }
 
 @Composable
-private fun ReasoningBlock(reasoning: String, active: Boolean, preferred: Boolean?, onToggle: (Boolean) -> Unit) {
+internal fun ReasoningBlock(reasoning: String, active: Boolean, preferred: Boolean?, onToggle: (Boolean) -> Unit) {
     // Until the user opens or folds one, it opens by itself while the model thinks and folds away when it answers.
     // After that every reply follows their choice.
     var expanded by remember { mutableStateOf(preferred ?: active) }
@@ -584,7 +584,7 @@ private fun Dots(color: Color) {
 }
 
 @Composable
-private fun ErrorCard(error: String, onRetry: (() -> Unit)?) {
+internal fun ErrorCard(error: String, onRetry: (() -> Unit)?) {
     Surface(
         color = MaterialTheme.colorScheme.errorContainer,
         shape = MaterialTheme.shapes.medium,
@@ -599,7 +599,7 @@ private fun ErrorCard(error: String, onRetry: (() -> Unit)?) {
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun Sources(urls: List<String>) {
+internal fun Sources(urls: List<String>) {
     val uriHandler = LocalUriHandler.current
     var showAll by remember { mutableStateOf(false) }
     val shown = if (showAll) urls else urls.take(6)

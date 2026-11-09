@@ -26,8 +26,8 @@ import kotlin.math.sqrt
  * from face to face, which is the app's only "thinking" animation.
  */
 @Composable
-fun Cube(size: Dp, modifier: Modifier = Modifier, spinning: Boolean = false) {
-    val cube = LocalCube.current
+fun Cube(size: Dp, modifier: Modifier = Modifier, spinning: Boolean = false, colors: CubeColors? = null) {
+    val cube = colors ?: LocalCube.current
     val gap = MaterialTheme.colorScheme.background
     // The animated value is read only while drawing, so the spin redraws the cube without recomposing anything.
     val phase: State<Float> = if (spinning) {
@@ -72,6 +72,12 @@ fun Cube(size: Dp, modifier: Modifier = Modifier, spinning: Boolean = false) {
 }
 
 private val Still: State<Float> = mutableFloatStateOf(0f)
+
+/** A Bot's cube in its own colour ("#rrggbb"): a lit top, the colour itself, a shaded side. */
+fun cubeColors(hex: String): CubeColors {
+    val base = runCatching { Color(android.graphics.Color.parseColor(hex)) }.getOrDefault(Color(0xFF2F6BFF))
+    return CubeColors(lerp(base, Color.White, 0.35f), base, lerp(base, Color.Black, 0.3f))
+}
 
 @Composable
 fun CubeMark(modifier: Modifier = Modifier) = Cube(28.dp, modifier)

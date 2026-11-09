@@ -71,6 +71,7 @@ import androidx.compose.material.icons.rounded.Movie
 import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.PhotoCamera
 import androidx.compose.material.icons.rounded.Settings
+import androidx.compose.material.icons.rounded.SmartToy
 import androidx.compose.material.icons.rounded.Stop
 import androidx.compose.material3.Button
 import androidx.compose.material3.CenterAlignedTopAppBar
@@ -135,7 +136,7 @@ import java.time.temporal.ChronoUnit
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ChatScreen(vm: ChatViewModel, onOpenSettings: () -> Unit) {
+fun ChatScreen(vm: ChatViewModel, onOpenSettings: () -> Unit, onOpenBots: () -> Unit) {
     val state by vm.state.collectAsStateWithLifecycle()
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
@@ -183,6 +184,7 @@ fun ChatScreen(vm: ChatViewModel, onOpenSettings: () -> Unit) {
                 onOpen = { vm.openChat(it); scope.launch { drawerState.close() } },
                 onDelete = vm::deleteChat,
                 onSettings = { scope.launch { drawerState.close() }; onOpenSettings() },
+                onBots = { scope.launch { drawerState.close() }; onOpenBots() },
             )
         },
     ) {
@@ -615,6 +617,7 @@ private fun ChatDrawer(
     onOpen: (String) -> Unit,
     onDelete: (String) -> Unit,
     onSettings: () -> Unit,
+    onBots: () -> Unit,
 ) {
     ModalDrawerSheet(drawerContainerColor = MaterialTheme.colorScheme.surfaceContainerLow) {
         // 24dp mark at the items' icon column, so "CubicAI" starts where the item labels do.
@@ -629,6 +632,14 @@ private fun ChatDrawer(
             icon = { Icon(Icons.Rounded.AddBox, null) },
             selected = false,
             onClick = onNew,
+            modifier = Modifier.padding(horizontal = 12.dp),
+        )
+        NavigationDrawerItem(
+            shape = MaterialTheme.shapes.small,
+            label = { Text("Bots") },
+            icon = { Icon(Icons.Rounded.SmartToy, null) },
+            selected = false,
+            onClick = onBots,
             modifier = Modifier.padding(horizontal = 12.dp),
         )
         // Search appears once the list is long enough to need it, and clears when the drawer closes,

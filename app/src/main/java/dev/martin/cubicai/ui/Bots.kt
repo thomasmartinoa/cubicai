@@ -1,0 +1,941 @@
+package dev.martin.cubicai.ui
+
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.consumeWindowInsets
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CutCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.ArrowUpward
+import androidx.compose.material.icons.rounded.Bookmark
+import androidx.compose.material.icons.rounded.BookmarkRemove
+import androidx.compose.material.icons.rounded.Check
+import androidx.compose.material.icons.rounded.ContentCopy
+import androidx.compose.material.icons.rounded.Delete
+import androidx.compose.material.icons.rounded.DeleteSweep
+import androidx.compose.material.icons.rounded.Description
+import androidx.compose.material.icons.rounded.EditNote
+import androidx.compose.material.icons.rounded.ErrorOutline
+import androidx.compose.material.icons.rounded.Folder
+import androidx.compose.material.icons.rounded.Language
+import androidx.compose.material.icons.rounded.MoreVert
+import androidx.compose.material.icons.rounded.Schedule
+import androidx.compose.material.icons.rounded.EventBusy
+import androidx.compose.material.icons.rounded.Search
+import androidx.compose.material.icons.rounded.Stop
+import androidx.compose.material.icons.rounded.Tune
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Badge
+import androidx.compose.material3.BadgedBox
+import androidx.compose.material3.Button
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledIconButton
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.TextField
+import androidx.compose.material3.TextFieldDefaults
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material3.rememberModalBottomSheetState
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.KeyboardCapitalization
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import dev.martin.cubicai.ChatViewModel
+import dev.martin.cubicai.bots.LiveTurn
+import dev.martin.cubicai.bots.OpenBot
+import dev.martin.cubicai.data.Providers
+import dev.martin.cubicai.net.Bot
+import dev.martin.cubicai.net.BotCall
+import dev.martin.cubicai.net.BotMessage
+import org.json.JSONObject
+
+/** The colours a Bot's cube can have: the app's amber and cobalt first. */
+val BOT_COLORS = listOf("#f29e38", "#2f6bff", "#14b8a6", "#4caf50", "#e5484d", "#e0569b", "#8b5cf6", "#64748b")
+
+private data class BotIdea(val name: String, val job: String, val color: String)
+
+/** Starting points, like Grok Bot's "give each Bot a role"; every field can be changed before saving. */
+private val IDEAS = listOf(
+    BotIdea(
+        "Researcher",
+        "Dig into the questions I give you. Search the web, read the best sources (not just snippets), and give me a short, clear answer with links. " +
+            "For anything bigger, write a report to research/<topic>.md in the workspace and tell me what's in it.",
+        "#f29e38",
+    ),
+    BotIdea(
+        "News scout",
+        "Keep up with the topics I tell you about. When I ask for news, search for what's new since last time, skip what I've already seen, " +
+            "and give me a digest of the five most important items with one line each and a link. Remember my topics and what you've reported.",
+        "#2f6bff",
+    ),
+    BotIdea(
+        "Writer",
+        "Help me write: drafts, edits, emails, posts. Keep longer pieces as files in writing/ in the workspace and update them when I ask. " +
+            "Learn my style and preferences and remember them.",
+        "#14b8a6",
+    ),
+    BotIdea(
+        "Planner",
+        "Turn my goals into plans and checklists. Keep them in plans/ in the workspace, update them as things get done, " +
+            "and remind me what's next when I ask. Remember my priorities and deadlines.",
+        "#8b5cf6",
+    ),
+)
+
+private fun providerName(id: String) = Providers.all.firstOrNull { it.id == id }?.shortName ?: id
+
+// --- The list ---------------------------------------------------------------------------------------
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun BotsScreen(vm: ChatViewModel, onBack: () -> Unit, onOpenBot: (String) -> Unit, onOpenSettings: () -> Unit) {
+    val state by vm.bots.state.collectAsStateWithLifecycle()
+    var editing by remember { mutableStateOf<BotDraft?>(null) }
+    LaunchedEffect(Unit) { vm.bots.watchList() }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back") } },
+                title = { Text("Bots") },
+                actions = {
+                    if (vm.bots.paired) IconButton(onClick = { editing = BotDraft.blank(vm) }) { Icon(Icons.Rounded.Add, "New Bot") }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background),
+            )
+        },
+    ) { padding ->
+        LazyColumn(
+            Modifier.fillMaxSize().padding(padding).consumeWindowInsets(padding),
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            when {
+                !vm.bots.paired -> item {
+                    Notice(
+                        "Bots live on your PC, so they keep working when you close the app. Pair with your PC to make one.",
+                        "Open Settings",
+                        onOpenSettings,
+                    )
+                }
+                !state.loaded && state.error == null -> item {
+                    Box(Modifier.fillMaxWidth().padding(48.dp), contentAlignment = Alignment.Center) { Cube(32.dp, spinning = true) }
+                }
+                !state.loaded -> item { Notice(state.error.orEmpty(), "Try again") { vm.bots.refresh() } }
+                else -> {
+                    if (state.bots.isEmpty()) item { Intro() }
+                    items(state.bots, key = { it.id }) { bot ->
+                        BotRow(
+                            bot,
+                            onOpen = { onOpenBot(bot.id) },
+                            onEdit = { editing = BotDraft.of(bot) },
+                            onDelete = { vm.bots.delete(bot.id) },
+                            modifier = Modifier.animateItem(),
+                        )
+                    }
+                    item(key = "ideas") {
+                        Text(
+                            if (state.bots.isEmpty()) "Start from an idea" else "More ideas",
+                            Modifier.padding(top = 16.dp, bottom = 4.dp),
+                            style = MaterialTheme.typography.titleSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    items(IDEAS.filter { idea -> state.bots.none { it.name == idea.name } }, key = { "idea:" + it.name }) { idea ->
+                        IdeaRow(idea) { editing = BotDraft.blank(vm).copy(name = idea.name, job = idea.job, color = idea.color) }
+                    }
+                    item(key = "new") {
+                        OutlinedButton(
+                            onClick = { editing = BotDraft.blank(vm) },
+                            shape = MaterialTheme.shapes.small,
+                            modifier = Modifier.padding(top = 8.dp),
+                        ) {
+                            Icon(Icons.Rounded.Add, null, Modifier.size(18.dp))
+                            Spacer(Modifier.width(8.dp))
+                            Text("New Bot")
+                        }
+                    }
+                    if (state.error != null) item(key = "error") {
+                        Text(state.error.orEmpty(), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                    }
+                }
+            }
+        }
+    }
+    editing?.let { draft ->
+        BotEditSheet(vm, draft, onOpenSettings = onOpenSettings, onDismiss = { editing = null }, onSaved = { bot -> editing = null; if (draft.id == null) onOpenBot(bot.id) })
+    }
+}
+
+@Composable
+private fun Intro() {
+    Column(Modifier.fillMaxWidth().padding(top = 24.dp, bottom = 8.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+        Cube(48.dp)
+        Text("Give each Bot a role", Modifier.padding(top = 16.dp), style = MaterialTheme.typography.headlineSmall)
+        Text(
+            "Bots live on your PC and keep working when you close the app. Each has its own job, chat and memory; " +
+                "they can search the web, read pages and keep files in a workspace folder they share.",
+            Modifier.padding(top = 8.dp),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+        )
+    }
+}
+
+@Composable
+private fun Notice(text: String, action: String, onAction: () -> Unit) {
+    Column(Modifier.fillMaxWidth().padding(vertical = 32.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+        Cube(40.dp)
+        Text(
+            text,
+            Modifier.padding(top = 16.dp),
+            style = MaterialTheme.typography.bodyLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+        )
+        Button(onClick = onAction, shape = MaterialTheme.shapes.small, modifier = Modifier.padding(top = 16.dp)) { Text(action) }
+    }
+}
+
+@Composable
+private fun BotRow(bot: Bot, onOpen: () -> Unit, onEdit: () -> Unit, onDelete: () -> Unit, modifier: Modifier = Modifier) {
+    var menu by remember { mutableStateOf(false) }
+    var confirm by remember { mutableStateOf(false) }
+    Surface(
+        shape = MaterialTheme.shapes.medium,
+        color = MaterialTheme.colorScheme.surfaceContainer,
+        modifier = modifier.fillMaxWidth().clip(MaterialTheme.shapes.medium).clickable(onClick = onOpen),
+    ) {
+        Row(Modifier.padding(start = 16.dp, top = 12.dp, bottom = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+            Cube(32.dp, spinning = bot.running, colors = cubeColors(bot.color))
+            Column(Modifier.weight(1f).padding(start = 14.dp)) {
+                Text(bot.name, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                when {
+                    bot.running -> ShimmerText("Working")
+                    bot.last != null -> Text(
+                        (if (bot.lastFromUser) "You: " else "") + bot.last.replace('\n', ' '),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = if (bot.lastError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    else -> Text(
+                        bot.job.ifBlank { "No job yet" }.replace('\n', ' '),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                Row {
+                    Text(
+                        "${displayModelName(bot.model)} · ${providerName(bot.provider)}" +
+                            (if (bot.routines > 0) " · ${bot.routines} routine${if (bot.routines == 1) "" else "s"}" else ""),
+                        Modifier.weight(1f, fill = false),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    if (bot.pending > 0) Text(
+                        " · ${bot.pending} to approve",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary,
+                        maxLines = 1,
+                    )
+                }
+            }
+            Box {
+                IconButton(onClick = { menu = true }) { Icon(Icons.Rounded.MoreVert, "Options") }
+                CubicMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                    DropdownMenuItem(
+                        text = { Text("Edit") },
+                        leadingIcon = { Icon(Icons.Rounded.Tune, null) },
+                        onClick = { menu = false; onEdit() },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Delete", color = MaterialTheme.colorScheme.error) },
+                        leadingIcon = { Icon(Icons.Rounded.Delete, null, tint = MaterialTheme.colorScheme.error) },
+                        onClick = { menu = false; confirm = true },
+                    )
+                }
+            }
+        }
+    }
+    if (confirm) DeleteBotDialog(bot.name, onDismiss = { confirm = false }, onConfirm = { confirm = false; onDelete() })
+}
+
+@Composable
+private fun DeleteBotDialog(name: String, onDismiss: () -> Unit, onConfirm: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Delete $name?") },
+        text = { Text("Its chat and memory are deleted from your PC. Files it saved in the workspace stay.") },
+        confirmButton = {
+            TextButton(onClick = onConfirm) { Text("Delete", color = MaterialTheme.colorScheme.error) }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+@Composable
+private fun IdeaRow(idea: BotIdea, onClick: () -> Unit) {
+    Surface(
+        shape = MaterialTheme.shapes.medium,
+        color = Color.Transparent,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+        modifier = Modifier.fillMaxWidth().clip(MaterialTheme.shapes.medium).clickable(onClick = onClick),
+    ) {
+        Row(Modifier.padding(16.dp), verticalAlignment = Alignment.Top) {
+            Cube(24.dp, Modifier.padding(top = 2.dp), colors = cubeColors(idea.color))
+            Column(Modifier.padding(start = 14.dp)) {
+                Text(idea.name, style = MaterialTheme.typography.titleSmall)
+                Text(
+                    idea.job,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+    }
+}
+
+// --- Making and changing a Bot --------------------------------------------------------------------
+
+/** A Bot being made ([id] null) or changed, as the sheet holds it. */
+data class BotDraft(
+    val id: String?,
+    val name: String,
+    val job: String,
+    val color: String,
+    val provider: String,
+    val model: String,
+    /** Null until loaded (new Bots start with none). */
+    val memory: String?,
+) {
+    companion object {
+        /** An existing Bot; its memory (null here) is fetched when the sheet opens. */
+        fun of(bot: Bot) = BotDraft(bot.id, bot.name, bot.job, bot.color, bot.provider, bot.model, null)
+
+        /** A new Bot on the chat's model when that can be one, else the PC's. */
+        fun blank(vm: ChatViewModel): BotDraft {
+            val s = vm.state.value.settings
+            val p = s.provider
+            val model = s.model(p)
+            val (provider, m) = if (model.isNotBlank() && !p.isMultiAgent(model) && (p != Providers.LOCAL || s.isPaired)) p.id to model
+            else Providers.LOCAL.id to s.model(Providers.LOCAL)
+            return BotDraft(null, "", "", BOT_COLORS.first(), provider, m, "")
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class, androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
+@Composable
+fun BotEditSheet(vm: ChatViewModel, start: BotDraft, onOpenSettings: () -> Unit, onDismiss: () -> Unit, onSaved: (Bot) -> Unit) {
+    var draft by remember { mutableStateOf(start) }
+    var picking by remember { mutableStateOf(false) }
+    var saving by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var confirmDelete by remember { mutableStateOf(false) }
+    // An existing Bot's memory is read fresh from the PC (the Bot changes it as it works) and sent back
+    // only when changed here, so saving the name never overwrites what it learnt meanwhile.
+    var savedMemory by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(start.id) {
+        val id = start.id ?: return@LaunchedEffect
+        vm.bots.memoryOf(id) { r ->
+            r.onSuccess { m -> savedMemory = m; if (draft.memory == null) draft = draft.copy(memory = m) }
+                .onFailure { error = it.message }
+        }
+    }
+    val canSave = draft.name.isNotBlank() && draft.model.isNotBlank() && !saving
+
+    fun save() {
+        saving = true
+        error = null
+        val fields = JSONObject()
+            .put("name", draft.name.trim())
+            .put("job", draft.job.trim())
+            .put("color", draft.color)
+            .put("provider", draft.provider)
+            .put("model", draft.model)
+        draft.memory?.let { if (draft.id != null && savedMemory != null && it != savedMemory) fields.put("memory", it) }
+        val done: (Result<Bot>) -> Unit = { r ->
+            saving = false
+            r.onSuccess(onSaved).onFailure { error = it.message ?: "Couldn't save the Bot." }
+        }
+        if (draft.id == null) vm.bots.create(fields, done) else vm.bots.update(draft.id!!, fields, done)
+    }
+
+    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
+        Column(
+            Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp).padding(bottom = 24.dp).imePadding(),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Cube(28.dp, colors = cubeColors(draft.color))
+                Text(if (draft.id == null) "New Bot" else "Edit ${start.name}", Modifier.padding(start = 12.dp), style = MaterialTheme.typography.titleLarge)
+            }
+            OutlinedTextField(
+                value = draft.name,
+                onValueChange = { draft = draft.copy(name = it.take(40)) },
+                label = { Text("Name") },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Words),
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = draft.job,
+                onValueChange = { draft = draft.copy(job = it.take(8000)) },
+                label = { Text("Its job") },
+                placeholder = { Text("What it does, how, and what it should always keep in mind") },
+                minLines = 3,
+                maxLines = 8,
+                keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Text("Colour", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                BOT_COLORS.forEach { c ->
+                    val selected = c.equals(draft.color, ignoreCase = true)
+                    Box(
+                        Modifier.size(34.dp)
+                            .clip(MaterialTheme.shapes.small)
+                            .border(if (selected) 2.dp else 0.dp, if (selected) MaterialTheme.colorScheme.onSurface else Color.Transparent, MaterialTheme.shapes.small)
+                            .clickable { draft = draft.copy(color = c) }
+                            .padding(5.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Cube(24.dp, colors = cubeColors(c))
+                    }
+                }
+            }
+            Text("Model", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Surface(
+                shape = MaterialTheme.shapes.small,
+                color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                modifier = Modifier.fillMaxWidth().clip(MaterialTheme.shapes.small).clickable { picking = true },
+            ) {
+                Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
+                    Text(displayModelName(draft.model).ifBlank { "Pick a model" }, style = MaterialTheme.typography.bodyLarge)
+                    Text(
+                        providerName(draft.provider) + if (draft.provider == Providers.LOCAL.id) " · runs on your PC's GPU" else " · uses your key, kept on your PC",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            if (draft.id != null) {
+                OutlinedTextField(
+                    value = draft.memory.orEmpty(),
+                    onValueChange = { draft = draft.copy(memory = it.take(6000)) },
+                    enabled = draft.memory != null,
+                    label = { Text("What it remembers") },
+                    placeholder = { Text(if (draft.memory == null) "Loading…" else "Nothing yet") },
+                    supportingText = { Text("It keeps this up to date itself; change or clear anything here.") },
+                    minLines = 2,
+                    maxLines = 8,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+            error?.let { Text(it, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error) }
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                // Pulled in by its inner padding, so "Delete" starts on the sheet's edge.
+                if (draft.id != null) TextButton(onClick = { confirmDelete = true }, modifier = Modifier.offset(x = (-12).dp)) {
+                    Text("Delete", color = MaterialTheme.colorScheme.error)
+                }
+                Spacer(Modifier.weight(1f))
+                Button(onClick = ::save, enabled = canSave, shape = MaterialTheme.shapes.small) {
+                    if (saving) Cube(18.dp, spinning = true) else Text(if (draft.id == null) "Make Bot" else "Save")
+                }
+            }
+        }
+    }
+    if (picking) ModelPickerSheet(
+        vm,
+        onOpenSettings = { onDismiss(); onOpenSettings() },
+        onDismiss = { picking = false },
+        title = "Model for ${draft.name.ifBlank { "this Bot" }}",
+        current = draft.provider to draft.model,
+        onPick = { p, m -> draft = draft.copy(provider = p.id, model = m) },
+    )
+    if (confirmDelete) DeleteBotDialog(start.name, onDismiss = { confirmDelete = false }, onConfirm = {
+        confirmDelete = false
+        draft.id?.let { id -> vm.bots.delete(id) { r -> r.onSuccess { onDismiss() }.onFailure { error = it.message } } }
+    })
+}
+
+// --- A Bot's chat ---------------------------------------------------------------------------------
+
+/** What the chat shows, oldest first: messages, the Bot's steps and replies, and its turn under way. */
+private sealed interface BotRowItem {
+    val key: String
+
+    data class User(val m: BotMessage) : BotRowItem { override val key get() = m.id }
+    data class RoutineRun(val m: BotMessage) : BotRowItem { override val key get() = m.id }
+    data class Head(override val key: String, val spinning: Boolean, val took: Long) : BotRowItem
+    data class Step(val call: BotCall, val result: BotMessage?, override val key: String) : BotRowItem
+    data class Reply(val m: BotMessage, val sources: List<String>) : BotRowItem { override val key get() = m.id }
+    data class Failure(val m: BotMessage) : BotRowItem { override val key get() = m.id }
+    data class Live(val turn: LiveTurn, val withHead: Boolean) : BotRowItem { override val key get() = "live" }
+}
+
+private fun rowsOf(o: OpenBot): List<BotRowItem> {
+    val results = o.messages.filter { it.role == "tool" }.associateBy { it.call }
+    val rows = mutableListOf<BotRowItem>()
+    var headed = false
+    var head = -1
+    var sources = mutableListOf<String>()
+    for (m in o.messages) {
+        when (m.role) {
+            "user" -> {
+                rows += if (m.routine != null) BotRowItem.RoutineRun(m) else BotRowItem.User(m)
+                headed = false
+                sources = mutableListOf()
+            }
+            "assistant" -> {
+                if (!headed && (m.text.isNotBlank() || m.calls.isNotEmpty() || m.error != null || m.stopped || m.reasoning.isNotBlank())) {
+                    head = rows.size
+                    rows += BotRowItem.Head("head:" + m.id, spinning = false, took = 0)
+                    headed = true
+                }
+                // The header shows the time over the whole answer: every turn, tool-calling ones too.
+                if (headed) (rows[head] as BotRowItem.Head).let { rows[head] = it.copy(took = it.took + m.took) }
+                if (m.error != null) rows += BotRowItem.Failure(m)
+                else if (m.text.isNotBlank() || m.stopped || (m.reasoning.isNotBlank() && m.calls.isEmpty())) rows += BotRowItem.Reply(m, if (m.calls.isEmpty()) sources.distinct() else emptyList())
+                m.calls.forEach { c ->
+                    val r = results[c.id]
+                    rows += BotRowItem.Step(c, r, "step:" + c.id + ":" + m.id)
+                    r?.citations?.let { sources += it }
+                }
+            }
+        }
+    }
+    if (o.running || o.live != null) {
+        val lastUser = rows.indexOfLast { it is BotRowItem.User || it is BotRowItem.RoutineRun }
+        val headIndex = rows.indexOfLast { it is BotRowItem.Head }
+        val answering = headIndex > lastUser
+        if (answering) rows[headIndex] = (rows[headIndex] as BotRowItem.Head).copy(spinning = true, took = 0)
+        rows += BotRowItem.Live(o.live ?: LiveTurn(), withHead = !answering)
+    }
+    return rows
+}
+
+/** What a tool step says: done, or under way. */
+private fun stepLabel(c: BotCall, done: Boolean): Pair<ImageVector, String> {
+    val a = runCatching { JSONObject(c.args) }.getOrDefault(JSONObject())
+    fun s(k: String) = a.optString(k).trim()
+    return when (c.name) {
+        "web_search" -> Icons.Rounded.Search to (if (done) "Searched the web for “${s("query")}”" else "Searching the web for “${s("query")}”")
+        "read_page" -> Icons.Rounded.Language to (if (done) "Read ${domainOf(s("url"))}" else "Reading ${domainOf(s("url"))}")
+        "list_files" -> Icons.Rounded.Folder to (if (done) "Looked in ${s("path").ifBlank { "the workspace" }}" else "Looking in ${s("path").ifBlank { "the workspace" }}")
+        "read_file" -> Icons.Rounded.Description to (if (done) "Read ${s("path")}" else "Reading ${s("path")}")
+        "write_file" -> Icons.Rounded.EditNote to (if (done) "Saved ${s("path")}" else "Saving ${s("path")}")
+        "remember" -> Icons.Rounded.Bookmark to (if (done) "Remembered: ${s("note")}" else "Remembering")
+        "forget" -> Icons.Rounded.BookmarkRemove to (if (done) "Forgot notes about “${s("text")}”" else "Forgetting")
+        "schedule_routine" -> Icons.Rounded.Schedule to (if (done) "Proposed the routine “${s("name")}”" else "Proposing a routine")
+        "cancel_routine" -> Icons.Rounded.EventBusy to (if (done) "Withdrew or switched off “${s("name")}”" else "Cancelling a routine")
+        else -> Icons.Rounded.Tune to c.name
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun BotChatScreen(vm: ChatViewModel, onBack: () -> Unit, onOpenSettings: () -> Unit) {
+    val state by vm.bots.state.collectAsStateWithLifecycle()
+    val chatState by vm.state.collectAsStateWithLifecycle()
+    val open = state.open
+    if (open == null) {
+        LaunchedEffect(Unit) { onBack() }
+        return
+    }
+    val bot = open.bot
+    var editing by remember { mutableStateOf(false) }
+    var menu by remember { mutableStateOf(false) }
+    var confirmClear by remember { mutableStateOf(false) }
+    var routinesOpen by remember { mutableStateOf(false) }
+    var draft by rememberSaveable(bot.id) { mutableStateOf("") }
+    LaunchedEffect(Unit) { vm.bots.watchOpen() }
+    val colors = remember(bot.color) { cubeColors(bot.color) }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back") } },
+                title = {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Cube(24.dp, spinning = open.running, colors = colors)
+                        Column(Modifier.padding(start = 12.dp)) {
+                            Text(bot.name, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text(
+                                "${displayModelName(bot.model)} · ${providerName(bot.provider)}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
+                },
+                actions = {
+                    val pending = open.routines.count { !it.approved }
+                    IconButton(onClick = { routinesOpen = true }) {
+                        BadgedBox(badge = { if (pending > 0) Badge { Text("$pending") } }) { Icon(Icons.Rounded.Schedule, "Routines") }
+                    }
+                    IconButton(onClick = { editing = true }) { Icon(Icons.Rounded.Tune, "Edit Bot") }
+                    Box {
+                        IconButton(onClick = { menu = true }) { Icon(Icons.Rounded.MoreVert, "More") }
+                        CubicMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                            DropdownMenuItem(
+                                text = { Text("Clear chat", color = MaterialTheme.colorScheme.error) },
+                                leadingIcon = { Icon(Icons.Rounded.DeleteSweep, null, tint = MaterialTheme.colorScheme.error) },
+                                enabled = !open.running && open.messages.isNotEmpty(),
+                                onClick = { menu = false; confirmClear = true },
+                            )
+                        }
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background),
+            )
+        },
+    ) { padding ->
+        Column(Modifier.fillMaxSize().padding(padding).consumeWindowInsets(padding).imePadding()) {
+            Box(Modifier.weight(1f).fillMaxWidth()) {
+                when {
+                    open.loading && open.messages.isEmpty() -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Cube(32.dp, spinning = true, colors = colors)
+                    }
+                    open.messages.isEmpty() && !open.running -> BotWelcome(bot)
+                    else -> BotMessages(open, chatState.settings.thoughtsOpen, vm::setThoughtsOpen)
+                }
+            }
+            RoutineApprovals(vm, open)
+            AnimatedVisibility(
+                visible = open.error != null || open.reconnecting,
+                enter = expandVertically(tween(180)) + fadeIn(tween(180)),
+                exit = shrinkVertically(tween(140)) + fadeOut(tween(100)),
+            ) {
+                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    if (open.reconnecting) ShimmerText("Reconnecting to your PC")
+                    else {
+                        Icon(Icons.Rounded.ErrorOutline, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.error)
+                        Text(
+                            open.error.orEmpty(),
+                            Modifier.weight(1f).padding(start = 8.dp),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                        TextButton(onClick = vm.bots::dismissError) { Text("OK") }
+                    }
+                }
+            }
+            BotComposer(
+                draft = draft,
+                onDraft = { draft = it },
+                running = open.running,
+                enabled = !open.loading,
+                placeholder = if (open.running) "Add something while it works" else "Message ${bot.name}",
+                onSend = { vm.bots.send(draft); draft = "" },
+                onStop = vm.bots::stop,
+            )
+        }
+    }
+    if (routinesOpen) RoutinesSheet(vm, open, onDismiss = { routinesOpen = false })
+    if (editing) {
+        BotEditSheet(vm, BotDraft.of(bot), onOpenSettings = onOpenSettings, onDismiss = { editing = false }, onSaved = { editing = false })
+    }
+    if (confirmClear) AlertDialog(
+        onDismissRequest = { confirmClear = false },
+        title = { Text("Clear the chat?") },
+        text = { Text("${bot.name}'s messages are deleted from your PC. What it remembers and the files it saved stay.") },
+        confirmButton = {
+            TextButton(onClick = { confirmClear = false; vm.bots.clearChat() }) { Text("Clear", color = MaterialTheme.colorScheme.error) }
+        },
+        dismissButton = { TextButton(onClick = { confirmClear = false }) { Text("Cancel") } },
+    )
+}
+
+@Composable
+private fun BotWelcome(bot: Bot) {
+    Column(
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 32.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        Cube(56.dp, colors = cubeColors(bot.color))
+        Text(bot.name, Modifier.padding(top = 16.dp), style = MaterialTheme.typography.headlineSmall)
+        if (bot.job.isNotBlank()) Text(
+            bot.job,
+            Modifier.padding(top = 8.dp),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+            maxLines = 8,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Text(
+            "It works on your PC: you can close the app and come back to the result.",
+            Modifier.padding(top = 16.dp),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+        )
+    }
+}
+
+@Composable
+private fun BotMessages(open: OpenBot, thoughtsOpen: Boolean?, onThoughts: (Boolean) -> Unit) {
+    val rows = remember(open.messages, open.live, open.running) { rowsOf(open) }
+    val colors = remember(open.bot.color) { cubeColors(open.bot.color) }
+    // Newest at the bottom and kept there while the Bot writes: reverseLayout pins the view to the
+    // bottom only while it's there, so each new row (a message, a step, the turn under way) brings it back.
+    val listState = rememberLazyListState()
+    LaunchedEffect(open.bot.id, rows.size) { listState.animateScrollToItem(0) }
+    LazyColumn(
+        Modifier.fillMaxSize(),
+        state = listState,
+        reverseLayout = true,
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp, Alignment.Bottom),
+    ) {
+        items(rows.asReversed(), key = { it.key }) { row ->
+            Box(Modifier.animateItem(fadeInSpec = tween(200), placementSpec = null, fadeOutSpec = null)) {
+                when (row) {
+                    is BotRowItem.User -> BotUserBubble(row.m.text)
+                    is BotRowItem.RoutineRun -> RoutineRunRow(row.m.routine.orEmpty(), row.m.text)
+                    is BotRowItem.Head -> BotHeader(open.bot.name, colors, row.spinning, null, row.took)
+                    is BotRowItem.Step -> StepRow(row.call, row.result)
+                    is BotRowItem.Reply -> Column {
+                        if (row.m.reasoning.isNotBlank()) ReasoningBlock(row.m.reasoning, active = false, preferred = thoughtsOpen, onToggle = onThoughts)
+                        if (row.m.text.isNotBlank()) MarkdownText(row.m.text)
+                        if (row.m.stopped) Text("Stopped", Modifier.padding(top = 4.dp), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        if (row.sources.isNotEmpty()) Sources(row.sources)
+                    }
+                    is BotRowItem.Failure -> ErrorCard(row.m.error.orEmpty(), null)
+                    is BotRowItem.Live -> LiveTurnView(open.bot.name, colors, row, thoughtsOpen, onThoughts)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun BotHeader(name: String, colors: CubeColors, spinning: Boolean, phase: String?, took: Long) {
+    Row(Modifier.padding(top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+        Cube(16.dp, spinning = spinning, colors = colors)
+        Spacer(Modifier.width(8.dp))
+        Text(
+            name,
+            Modifier.weight(1f, fill = false),
+            style = MaterialTheme.typography.titleSmall,
+            color = MaterialTheme.colorScheme.primary,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        if (phase != null) ShimmerText(phase, Modifier.padding(start = 10.dp))
+        else if (took > 0 && !spinning) Text(
+            "  ${if (took < 60_000) "%.1f s".format(took / 1000.0) else "${took / 60_000} min ${took % 60_000 / 1000} s"}",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+@Composable
+private fun LiveTurnView(name: String, colors: CubeColors, row: BotRowItem.Live, thoughtsOpen: Boolean?, onThoughts: (Boolean) -> Unit) {
+    val t = row.turn
+    val phase = when {
+        t.tool != null -> null // the step says what it's doing
+        t.text.isNotEmpty() -> "Writing"
+        else -> "Thinking"
+    }
+    Column(Modifier.animateContentSize(tween(180))) {
+        if (row.withHead) BotHeader(name, colors, spinning = true, phase = phase, took = 0)
+        else if (phase != null && t.text.isEmpty() && t.reasoning.isEmpty()) ShimmerText(phase)
+        if (t.reasoning.isNotBlank()) ReasoningBlock(t.reasoning, active = t.text.isEmpty() && t.tool == null, preferred = thoughtsOpen, onToggle = onThoughts)
+        if (t.text.isNotEmpty()) MarkdownText(t.text, streaming = true)
+        t.tool?.let { StepRow(it, null, live = true) }
+    }
+}
+
+@Composable
+private fun StepRow(call: BotCall, result: BotMessage?, live: Boolean = false) {
+    var open by remember { mutableStateOf(false) }
+    val (icon, label) = stepLabel(call, done = !live)
+    val failed = result?.failed == true
+    val tint = if (failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
+    Column {
+        Row(
+            Modifier.clip(MaterialTheme.shapes.extraSmall)
+                .clickable(enabled = result != null) { open = !open }
+                .heightIn(min = 32.dp)
+                .padding(end = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(icon, null, Modifier.size(16.dp), tint = tint)
+            Spacer(Modifier.width(8.dp))
+            if (live) ShimmerText(label)
+            else Text(
+                label + if (failed) " (failed)" else "",
+                style = MaterialTheme.typography.bodyMedium,
+                color = tint,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+            if (result != null && !failed) Icon(Icons.Rounded.Check, null, Modifier.padding(start = 6.dp).size(14.dp), tint = MaterialTheme.colorScheme.primary)
+        }
+        AnimatedVisibility(open && result != null, enter = expandVertically(tween(200)) + fadeIn(tween(200)), exit = shrinkVertically(tween(160)) + fadeOut(tween(120))) {
+            Surface(color = MaterialTheme.colorScheme.surfaceContainer, shape = MaterialTheme.shapes.medium, modifier = Modifier.fillMaxWidth().padding(top = 4.dp)) {
+                Text(
+                    result?.text.orEmpty().trim(),
+                    Modifier.heightIn(max = 240.dp).verticalScroll(rememberScrollState()).padding(12.dp),
+                    style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun BotUserBubble(text: String) {
+    val context = LocalContext.current
+    var menu by remember { mutableStateOf(false) }
+    Column(Modifier.fillMaxWidth().padding(start = 40.dp), horizontalAlignment = Alignment.End) {
+        Box {
+            val shape = CutCornerShape(topStart = 14.dp, topEnd = 2.dp, bottomEnd = 14.dp, bottomStart = 2.dp)
+            Surface(
+                shape = shape,
+                color = MaterialTheme.colorScheme.secondaryContainer,
+                modifier = Modifier.clip(shape).combinedClickable(onClick = {}, onLongClick = { menu = true }),
+            ) {
+                Text(text, Modifier.padding(horizontal = 16.dp, vertical = 10.dp), style = MaterialTheme.typography.bodyLarge)
+            }
+            CubicMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                DropdownMenuItem(
+                    text = { Text("Copy") },
+                    leadingIcon = { Icon(Icons.Rounded.ContentCopy, null) },
+                    onClick = { copyToClipboard(context, text); menu = false },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun BotComposer(
+    draft: String,
+    onDraft: (String) -> Unit,
+    running: Boolean,
+    enabled: Boolean,
+    placeholder: String,
+    onSend: () -> Unit,
+    onStop: () -> Unit,
+) {
+    Surface(
+        shape = MaterialTheme.shapes.large,
+        color = MaterialTheme.colorScheme.surfaceContainer,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+    ) {
+        Row(verticalAlignment = Alignment.Bottom) {
+            TextField(
+                value = draft,
+                onValueChange = onDraft,
+                placeholder = { Text(placeholder, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                maxLines = 6,
+                enabled = enabled,
+                keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
+                modifier = Modifier.weight(1f),
+                colors = TextFieldDefaults.colors(
+                    focusedContainerColor = Color.Transparent,
+                    unfocusedContainerColor = Color.Transparent,
+                    disabledContainerColor = Color.Transparent,
+                    focusedIndicatorColor = Color.Transparent,
+                    unfocusedIndicatorColor = Color.Transparent,
+                    disabledIndicatorColor = Color.Transparent,
+                ),
+            )
+            // Typing while it works sends the message on (it's answered after the current reply); otherwise Stop.
+            val mode = when {
+                draft.isNotBlank() -> 1
+                running -> 2
+                else -> 0
+            }
+            AnimatedContent(
+                targetState = mode,
+                transitionSpec = { fadeIn(tween(120)) togetherWith fadeOut(tween(120)) },
+                label = "send",
+                modifier = Modifier.padding(end = 6.dp, bottom = 6.dp),
+            ) { m ->
+                when (m) {
+                    2 -> FilledIconButton(onClick = onStop, shape = MaterialTheme.shapes.small) { Icon(Icons.Rounded.Stop, "Stop") }
+                    else -> FilledIconButton(onClick = onSend, enabled = m == 1 && enabled, shape = MaterialTheme.shapes.small) {
+                        Icon(Icons.Rounded.ArrowUpward, "Send")
+                    }
+                }
+            }
+        }
+    }
+}
